@@ -1,0 +1,60 @@
+#version 460
+
+layout( local_size_x = 8, local_size_y = 8 ) in;
+
+layout( set = 0, binding = 0, std430 ) readonly buffer SourceBuffer {
+	uint sourcePixels[];
+};
+
+layout( set = 0, binding = 1, std430 ) buffer OverlayBuffer {
+	uint overlayPixels[];
+};
+
+layout( push_constant ) uniform PushConstants {
+	uvec4 src;       // offset, width, height, clear overlay
+	uvec4 frame;     // width, height, unused, unused
+	ivec4 viewport;  // x, y, presentWidth, presentHeight in Doom's bottom-left frame space
+} pc;
+
+void main() {
+	uint idX = gl_GlobalInvocationID.x;
+	uint idY = gl_GlobalInvocationID.y;
+
+	if ( pc.src.w != 0u ) {
+		if ( idX >= pc.frame.x || idY >= pc.frame.y ) {
+			return;
+		}
+
+		uint logicalY = pc.frame.y - 1u - idY;
+		uint overlayIndex = logicalY * pc.frame.x + idX;
+		uint outColor = 0u;
+
+		if ( int( idX ) >= pc.viewport.x &&
+			 int( logicalY ) >= pc.viewport.y &&
+			 int( idX ) < pc.viewport.x + pc.viewport.z &&
+			 int( logicalY ) < pc.viewport.y + pc.viewport.w ) {
+			uint viewX = uint( int( idX ) - pc.viewport.x );
+			uint viewY = uint( int( logicalY ) - pc.viewport.y );
+			uint srcX = min( pc.src.y - 1u, ( viewX * pc.src.y ) / uint( pc.viewport.z ) );
+			uint srcY = min( pc.src.z - 1u, ( viewY * pc.src.z ) / uint( pc.viewport.w ) );
+			outColor = sourcePixels[pc.src.x + srcY * pc.src.y + srcX];
+		}
+
+		overlayPixels[overlayIndex] = outColor;
+		return;
+	}
+
+	if ( idX >= uint( pc.viewport.z ) || idY >= uint( pc.viewport.w ) ) {
+		return;
+	}
+
+	uint frameX = uint( pc.viewport.x ) + idX;
+	uint logicalY = uint( pc.viewport.y ) + idY;
+	if ( frameX >= pc.frame.x || logicalY >= pc.frame.y ) {
+		return;
+	}
+
+	uint srcX = min( pc.src.y - 1u, ( idX * pc.src.y ) / uint( pc.viewport.z ) );
+	uint srcY = min( pc.src.z - 1u, ( idY * pc.src.z ) / uint( pc.viewport.w ) );
+	overlayPixels[logicalY * pc.frame.x + frameX] = sourcePixels[pc.src.x + srcY * pc.src.y + srcX];
+}

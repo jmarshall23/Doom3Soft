@@ -14,6 +14,7 @@ This file is part of the idTech 4 software renderer source code
 
 #include "tr_local.h"
 #include "SoftwareRasterizer.h"
+#include "SoftwareVulkanBridge.h"
 
 #if defined( SW_COMPILE_AVX2 ) || defined( __AVX2__ ) || defined( _M_AVX2 )
 #include <immintrin.h>
@@ -93,6 +94,10 @@ struct swScreenVert_t {
 	float sOverW;
 	float tOverW;
 	float colorOverW[4];
+	float globalOverW[3];
+	float normalOverW[3];
+	float tangent0OverW[3];
+	float tangent1OverW[3];
 };
 
 struct swClipVert_t {
@@ -100,6 +105,9 @@ struct swClipVert_t {
 	float s;
 	float t;
 	float color[4];
+	float global[3];
+	float normal[3];
+	float tangent[2][3];
 	float attr[SW_INTERACTION_ATTR_COUNT];
 };
 
@@ -119,9 +127,15 @@ struct swSurfaceStage_t {
 	bool drawStage;
 	bool needsColorModulation;
 	bool alphaTest;
+	bool writeWorldPosition;
+	bool writeGBuffer;
 	float alphaTestValue;
 	int alphaTestByte;
 	unsigned int fallbackColor;
+	unsigned int materialId;
+	unsigned int surfaceId;
+	unsigned int albedoOrTextureId;
+	unsigned int specularAndFlags;
 };
 
 struct swTexture_t {
@@ -138,6 +152,18 @@ struct swTexture_t {
 	int height;
 	textureRepeat_t repeat;
 	idList<unsigned int> texels;
+};
+
+struct swHybridGBuffer_t {
+	idList<float> depth;
+	idList<unsigned int> normalPacked;
+	idList<unsigned int> tangentPacked;
+	idList<unsigned int> bitangentPacked;
+	idList<unsigned int> uvPacked;
+	idList<unsigned int> materialId;
+	idList<unsigned int> albedoOrTextureId;
+	idList<unsigned int> specularAndFlags;
+	idList<unsigned int> surfaceId;
 };
 
 struct swTriSetup_t {
@@ -183,6 +209,22 @@ struct swTriSetup_t {
 	float colorOverW0[4];
 	float dColorOverWdx[4];
 	float dColorOverWdy[4];
+	float globalOverW[3][3];
+	float globalOverW0[3];
+	float dGlobalOverWdx[3];
+	float dGlobalOverWdy[3];
+	float normalOverW[3][3];
+	float normalOverW0[3];
+	float dNormalOverWdx[3];
+	float dNormalOverWdy[3];
+	float tangent0OverW[3][3];
+	float tangent0OverW0[3];
+	float dTangent0OverWdx[3];
+	float dTangent0OverWdy[3];
+	float tangent1OverW[3][3];
+	float tangent1OverW0[3];
+	float dTangent1OverWdx[3];
+	float dTangent1OverWdy[3];
 	int srcBlend;
 	int dstBlend;
 	int blendMode;
@@ -193,9 +235,15 @@ struct swTriSetup_t {
 	bool alphaBlend;
 	bool needsColorModulation;
 	bool alphaTest;
+	bool writeWorldPosition;
+	bool writeGBuffer;
 	float alphaTestValue;
 	int alphaTestByte;
 	unsigned int fallbackColor;
+	unsigned int materialId;
+	unsigned int surfaceId;
+	unsigned int albedoOrTextureId;
+	unsigned int specularAndFlags;
 };
 
 struct swInteractionVert_t {
@@ -290,12 +338,14 @@ private:
 	void Resize( int width, int height );
 	void Clear( bool clearColor );
 	void ClearTileBins();
+	void ClearHybridGBuffer();
 	void BeginSurfacePass();
 	void BeginInteractionPass();
 	void ReadCurrentFramebuffer( const viewDef_t *viewDef );
 	void SetupTriangles( const viewDef_t *viewDef );
 	void SetupDepthPrepass( const viewDef_t *viewDef );
 	void SetupAmbientTriangles( const viewDef_t *viewDef );
+	void SetupTranslucentTriangles( const viewDef_t *viewDef );
 	void SetupDrawSurf( const viewDef_t *viewDef, const drawSurf_t *surf );
 	void SetupDepthDrawSurf( const viewDef_t *viewDef, const drawSurf_t *surf );
 	void SetupDrawSurfStage( const viewDef_t *viewDef, const drawSurf_t *surf, const swSurfaceStage_t &stage );
@@ -303,7 +353,7 @@ private:
 	void ConfigureDepthStage( const drawSurf_t *surf, swSurfaceStage_t &stage, const shaderStage_t *sourceStage );
 	bool TransformVertex( const idDrawVert &src, const float *modelViewMatrix, const float *projectionMatrix, swScreenVert_t &dst ) const;
 	void ApplyTextureCoordinates( const idDrawVert &src, const swSurfaceStage_t &stage, swScreenVert_t &dst ) const;
-	bool BuildClipVertex( const idDrawVert &src, const float *modelViewMatrix, const float *projectionMatrix, const swSurfaceStage_t &stage, swClipVert_t &dst ) const;
+	bool BuildClipVertex( const idDrawVert &src, const float *modelMatrix, const float *modelViewMatrix, const float *projectionMatrix, const swSurfaceStage_t &stage, swClipVert_t &dst ) const;
 	bool BuildInteractionClipVertex( const idDrawVert &src, const float *modelViewMatrix, const float *projectionMatrix, swClipVert_t &dst ) const;
 	int ClipTriangleToFrustum( const swClipVert_t &v0, const swClipVert_t &v1, const swClipVert_t &v2, swClipVert_t clipped[SW_MAX_CLIP_VERTS] ) const;
 	bool ProjectClipVertex( const swClipVert_t &src, swScreenVert_t &dst ) const;
@@ -313,11 +363,15 @@ private:
 	void BinTriangle( int triIndex );
 	void BinInteractionTriangle( int triIndex );
 	void DrawLights( const viewDef_t *viewDef );
+	void WriteHybridDebugView();
+	void BuildHybridTextureUpload( swHybridGBufferUpload_t &gbuffer );
+	void BuildHybridLightUpload( const viewDef_t *viewDef, swHybridGBufferUpload_t &gbuffer );
 	void RasterizeTiles();
 	void RasterizeTileRange( int firstTile, int endTile );
 	void RasterizeTile( int tileX, int tileY );
 	void RasterizeTriangleInTile( const swTriSetup_t &tri, int tileX, int tileY );
 	void RasterizeDepthTriangleInTile( const swTriSetup_t &tri, int tileX, int tileY );
+	void RasterizeAlphaTestDepthTriangleInTile( const swTriSetup_t &tri, int tileX, int tileY );
 	template<int TEXTURE_MODE>
 	void RasterizeTriangleInTileTexture( const swTriSetup_t &tri, int tileX, int tileY );
 	template<bool HAS_TEXTURE, int TEXTURE_MODE>
@@ -331,7 +385,9 @@ private:
 	template<bool HAS_TEXTURE, int TEXTURE_MODE, bool COLOR_MOD, int BLEND_MODE, int WRITE_MASK, bool DEPTH_TEST, bool DEPTH_WRITE, bool ALPHA_TEST>
 	void RasterizeTriangleInTileSpecialized( const swTriSetup_t &tri, int tileX, int tileY );
 	void RasterizeInteractionTriangleInTile( const swInteractionTri_t &tri, int tileX, int tileY );
-	unsigned int ShadeInteractionPixel( const swInteractionTri_t &tri, float invW, const float attrOverW[SW_INTERACTION_ATTR_COUNT] ) const;
+	void WriteHybridGBufferPixel( int pixelIndex, const swTriSetup_t &tri, float z, float invW, float sOverW, float tOverW, const float normalOverW[3], const float tangent0OverW[3], const float tangent1OverW[3] );
+	unsigned int ShadeInteractionPixel( const swInteractionTri_t &tri, int x, int y, float invW, const float attrOverW[SW_INTERACTION_ATTR_COUNT] ) const;
+	float ShadowVisibility( int x, int y ) const;
 	void ApplyLightScale();
 	void Present() const;
 
@@ -357,6 +413,12 @@ private:
 	static unsigned int ApplyWriteMask( unsigned int src, unsigned int dst, int writeMask );
 	static void SetupFloatPlane( float v0, float v1, float v2, float fx0, float fy0, float fx1, float fy1, float fx2, float fy2, float denom, float &base, float &dx, float &dy );
 	static unsigned int PackColor( int r, int g, int b, int a = 255 );
+	static int PackSnorm10( float value );
+	static float UnpackSnorm10( unsigned int packed, int shift );
+	static unsigned int PackNormal10( const idVec3 &normal );
+	static unsigned int PackUV16( float s, float t );
+	static unsigned int PackOptionalTextureId16( int textureIndex );
+	static unsigned int IdDebugColor( unsigned int value );
 	static unsigned int ModulateColor( unsigned int color, const float scale[4] );
 	static unsigned int AdditiveColor( unsigned int src, unsigned int dst );
 	static float ColorChannel( unsigned int color, int shift );
@@ -385,11 +447,21 @@ private:
 
 	idList<float> depthBuffer;
 	idList<unsigned int> colorBuffer;
+	swHybridGBuffer_t hybridGBuffer;
+	idList<idVec4> worldPositionBuffer;
+	idList<unsigned char> shadowMask;
 	idList<swTriSetup_t> triangles;
 	idList<swInteractionTri_t> interactionTriangles;
 	idList<swTileBin_t> tileBins;
 	idList<swTexture_t> textureCache;
+	idList<swHybridTextureInfo_t> hybridTextureInfos;
+	idList<unsigned int> hybridTextureTexels;
+	idList<swHybridLight_t> hybridLights;
+	unsigned int textureCacheGeneration;
+	unsigned int hybridTextureAtlasGeneration;
 	swRasterPass_t rasterPass;
+	bool shadowMaskActive;
+	unsigned int hybridSurfaceSerial;
 
 #if defined( _WIN32 ) && !defined( _D3SDK )
 	bool workersStarted;
@@ -413,6 +485,10 @@ idSoftwareRasterizer::idSoftwareRasterizer() {
 	tileCountX = 0;
 	tileCountY = 0;
 	rasterPass = SW_RASTER_SURFACE;
+	shadowMaskActive = false;
+	hybridSurfaceSerial = 1;
+	textureCacheGeneration = 1;
+	hybridTextureAtlasGeneration = 0;
 
 #if defined( _WIN32 ) && !defined( _D3SDK )
 	workersStarted = false;
@@ -440,13 +516,28 @@ void idSoftwareRasterizer::Resize( int newWidth, int newHeight ) {
 
 	depthBuffer.SetNum( width * height, false );
 	colorBuffer.SetNum( width * height, false );
+	hybridGBuffer.depth.SetNum( width * height, false );
+	hybridGBuffer.normalPacked.SetNum( width * height, false );
+	hybridGBuffer.tangentPacked.SetNum( width * height, false );
+	hybridGBuffer.bitangentPacked.SetNum( width * height, false );
+	hybridGBuffer.uvPacked.SetNum( width * height, false );
+	hybridGBuffer.materialId.SetNum( width * height, false );
+	hybridGBuffer.albedoOrTextureId.SetNum( width * height, false );
+	hybridGBuffer.specularAndFlags.SetNum( width * height, false );
+	hybridGBuffer.surfaceId.SetNum( width * height, false );
+	worldPositionBuffer.SetNum( width * height, false );
+	shadowMask.SetNum( width * height, false );
 	tileBins.SetNum( tileCountX * tileCountY, false );
 }
 
 void idSoftwareRasterizer::Clear( bool clearColor ) {
 	for ( int i = 0; i < depthBuffer.Num(); i++ ) {
 		depthBuffer[i] = 1.0f;
+		worldPositionBuffer[i].Set( 0.0f, 0.0f, 0.0f, 0.0f );
 	}
+	ClearHybridGBuffer();
+	shadowMaskActive = false;
+	hybridSurfaceSerial = 1;
 	if ( clearColor ) {
 		for ( int i = 0; i < colorBuffer.Num(); i++ ) {
 			colorBuffer[i] = 0xff000000u;
@@ -456,6 +547,24 @@ void idSoftwareRasterizer::Clear( bool clearColor ) {
 	triangles.SetNum( 0, false );
 	interactionTriangles.SetNum( 0, false );
 	ClearTileBins();
+}
+
+void idSoftwareRasterizer::ClearHybridGBuffer() {
+	const int pixelCount = width * height;
+	if ( hybridGBuffer.depth.Num() != pixelCount ) {
+		return;
+	}
+	for ( int i = 0; i < pixelCount; i++ ) {
+		hybridGBuffer.depth[i] = 1.0f;
+		hybridGBuffer.normalPacked[i] = 0;
+		hybridGBuffer.tangentPacked[i] = 0;
+		hybridGBuffer.bitangentPacked[i] = 0;
+		hybridGBuffer.uvPacked[i] = 0;
+		hybridGBuffer.materialId[i] = 0;
+		hybridGBuffer.albedoOrTextureId[i] = 0xffffffffu;
+		hybridGBuffer.specularAndFlags[i] = 0;
+		hybridGBuffer.surfaceId[i] = 0;
+	}
 }
 
 void idSoftwareRasterizer::ClearTileBins() {
@@ -478,6 +587,9 @@ void idSoftwareRasterizer::BeginInteractionPass() {
 
 void idSoftwareRasterizer::ReadCurrentFramebuffer( const viewDef_t *viewDef ) {
 	if ( !viewDef || colorBuffer.Num() != width * height ) {
+		return;
+	}
+	if ( r_softwareVulkanPresent.GetBool() && SWVulkan_ReadView( viewDef, colorBuffer.Ptr(), width, height ) ) {
 		return;
 	}
 	qglReadPixels( viewDef->viewport.x1, viewDef->viewport.y1, width, height, GL_BGRA_EXT, GL_UNSIGNED_BYTE, colorBuffer.Ptr() );
@@ -511,6 +623,40 @@ void idSoftwareRasterizer::DrawView( const viewDef_t *viewDef ) {
 		BeginSurfacePass();
 		SetupDepthPrepass( viewDef );
 		RasterizeTiles();
+
+		if ( r_softwareHybridComputeLighting.GetBool() ) {
+			swHybridGBufferUpload_t gbuffer;
+			gbuffer.depth = hybridGBuffer.depth.Ptr();
+			gbuffer.normalPacked = hybridGBuffer.normalPacked.Ptr();
+			gbuffer.tangentPacked = hybridGBuffer.tangentPacked.Ptr();
+			gbuffer.bitangentPacked = hybridGBuffer.bitangentPacked.Ptr();
+			gbuffer.uvPacked = hybridGBuffer.uvPacked.Ptr();
+			gbuffer.materialId = hybridGBuffer.materialId.Ptr();
+			gbuffer.albedoOrTextureId = hybridGBuffer.albedoOrTextureId.Ptr();
+			gbuffer.specularAndFlags = hybridGBuffer.specularAndFlags.Ptr();
+			gbuffer.surfaceId = hybridGBuffer.surfaceId.Ptr();
+			gbuffer.worldPositions = worldPositionBuffer.Ptr();
+			gbuffer.debugView = r_softwareHybridDebugView.GetInteger();
+			BuildHybridLightUpload( viewDef, gbuffer );
+			BuildHybridTextureUpload( gbuffer );
+			if ( SWVulkan_CompositeHybridGBuffer( viewDef, gbuffer, width, height, presentWidth, presentHeight ) ) {
+				if ( r_softwareHybridDebugView.GetInteger() == 0 ) {
+					for ( int i = 0; i < colorBuffer.Num(); i++ ) {
+						colorBuffer[i] = 0;
+					}
+					BeginSurfacePass();
+					SetupTranslucentTriangles( viewDef );
+					RasterizeTiles();
+					Present();
+				}
+				return;
+			}
+			if ( r_softwareHybridDebugView.GetInteger() != 0 ) {
+				WriteHybridDebugView();
+				Present();
+				return;
+			}
+		}
 
 		DrawLights( viewDef );
 		ApplyLightScale();
@@ -582,6 +728,23 @@ void idSoftwareRasterizer::SetupAmbientTriangles( const viewDef_t *viewDef ) {
 	}
 }
 
+void idSoftwareRasterizer::SetupTranslucentTriangles( const viewDef_t *viewDef ) {
+	for ( int i = 0; i < viewDef->numDrawSurfs; i++ ) {
+		const drawSurf_t *surf = viewDef->drawSurfs[i];
+		if ( !surf || !surf->geo || !surf->material ) {
+			continue;
+		}
+		const float sort = surf->material->GetSort();
+		if ( sort >= SS_POST_PROCESS ) {
+			continue;
+		}
+		if ( sort <= SS_OPAQUE && surf->material->Coverage() != MC_TRANSLUCENT ) {
+			continue;
+		}
+		SetupDrawSurf( viewDef, surf );
+	}
+}
+
 void idSoftwareRasterizer::SetupDrawSurf( const viewDef_t *viewDef, const drawSurf_t *surf ) {
 	const srfTriangles_t *geo = surf->geo;
 	if ( !geo->verts || !geo->indexes || geo->numVerts <= 0 || geo->numIndexes < 3 || !surf->space ) {
@@ -616,6 +779,9 @@ void idSoftwareRasterizer::SetupDrawSurf( const viewDef_t *viewDef, const drawSu
 	SetupDrawSurfStage( viewDef, surf, stage );
 }
 
+#if defined( _MSC_VER )
+#pragma optimize( "", off )
+#endif
 void idSoftwareRasterizer::SetupDepthDrawSurf( const viewDef_t *viewDef, const drawSurf_t *surf ) {
 	const srfTriangles_t *geo = surf->geo;
 	if ( !geo->indexes || geo->numIndexes < 3 || !surf->space || !surf->material->IsDrawn() ) {
@@ -626,6 +792,50 @@ void idSoftwareRasterizer::SetupDepthDrawSurf( const viewDef_t *viewDef, const d
 	}
 	if ( surf->material->Coverage() == MC_TRANSLUCENT ) {
 		return;
+	}
+
+	unsigned int surfaceId = 0;
+	unsigned int materialId = 0;
+	unsigned int albedoOrTextureId = 0xffffffffu;
+	unsigned int specularAndFlags = 0;
+	if ( r_softwareHybridComputeLighting.GetBool() ) {
+		surfaceId = hybridSurfaceSerial++;
+		materialId = surfaceId;
+
+		swSurfaceStage_t materialStage;
+		SelectSurfaceStage( static_cast<int>( surfaceId ), surf, materialStage, -1 );
+		if ( materialStage.textureIndex >= 0 ) {
+			albedoOrTextureId = static_cast<unsigned int>( materialStage.textureIndex );
+		}
+
+		int bumpTextureIndex = -1;
+		int specularTextureIndex = -1;
+		const idMaterial *material = surf->material;
+		const float *regs = surf->shaderRegisters;
+		for ( int stageIndex = 0; stageIndex < material->GetNumStages(); stageIndex++ ) {
+			const shaderStage_t *stage = material->GetStage( stageIndex );
+			if ( !stage || !stage->texture.image ) {
+				continue;
+			}
+			if ( regs && regs[stage->conditionRegister] == 0.0f ) {
+				continue;
+			}
+			if ( stage->texture.texgen != TG_EXPLICIT || stage->texture.cinematic || stage->texture.dynamic != DI_STATIC ) {
+				continue;
+			}
+			if ( stage->lighting == SL_DIFFUSE && albedoOrTextureId == 0xffffffffu ) {
+				const int textureIndex = TextureIndexForImage( stage->texture.image );
+				if ( textureIndex >= 0 ) {
+					albedoOrTextureId = static_cast<unsigned int>( textureIndex );
+				}
+			} else if ( stage->lighting == SL_BUMP && bumpTextureIndex < 0 ) {
+				bumpTextureIndex = TextureIndexForImage( stage->texture.image );
+			} else if ( stage->lighting == SL_SPECULAR && specularTextureIndex < 0 ) {
+				specularTextureIndex = TextureIndexForImage( stage->texture.image );
+			}
+		}
+		specularAndFlags = PackOptionalTextureId16( bumpTextureIndex ) |
+			( PackOptionalTextureId16( specularTextureIndex ) << 16 );
 	}
 
 	bool drewAlphaTest = false;
@@ -646,6 +856,10 @@ void idSoftwareRasterizer::SetupDepthDrawSurf( const viewDef_t *viewDef, const d
 
 			swSurfaceStage_t stage;
 			ConfigureDepthStage( surf, stage, sourceStage );
+			stage.materialId = materialId;
+			stage.surfaceId = surfaceId;
+			stage.albedoOrTextureId = albedoOrTextureId;
+			stage.specularAndFlags = specularAndFlags;
 			if ( stage.color[3] <= 0.0f ) {
 				drewAlphaTest = true;
 				continue;
@@ -658,9 +872,16 @@ void idSoftwareRasterizer::SetupDepthDrawSurf( const viewDef_t *viewDef, const d
 	if ( !drewAlphaTest ) {
 		swSurfaceStage_t stage;
 		ConfigureDepthStage( surf, stage, NULL );
+		stage.materialId = materialId;
+		stage.surfaceId = surfaceId;
+		stage.albedoOrTextureId = albedoOrTextureId;
+		stage.specularAndFlags = specularAndFlags;
 		SetupDrawSurfStage( viewDef, surf, stage );
 	}
 }
+#if defined( _MSC_VER )
+#pragma optimize( "", on )
+#endif
 
 void idSoftwareRasterizer::ConfigureStageForView( const viewDef_t *viewDef, const drawSurf_t *surf, swSurfaceStage_t &stage ) const {
 	const bool is2DView = viewDef->viewEntitys == NULL;
@@ -704,9 +925,15 @@ void idSoftwareRasterizer::ConfigureDepthStage( const drawSurf_t *surf, swSurfac
 	stage.drawStage = true;
 	stage.needsColorModulation = false;
 	stage.alphaTest = false;
+	stage.writeWorldPosition = r_softwareRayQueryShadows.GetBool() || r_softwareHybridComputeLighting.GetBool();
+	stage.writeGBuffer = r_softwareHybridComputeLighting.GetBool();
 	stage.alphaTestValue = 0.0f;
 	stage.alphaTestByte = 0;
 	stage.fallbackColor = PackColor( 255, 255, 255, 255 );
+	stage.materialId = 0;
+	stage.surfaceId = 0;
+	stage.albedoOrTextureId = 0xffffffffu;
+	stage.specularAndFlags = 0;
 
 	if ( !sourceStage ) {
 		return;
@@ -767,9 +994,9 @@ void idSoftwareRasterizer::SetupDrawSurfStage( const viewDef_t *viewDef, const d
 		const idDrawVert &dv2 = verts[index2];
 
 		swClipVert_t cv0, cv1, cv2;
-		if ( !BuildClipVertex( dv0, surf->space->modelViewMatrix, viewDef->projectionMatrix, stage, cv0 ) ||
-			 !BuildClipVertex( dv1, surf->space->modelViewMatrix, viewDef->projectionMatrix, stage, cv1 ) ||
-			 !BuildClipVertex( dv2, surf->space->modelViewMatrix, viewDef->projectionMatrix, stage, cv2 ) ) {
+		if ( !BuildClipVertex( dv0, surf->space->modelMatrix, surf->space->modelViewMatrix, viewDef->projectionMatrix, stage, cv0 ) ||
+			 !BuildClipVertex( dv1, surf->space->modelMatrix, surf->space->modelViewMatrix, viewDef->projectionMatrix, stage, cv1 ) ||
+			 !BuildClipVertex( dv2, surf->space->modelMatrix, surf->space->modelViewMatrix, viewDef->projectionMatrix, stage, cv2 ) ) {
 			continue;
 		}
 
@@ -827,6 +1054,12 @@ bool idSoftwareRasterizer::TransformVertex( const idDrawVert &src, const float *
 	for ( int i = 0; i < 4; i++ ) {
 		dst.colorOverW[i] = dst.invW;
 	}
+	for ( int i = 0; i < 3; i++ ) {
+		dst.globalOverW[i] = 0.0f;
+		dst.normalOverW[i] = 0.0f;
+		dst.tangent0OverW[i] = 0.0f;
+		dst.tangent1OverW[i] = 0.0f;
+	}
 	return true;
 }
 
@@ -859,8 +1092,8 @@ void idSoftwareRasterizer::ApplyTextureCoordinates( const idDrawVert &src, const
 	}
 }
 
-bool idSoftwareRasterizer::BuildClipVertex( const idDrawVert &src, const float *modelViewMatrix, const float *projectionMatrix, const swSurfaceStage_t &stage, swClipVert_t &dst ) const {
-	if ( !modelViewMatrix || !projectionMatrix ) {
+bool idSoftwareRasterizer::BuildClipVertex( const idDrawVert &src, const float *modelMatrix, const float *modelViewMatrix, const float *projectionMatrix, const swSurfaceStage_t &stage, swClipVert_t &dst ) const {
+	if ( !modelMatrix || !modelViewMatrix || !projectionMatrix ) {
 		return false;
 	}
 
@@ -873,6 +1106,36 @@ bool idSoftwareRasterizer::BuildClipVertex( const idDrawVert &src, const float *
 
 	dst.s = src.st[0] * stage.matrix[0][0] + src.st[1] * stage.matrix[0][1] + stage.matrix[0][2];
 	dst.t = src.st[0] * stage.matrix[1][0] + src.st[1] * stage.matrix[1][1] + stage.matrix[1][2];
+
+	idVec3 global;
+	R_LocalPointToGlobal( modelMatrix, src.xyz, global );
+	dst.global[0] = global[0];
+	dst.global[1] = global[1];
+	dst.global[2] = global[2];
+
+	idVec3 globalNormal;
+	R_LocalVectorToGlobal( modelMatrix, src.normal, globalNormal );
+	if ( globalNormal.Normalize() == 0.0f ) {
+		globalNormal.Set( 0.0f, 0.0f, 1.0f );
+	}
+	dst.normal[0] = globalNormal[0];
+	dst.normal[1] = globalNormal[1];
+	dst.normal[2] = globalNormal[2];
+
+	for ( int tangentIndex = 0; tangentIndex < 2; tangentIndex++ ) {
+		idVec3 globalTangent;
+		R_LocalVectorToGlobal( modelMatrix, src.tangents[tangentIndex], globalTangent );
+		if ( globalTangent.Normalize() == 0.0f ) {
+			if ( tangentIndex == 0 ) {
+				globalTangent.Set( 1.0f, 0.0f, 0.0f );
+			} else {
+				globalTangent.Set( 0.0f, 1.0f, 0.0f );
+			}
+		}
+		dst.tangent[tangentIndex][0] = globalTangent[0];
+		dst.tangent[tangentIndex][1] = globalTangent[1];
+		dst.tangent[tangentIndex][2] = globalTangent[2];
+	}
 
 	float vertexColor[4];
 	if ( stage.vertexColor == SVC_IGNORE ) {
@@ -912,6 +1175,12 @@ bool idSoftwareRasterizer::BuildInteractionClipVertex( const idDrawVert &src, co
 	for ( int i = 0; i < 4; i++ ) {
 		dst.clip[i] = clip[i];
 		dst.color[i] = 0.0f;
+	}
+	for ( int i = 0; i < 3; i++ ) {
+		dst.global[i] = 0.0f;
+		dst.normal[i] = 0.0f;
+		dst.tangent[0][i] = 0.0f;
+		dst.tangent[1][i] = 0.0f;
 	}
 	dst.s = 0.0f;
 	dst.t = 0.0f;
@@ -1012,6 +1281,12 @@ bool idSoftwareRasterizer::ProjectClipVertex( const swClipVert_t &src, swScreenV
 	for ( int i = 0; i < 4; i++ ) {
 		dst.colorOverW[i] = src.color[i] * invW;
 	}
+	for ( int i = 0; i < 3; i++ ) {
+		dst.globalOverW[i] = src.global[i] * invW;
+		dst.normalOverW[i] = src.normal[i] * invW;
+		dst.tangent0OverW[i] = src.tangent[0][i] * invW;
+		dst.tangent1OverW[i] = src.tangent[1][i] * invW;
+	}
 	return true;
 }
 
@@ -1070,6 +1345,12 @@ bool idSoftwareRasterizer::SetupTriangle( const swScreenVert_t &in0, const swScr
 	tri.invW[0] = v0.invW;
 	tri.sOverW[0] = v0.sOverW;
 	tri.tOverW[0] = v0.tOverW;
+	for ( int i = 0; i < 3; i++ ) {
+		tri.globalOverW[0][i] = v0.globalOverW[i];
+		tri.normalOverW[0][i] = v0.normalOverW[i];
+		tri.tangent0OverW[0][i] = v0.tangent0OverW[i];
+		tri.tangent1OverW[0][i] = v0.tangent1OverW[i];
+	}
 	if ( stage.needsColorModulation ) {
 		for ( int i = 0; i < 4; i++ ) {
 			tri.colorOverW[0][i] = v0.colorOverW[i];
@@ -1081,6 +1362,12 @@ bool idSoftwareRasterizer::SetupTriangle( const swScreenVert_t &in0, const swScr
 	tri.invW[1] = v1.invW;
 	tri.sOverW[1] = v1.sOverW;
 	tri.tOverW[1] = v1.tOverW;
+	for ( int i = 0; i < 3; i++ ) {
+		tri.globalOverW[1][i] = v1.globalOverW[i];
+		tri.normalOverW[1][i] = v1.normalOverW[i];
+		tri.tangent0OverW[1][i] = v1.tangent0OverW[i];
+		tri.tangent1OverW[1][i] = v1.tangent1OverW[i];
+	}
 	if ( stage.needsColorModulation ) {
 		for ( int i = 0; i < 4; i++ ) {
 			tri.colorOverW[1][i] = v1.colorOverW[i];
@@ -1092,6 +1379,12 @@ bool idSoftwareRasterizer::SetupTriangle( const swScreenVert_t &in0, const swScr
 	tri.invW[2] = v2.invW;
 	tri.sOverW[2] = v2.sOverW;
 	tri.tOverW[2] = v2.tOverW;
+	for ( int i = 0; i < 3; i++ ) {
+		tri.globalOverW[2][i] = v2.globalOverW[i];
+		tri.normalOverW[2][i] = v2.normalOverW[i];
+		tri.tangent0OverW[2][i] = v2.tangent0OverW[i];
+		tri.tangent1OverW[2][i] = v2.tangent1OverW[i];
+	}
 	if ( stage.needsColorModulation ) {
 		for ( int i = 0; i < 4; i++ ) {
 			tri.colorOverW[2][i] = v2.colorOverW[i];
@@ -1108,9 +1401,15 @@ bool idSoftwareRasterizer::SetupTriangle( const swScreenVert_t &in0, const swScr
 	tri.alphaBlend = stage.alphaBlend;
 	tri.needsColorModulation = stage.needsColorModulation;
 	tri.alphaTest = stage.alphaTest;
+	tri.writeWorldPosition = stage.writeWorldPosition;
+	tri.writeGBuffer = stage.writeGBuffer;
 	tri.alphaTestValue = stage.alphaTestValue;
 	tri.alphaTestByte = stage.alphaTestByte;
 	tri.fallbackColor = stage.fallbackColor;
+	tri.materialId = stage.materialId;
+	tri.surfaceId = stage.surfaceId;
+	tri.albedoOrTextureId = stage.albedoOrTextureId;
+	tri.specularAndFlags = stage.specularAndFlags;
 
 	tri.minX = Max( 0, ( Min3( tri.x[0], tri.x[1], tri.x[2] ) + SW_FP_ONE - 1 ) >> SW_FP_SHIFT );
 	tri.minY = Max( 0, ( Min3( tri.y[0], tri.y[1], tri.y[2] ) + SW_FP_ONE - 1 ) >> SW_FP_SHIFT );
@@ -1152,6 +1451,18 @@ bool idSoftwareRasterizer::SetupTriangle( const swScreenVert_t &in0, const swScr
 	if ( tri.needsColorModulation ) {
 		for ( int i = 0; i < 4; i++ ) {
 			SetupFloatPlane( tri.colorOverW[0][i], tri.colorOverW[1][i], tri.colorOverW[2][i], fx0, fy0, fx1, fy1, fx2, fy2, denom, tri.colorOverW0[i], tri.dColorOverWdx[i], tri.dColorOverWdy[i] );
+		}
+	}
+	if ( tri.writeWorldPosition ) {
+		for ( int i = 0; i < 3; i++ ) {
+			SetupFloatPlane( tri.globalOverW[0][i], tri.globalOverW[1][i], tri.globalOverW[2][i], fx0, fy0, fx1, fy1, fx2, fy2, denom, tri.globalOverW0[i], tri.dGlobalOverWdx[i], tri.dGlobalOverWdy[i] );
+		}
+	}
+	if ( tri.writeGBuffer ) {
+		for ( int i = 0; i < 3; i++ ) {
+			SetupFloatPlane( tri.normalOverW[0][i], tri.normalOverW[1][i], tri.normalOverW[2][i], fx0, fy0, fx1, fy1, fx2, fy2, denom, tri.normalOverW0[i], tri.dNormalOverWdx[i], tri.dNormalOverWdy[i] );
+			SetupFloatPlane( tri.tangent0OverW[0][i], tri.tangent0OverW[1][i], tri.tangent0OverW[2][i], fx0, fy0, fx1, fy1, fx2, fy2, denom, tri.tangent0OverW0[i], tri.dTangent0OverWdx[i], tri.dTangent0OverWdy[i] );
+			SetupFloatPlane( tri.tangent1OverW[0][i], tri.tangent1OverW[1][i], tri.tangent1OverW[2][i], fx0, fy0, fx1, fy1, fx2, fy2, denom, tri.tangent1OverW0[i], tri.dTangent1OverWdx[i], tri.dTangent1OverWdy[i] );
 		}
 	}
 
@@ -1291,7 +1602,9 @@ void idSoftwareRasterizer::DrawLights( const viewDef_t *viewDef ) {
 		return;
 	}
 
-	BeginInteractionPass();
+	const bool rayQueryShadows = r_softwareRayQueryShadows.GetBool() &&
+		SWVulkan_RayQueryAvailable() &&
+		SWVulkan_PrepareRayQueryScene( viewDef );
 
 	const int oldDepthFunc = backEnd.depthFunc;
 	const viewEntity_t *oldSpace = backEnd.currentSpace;
@@ -1300,6 +1613,7 @@ void idSoftwareRasterizer::DrawLights( const viewDef_t *viewDef ) {
 	for ( viewLight_t *vLight = viewDef->viewLights; vLight; vLight = vLight->next ) {
 		backEnd.vLight = vLight;
 		backEnd.currentSpace = NULL;
+		shadowMaskActive = false;
 
 		if ( vLight->lightShader->IsFogLight() || vLight->lightShader->IsBlendLight() ) {
 			continue;
@@ -1308,6 +1622,11 @@ void idSoftwareRasterizer::DrawLights( const viewDef_t *viewDef ) {
 			continue;
 		}
 
+		const bool wantsRayQueryShadow = rayQueryShadows && !vLight->lightShader->IsAmbientLight();
+		const bool shadowMaskPending = wantsRayQueryShadow &&
+			SWVulkan_BeginLightShadowMask( vLight, worldPositionBuffer.Ptr(), width, height );
+
+		BeginInteractionPass();
 		backEnd.depthFunc = GLS_DEPTHFUNC_EQUAL;
 		for ( const drawSurf_t *surf = vLight->localInteractions; surf; surf = surf->nextOnLight ) {
 			RB_CreateSingleDrawInteractions( surf, RB_SW_DrawInteractionCallback );
@@ -1322,16 +1641,272 @@ void idSoftwareRasterizer::DrawLights( const viewDef_t *viewDef ) {
 				RB_CreateSingleDrawInteractions( surf, RB_SW_DrawInteractionCallback );
 			}
 		}
+
+		if ( interactionTriangles.Num() > 0 ) {
+			shadowMaskActive = shadowMaskPending &&
+				SWVulkan_FinishLightShadowMask( vLight, width, height, shadowMask.Ptr() );
+			RasterizeTiles();
+		} else if ( shadowMaskPending ) {
+			SWVulkan_FinishLightShadowMask( vLight, width, height, shadowMask.Ptr() );
+		}
 	}
 
+	shadowMaskActive = false;
 	backEnd.depthFunc = oldDepthFunc;
 	backEnd.currentSpace = oldSpace;
 	backEnd.vLight = oldLight;
+}
 
-	if ( interactionTriangles.Num() > 0 ) {
-		RasterizeTiles();
+void idSoftwareRasterizer::WriteHybridDebugView() {
+	const int pixelCount = width * height;
+	if ( colorBuffer.Num() != pixelCount || hybridGBuffer.depth.Num() != pixelCount ) {
+		return;
+	}
+
+	const int debugView = r_softwareHybridDebugView.GetInteger();
+	idVec3 debugLightDir( -0.35f, 0.45f, 0.82f );
+	debugLightDir.Normalize();
+	for ( int i = 0; i < pixelCount; i++ ) {
+		if ( hybridGBuffer.depth[i] >= 1.0f || hybridGBuffer.surfaceId[i] == 0 ) {
+			colorBuffer[i] = 0xff000000u;
+			continue;
+		}
+
+		switch ( debugView ) {
+		case 0: {
+			const unsigned int textureId = hybridGBuffer.albedoOrTextureId[i];
+			const int textureIndex = ( textureId != 0xffffffffu && textureId < 0x7fffffffu ) ? static_cast<int>( textureId ) : -1;
+			const unsigned int packedUV = hybridGBuffer.uvPacked[i];
+			const float s = static_cast<float>( packedUV & 0xffffu ) * ( 1.0f / 65535.0f );
+			const float t = static_cast<float>( ( packedUV >> 16 ) & 0xffffu ) * ( 1.0f / 65535.0f );
+			const unsigned int texel = SampleTexture( textureIndex, s, t );
+			idVec3 normal( UnpackSnorm10( hybridGBuffer.normalPacked[i], 0 ),
+				UnpackSnorm10( hybridGBuffer.normalPacked[i], 10 ),
+				UnpackSnorm10( hybridGBuffer.normalPacked[i], 20 ) );
+			if ( normal.Normalize() == 0.0f ) {
+				normal.Set( 0.0f, 0.0f, 1.0f );
+			}
+			const float nDotL = Max( 0.0f, normal[0] * debugLightDir[0] + normal[1] * debugLightDir[1] + normal[2] * debugLightDir[2] );
+			const float light = 0.20f + 0.80f * nDotL;
+			const int r = ByteFromFloat( ColorChannel( texel, 16 ) * light );
+			const int g = ByteFromFloat( ColorChannel( texel, 8 ) * light );
+			const int b = ByteFromFloat( ColorChannel( texel, 0 ) * light );
+			const int a = ( texel >> 24 ) & 255;
+			colorBuffer[i] = PackColor( r, g, b, a );
+			break;
+		}
+		case 1: {
+			const int v = ByteFromFloat( 1.0f - hybridGBuffer.depth[i] );
+			colorBuffer[i] = PackColor( v, v, v, 255 );
+			break;
+		}
+		case 2: {
+			const unsigned int packed = hybridGBuffer.normalPacked[i];
+			const int r = ByteFromFloat( UnpackSnorm10( packed, 0 ) * 0.5f + 0.5f );
+			const int g = ByteFromFloat( UnpackSnorm10( packed, 10 ) * 0.5f + 0.5f );
+			const int b = ByteFromFloat( UnpackSnorm10( packed, 20 ) * 0.5f + 0.5f );
+			colorBuffer[i] = PackColor( r, g, b, 255 );
+			break;
+		}
+		case 3: {
+			const unsigned int packed = hybridGBuffer.uvPacked[i];
+			const int s = static_cast<int>( packed & 0xffffu ) >> 8;
+			const int t = static_cast<int>( ( packed >> 16 ) & 0xffffu ) >> 8;
+			colorBuffer[i] = PackColor( s, t, 64, 255 );
+			break;
+		}
+		case 4:
+			colorBuffer[i] = IdDebugColor( hybridGBuffer.materialId[i] );
+			break;
+		case 5: {
+			const unsigned int textureId = hybridGBuffer.albedoOrTextureId[i];
+			const int textureIndex = ( textureId != 0xffffffffu && textureId < 0x7fffffffu ) ? static_cast<int>( textureId ) : -1;
+			const unsigned int packedUV = hybridGBuffer.uvPacked[i];
+			const float s = static_cast<float>( packedUV & 0xffffu ) * ( 1.0f / 65535.0f );
+			const float t = static_cast<float>( ( packedUV >> 16 ) & 0xffffu ) * ( 1.0f / 65535.0f );
+			colorBuffer[i] = SampleTexture( textureIndex, s, t );
+			break;
+		}
+		case 6:
+			colorBuffer[i] = IdDebugColor( hybridGBuffer.surfaceId[i] );
+			break;
+		default:
+			colorBuffer[i] = 0xff000000u;
+			break;
+		}
 	}
 }
+
+void idSoftwareRasterizer::BuildHybridTextureUpload( swHybridGBufferUpload_t &gbuffer ) {
+	if ( hybridTextureAtlasGeneration != textureCacheGeneration ||
+		 hybridTextureInfos.Num() == 0 ||
+		 hybridTextureTexels.Num() == 0 ) {
+		const unsigned int whiteTexel = PackColor( 255, 255, 255, 255 );
+		const int maxHybridTextureTexels = 64 * 1024 * 1024;
+		const int textureCount = Max( 1, textureCache.Num() );
+
+		hybridTextureInfos.SetNum( textureCount, false );
+		for ( int i = 0; i < textureCount; i++ ) {
+			swHybridTextureInfo_t &info = hybridTextureInfos[i];
+			info.offset = 0;
+			info.width = 1;
+			info.height = 1;
+			info.repeat = TR_REPEAT;
+		}
+
+		int totalTexels = 1;
+		for ( int i = 0; i < textureCache.Num(); i++ ) {
+			const swTexture_t &texture = textureCache[i];
+			if ( texture.width <= 0 || texture.height <= 0 || texture.texels.Num() <= 0 ) {
+				continue;
+			}
+			if ( texture.width > maxHybridTextureTexels / texture.height ) {
+				continue;
+			}
+			const int texelCount = texture.width * texture.height;
+			if ( texelCount <= 0 || totalTexels > maxHybridTextureTexels - texelCount ) {
+				continue;
+			}
+
+			swHybridTextureInfo_t &info = hybridTextureInfos[i];
+			info.offset = static_cast<unsigned int>( totalTexels );
+			info.width = static_cast<unsigned int>( texture.width );
+			info.height = static_cast<unsigned int>( texture.height );
+			info.repeat = static_cast<unsigned int>( texture.repeat );
+			totalTexels += texelCount;
+		}
+
+		hybridTextureTexels.SetNum( totalTexels, false );
+		hybridTextureTexels[0] = whiteTexel;
+		int outTexel = 1;
+		for ( int i = 0; i < textureCache.Num(); i++ ) {
+			swHybridTextureInfo_t &info = hybridTextureInfos[i];
+			const swTexture_t &texture = textureCache[i];
+			if ( info.offset != static_cast<unsigned int>( outTexel ) ) {
+				continue;
+			}
+
+			const int texelCount = texture.width * texture.height;
+			for ( int texel = 0; texel < texelCount; texel++ ) {
+				hybridTextureTexels[outTexel++] = texel < texture.texels.Num() ? texture.texels[texel] : whiteTexel;
+			}
+		}
+		hybridTextureAtlasGeneration = textureCacheGeneration;
+	}
+
+	gbuffer.textureInfos = hybridTextureInfos.Ptr();
+	gbuffer.textureInfoCount = hybridTextureInfos.Num();
+	gbuffer.textureTexels = hybridTextureTexels.Ptr();
+	gbuffer.textureTexelCount = hybridTextureTexels.Num();
+	gbuffer.textureGeneration = hybridTextureAtlasGeneration;
+}
+
+#if defined( _MSC_VER )
+#pragma optimize( "", off )
+#endif
+void idSoftwareRasterizer::BuildHybridLightUpload( const viewDef_t *viewDef, swHybridGBufferUpload_t &gbuffer ) {
+	hybridLights.SetNum( 0, false );
+	if ( !viewDef ) {
+		gbuffer.lights = NULL;
+		gbuffer.lightCount = 0;
+		return;
+	}
+
+	static const int MAX_HYBRID_LIGHTS = 64;
+	for ( const viewLight_t *vLight = viewDef->viewLights; vLight && hybridLights.Num() < MAX_HYBRID_LIGHTS; vLight = vLight->next ) {
+		if ( !vLight->lightShader || vLight->lightShader->IsFogLight() || vLight->lightShader->IsBlendLight() ) {
+			continue;
+		}
+		if ( !vLight->localInteractions && !vLight->globalInteractions && !vLight->translucentInteractions ) {
+			continue;
+		}
+		if ( vLight->scissorRect.IsEmpty() ) {
+			continue;
+		}
+
+		float lightColor[3] = { 0.0f, 0.0f, 0.0f };
+		idPlane projectedLightProject[4];
+		for ( int i = 0; i < 4; i++ ) {
+			projectedLightProject[i] = vLight->lightProject[i];
+		}
+		int lightTextureIndex = -1;
+		if ( vLight->shaderRegisters ) {
+			for ( int stageIndex = 0; stageIndex < vLight->lightShader->GetNumStages(); stageIndex++ ) {
+				const shaderStage_t *stage = vLight->lightShader->GetStage( stageIndex );
+				if ( !stage || vLight->shaderRegisters[stage->conditionRegister] == 0.0f ) {
+					continue;
+				}
+				lightColor[0] += backEnd.lightScale * vLight->shaderRegisters[stage->color.registers[0]];
+				lightColor[1] += backEnd.lightScale * vLight->shaderRegisters[stage->color.registers[1]];
+				lightColor[2] += backEnd.lightScale * vLight->shaderRegisters[stage->color.registers[2]];
+				if ( lightTextureIndex < 0 && stage->texture.image ) {
+					lightTextureIndex = TextureIndexForImage( stage->texture.image );
+					for ( int i = 0; i < 4; i++ ) {
+						projectedLightProject[i] = vLight->lightProject[i];
+					}
+					if ( stage->texture.hasMatrix ) {
+						RB_GetShaderTextureMatrix( vLight->shaderRegisters, &stage->texture, backEnd.lightTextureMatrix );
+						RB_BakeTextureMatrixIntoTexgen( projectedLightProject, backEnd.lightTextureMatrix );
+					}
+				}
+			}
+		}
+		if ( lightColor[0] <= 0.0f && lightColor[1] <= 0.0f && lightColor[2] <= 0.0f && vLight->lightDef ) {
+			lightColor[0] = backEnd.lightScale * vLight->lightDef->parms.shaderParms[SHADERPARM_RED];
+			lightColor[1] = backEnd.lightScale * vLight->lightDef->parms.shaderParms[SHADERPARM_GREEN];
+			lightColor[2] = backEnd.lightScale * vLight->lightDef->parms.shaderParms[SHADERPARM_BLUE];
+		}
+		if ( lightColor[0] <= 0.0f && lightColor[1] <= 0.0f && lightColor[2] <= 0.0f ) {
+			continue;
+		}
+
+		float radius = 1024.0f;
+		bool parallel = false;
+		if ( vLight->lightDef ) {
+			const renderLight_t &parms = vLight->lightDef->parms;
+			parallel = parms.parallel;
+			radius = Max( idMath::Fabs( parms.lightRadius[0] ), Max( idMath::Fabs( parms.lightRadius[1] ), idMath::Fabs( parms.lightRadius[2] ) ) );
+			radius = Max( radius, 1.0f );
+		}
+		if ( parallel ) {
+			radius = 1000000.0f;
+		}
+		const int falloffTextureIndex = TextureIndexForImage( vLight->falloffImage );
+
+		swHybridLight_t &light = hybridLights.Alloc();
+		light.originRadius[0] = vLight->globalLightOrigin[0];
+		light.originRadius[1] = vLight->globalLightOrigin[1];
+		light.originRadius[2] = vLight->globalLightOrigin[2];
+		light.originRadius[3] = radius;
+		light.color[0] = lightColor[0];
+		light.color[1] = lightColor[1];
+		light.color[2] = lightColor[2];
+		light.color[3] = 1.0f;
+		light.scissor[0] = Max( 0, Min( presentWidth - 1, static_cast<int>( vLight->scissorRect.x1 ) ) );
+		light.scissor[1] = Max( 0, Min( presentHeight - 1, static_cast<int>( vLight->scissorRect.y1 ) ) );
+		light.scissor[2] = Max( 0, Min( presentWidth - 1, static_cast<int>( vLight->scissorRect.x2 ) ) );
+		light.scissor[3] = Max( 0, Min( presentHeight - 1, static_cast<int>( vLight->scissorRect.y2 ) ) );
+		light.flags[0] = vLight->lightShader->IsAmbientLight() ? 1u : 0u;
+		light.flags[1] = parallel ? 1u : 0u;
+		light.flags[2] = ( !vLight->lightShader->IsAmbientLight() && r_softwareRayQueryShadows.GetBool() && r_softwareHybridRayQueryShadows.GetBool() ) ? 1u : 0u;
+		light.flags[3] = 0u;
+		for ( int plane = 0; plane < 4; plane++ ) {
+			for ( int component = 0; component < 4; component++ ) {
+				light.lightProject[plane][component] = projectedLightProject[plane][component];
+			}
+		}
+		light.textureIds[0] = PackOptionalTextureId16( lightTextureIndex );
+		light.textureIds[1] = PackOptionalTextureId16( falloffTextureIndex );
+		light.textureIds[2] = 0u;
+		light.textureIds[3] = 0u;
+	}
+
+	gbuffer.lights = hybridLights.Num() > 0 ? hybridLights.Ptr() : NULL;
+	gbuffer.lightCount = hybridLights.Num();
+}
+#if defined( _MSC_VER )
+#pragma optimize( "", on )
+#endif
 
 void idSoftwareRasterizer::DrawInteraction( const drawInteraction_t *interaction ) {
 	if ( !interaction || !interaction->surf || !interaction->surf->geo || !interaction->surf->space ) {
@@ -1518,6 +2093,10 @@ void idSoftwareRasterizer::RasterizeTriangleInTile( const swTriSetup_t &tri, int
 		RasterizeDepthTriangleInTile( tri, tileX, tileY );
 		return;
 	}
+	if ( tri.writeMask == 0 && tri.depthTest && tri.depthWrite && !tri.depthEqual && tri.alphaTest && tri.writeGBuffer ) {
+		RasterizeAlphaTestDepthTriangleInTile( tri, tileX, tileY );
+		return;
+	}
 
 	const int textureMode = r_softwareTextureMode.GetInteger();
 	if ( textureMode == 1 ) {
@@ -1542,6 +2121,15 @@ void idSoftwareRasterizer::RasterizeDepthTriangleInTile( const swTriSetup_t &tri
 	long long rowE1 = tri.A[1] * basePx + tri.B[1] * basePy + tri.C[1];
 	long long rowE2 = tri.A[2] * basePx + tri.B[2] * basePy + tri.C[2];
 	float rowZ = tri.z0 + tri.dzdx * ( static_cast<float>( x0 ) + 0.5f ) + tri.dzdy * ( static_cast<float>( y0 ) + 0.5f );
+	float rowInvW = tri.invW0 + tri.dinvWdx * ( static_cast<float>( x0 ) + 0.5f ) + tri.dinvWdy * ( static_cast<float>( y0 ) + 0.5f );
+	float rowSOverW = tri.sOverW0 + tri.dsOverWdx * ( static_cast<float>( x0 ) + 0.5f ) + tri.dsOverWdy * ( static_cast<float>( y0 ) + 0.5f );
+	float rowTOverW = tri.tOverW0 + tri.dtOverWdx * ( static_cast<float>( x0 ) + 0.5f ) + tri.dtOverWdy * ( static_cast<float>( y0 ) + 0.5f );
+	float rowGlobalOverW[3];
+	if ( tri.writeWorldPosition ) {
+		for ( int i = 0; i < 3; i++ ) {
+			rowGlobalOverW[i] = tri.globalOverW0[i] + tri.dGlobalOverWdx[i] * ( static_cast<float>( x0 ) + 0.5f ) + tri.dGlobalOverWdy[i] * ( static_cast<float>( y0 ) + 0.5f );
+		}
+	}
 
 	const long long stepX0 = tri.A[0] * SW_FP_ONE;
 	const long long stepX1 = tri.A[1] * SW_FP_ONE;
@@ -1550,8 +2138,19 @@ void idSoftwareRasterizer::RasterizeDepthTriangleInTile( const swTriSetup_t &tri
 	const long long stepY1 = tri.B[1] * SW_FP_ONE;
 	const long long stepY2 = tri.B[2] * SW_FP_ONE;
 
+	float rowNormalOverW[3];
+	float rowTangent0OverW[3];
+	float rowTangent1OverW[3];
+	if ( tri.writeGBuffer ) {
+		for ( int i = 0; i < 3; i++ ) {
+			rowNormalOverW[i] = tri.normalOverW0[i] + tri.dNormalOverWdx[i] * ( static_cast<float>( x0 ) + 0.5f ) + tri.dNormalOverWdy[i] * ( static_cast<float>( y0 ) + 0.5f );
+			rowTangent0OverW[i] = tri.tangent0OverW0[i] + tri.dTangent0OverWdx[i] * ( static_cast<float>( x0 ) + 0.5f ) + tri.dTangent0OverWdy[i] * ( static_cast<float>( y0 ) + 0.5f );
+			rowTangent1OverW[i] = tri.tangent1OverW0[i] + tri.dTangent1OverWdx[i] * ( static_cast<float>( x0 ) + 0.5f ) + tri.dTangent1OverWdy[i] * ( static_cast<float>( y0 ) + 0.5f );
+		}
+	}
+
 #if SW_AVX2_DEPTH_PATH
-	const bool useAVX2 = r_softwareDepthSIMD.GetBool();
+	const bool useAVX2 = r_softwareDepthSIMD.GetBool() && !tri.writeWorldPosition && !tri.writeGBuffer;
 	const __m256i laneI = _mm256_setr_epi32( 0, 1, 2, 3, 4, 5, 6, 7 );
 	const __m256 laneF = _mm256_cvtepi32_ps( laneI );
 	const __m256i minusOne = _mm256_set1_epi32( -1 );
@@ -1563,7 +2162,32 @@ void idSoftwareRasterizer::RasterizeDepthTriangleInTile( const swTriSetup_t &tri
 		long long e1 = rowE1;
 		long long e2 = rowE2;
 		float z = rowZ;
+		float invW = rowInvW;
+		float sOverW = rowSOverW;
+		float tOverW = rowTOverW;
+		float globalOverW[3];
+		if ( tri.writeWorldPosition ) {
+			globalOverW[0] = rowGlobalOverW[0];
+			globalOverW[1] = rowGlobalOverW[1];
+			globalOverW[2] = rowGlobalOverW[2];
+		}
+		float normalOverW[3];
+		float tangent0OverW[3];
+		float tangent1OverW[3];
+		if ( tri.writeGBuffer ) {
+			normalOverW[0] = rowNormalOverW[0];
+			normalOverW[1] = rowNormalOverW[1];
+			normalOverW[2] = rowNormalOverW[2];
+			tangent0OverW[0] = rowTangent0OverW[0];
+			tangent0OverW[1] = rowTangent0OverW[1];
+			tangent0OverW[2] = rowTangent0OverW[2];
+			tangent1OverW[0] = rowTangent1OverW[0];
+			tangent1OverW[1] = rowTangent1OverW[1];
+			tangent1OverW[2] = rowTangent1OverW[2];
+		}
 		float *depth = depthBuffer.Ptr() + y * width + x0;
+		idVec4 *worldPos = worldPositionBuffer.Ptr() + y * width + x0;
+		int pixelIndex = y * width + x0;
 		int x = x0;
 
 #if SW_AVX2_DEPTH_PATH
@@ -1601,19 +2225,232 @@ void idSoftwareRasterizer::RasterizeDepthTriangleInTile( const swTriSetup_t &tri
 		for ( ; x <= x1; x++ ) {
 			if ( ( e0 | e1 | e2 ) >= 0 && z < *depth ) {
 				*depth = z;
+				if ( tri.writeWorldPosition && invW != 0.0f ) {
+					const float invPerspective = 1.0f / invW;
+					worldPos->Set( globalOverW[0] * invPerspective, globalOverW[1] * invPerspective, globalOverW[2] * invPerspective, 1.0f );
+				}
+				if ( tri.writeGBuffer ) {
+					WriteHybridGBufferPixel( pixelIndex, tri, z, invW, sOverW, tOverW, normalOverW, tangent0OverW, tangent1OverW );
+				}
 			}
 
 			e0 += stepX0;
 			e1 += stepX1;
 			e2 += stepX2;
 			z += tri.dzdx;
+			invW += tri.dinvWdx;
+			sOverW += tri.dsOverWdx;
+			tOverW += tri.dtOverWdx;
+			if ( tri.writeWorldPosition ) {
+				globalOverW[0] += tri.dGlobalOverWdx[0];
+				globalOverW[1] += tri.dGlobalOverWdx[1];
+				globalOverW[2] += tri.dGlobalOverWdx[2];
+			}
+			if ( tri.writeGBuffer ) {
+				normalOverW[0] += tri.dNormalOverWdx[0];
+				normalOverW[1] += tri.dNormalOverWdx[1];
+				normalOverW[2] += tri.dNormalOverWdx[2];
+				tangent0OverW[0] += tri.dTangent0OverWdx[0];
+				tangent0OverW[1] += tri.dTangent0OverWdx[1];
+				tangent0OverW[2] += tri.dTangent0OverWdx[2];
+				tangent1OverW[0] += tri.dTangent1OverWdx[0];
+				tangent1OverW[1] += tri.dTangent1OverWdx[1];
+				tangent1OverW[2] += tri.dTangent1OverWdx[2];
+			}
 			depth++;
+			worldPos++;
+			pixelIndex++;
 		}
 
 		rowE0 += stepY0;
 		rowE1 += stepY1;
 		rowE2 += stepY2;
 		rowZ += tri.dzdy;
+		rowInvW += tri.dinvWdy;
+		rowSOverW += tri.dsOverWdy;
+		rowTOverW += tri.dtOverWdy;
+		if ( tri.writeWorldPosition ) {
+			rowGlobalOverW[0] += tri.dGlobalOverWdy[0];
+			rowGlobalOverW[1] += tri.dGlobalOverWdy[1];
+			rowGlobalOverW[2] += tri.dGlobalOverWdy[2];
+		}
+		if ( tri.writeGBuffer ) {
+			rowNormalOverW[0] += tri.dNormalOverWdy[0];
+			rowNormalOverW[1] += tri.dNormalOverWdy[1];
+			rowNormalOverW[2] += tri.dNormalOverWdy[2];
+			rowTangent0OverW[0] += tri.dTangent0OverWdy[0];
+			rowTangent0OverW[1] += tri.dTangent0OverWdy[1];
+			rowTangent0OverW[2] += tri.dTangent0OverWdy[2];
+			rowTangent1OverW[0] += tri.dTangent1OverWdy[0];
+			rowTangent1OverW[1] += tri.dTangent1OverWdy[1];
+			rowTangent1OverW[2] += tri.dTangent1OverWdy[2];
+		}
+	}
+}
+
+void idSoftwareRasterizer::RasterizeAlphaTestDepthTriangleInTile( const swTriSetup_t &tri, int tileX, int tileY ) {
+	const int x0 = Max( tri.minX, tileX * SW_TILE_SIZE );
+	const int y0 = Max( tri.minY, tileY * SW_TILE_SIZE );
+	const int x1 = Min( tri.maxX, ( tileX + 1 ) * SW_TILE_SIZE - 1 );
+	const int y1 = Min( tri.maxY, ( tileY + 1 ) * SW_TILE_SIZE - 1 );
+
+	const int basePx = ( x0 << SW_FP_SHIFT ) + SW_FP_HALF;
+	const int basePy = ( y0 << SW_FP_SHIFT ) + SW_FP_HALF;
+
+	long long rowE0 = tri.A[0] * basePx + tri.B[0] * basePy + tri.C[0];
+	long long rowE1 = tri.A[1] * basePx + tri.B[1] * basePy + tri.C[1];
+	long long rowE2 = tri.A[2] * basePx + tri.B[2] * basePy + tri.C[2];
+	float rowZ = tri.z0 + tri.dzdx * ( static_cast<float>( x0 ) + 0.5f ) + tri.dzdy * ( static_cast<float>( y0 ) + 0.5f );
+	float rowInvW = tri.invW0 + tri.dinvWdx * ( static_cast<float>( x0 ) + 0.5f ) + tri.dinvWdy * ( static_cast<float>( y0 ) + 0.5f );
+	float rowSOverW = tri.sOverW0 + tri.dsOverWdx * ( static_cast<float>( x0 ) + 0.5f ) + tri.dsOverWdy * ( static_cast<float>( y0 ) + 0.5f );
+	float rowTOverW = tri.tOverW0 + tri.dtOverWdx * ( static_cast<float>( x0 ) + 0.5f ) + tri.dtOverWdy * ( static_cast<float>( y0 ) + 0.5f );
+
+	float rowGlobalOverW[3];
+	if ( tri.writeWorldPosition ) {
+		for ( int i = 0; i < 3; i++ ) {
+			rowGlobalOverW[i] = tri.globalOverW0[i] + tri.dGlobalOverWdx[i] * ( static_cast<float>( x0 ) + 0.5f ) + tri.dGlobalOverWdy[i] * ( static_cast<float>( y0 ) + 0.5f );
+		}
+	}
+
+	float rowColorOverW[4];
+	if ( tri.needsColorModulation ) {
+		for ( int i = 0; i < 4; i++ ) {
+			rowColorOverW[i] = tri.colorOverW0[i] + tri.dColorOverWdx[i] * ( static_cast<float>( x0 ) + 0.5f ) + tri.dColorOverWdy[i] * ( static_cast<float>( y0 ) + 0.5f );
+		}
+	}
+
+	float rowNormalOverW[3];
+	float rowTangent0OverW[3];
+	float rowTangent1OverW[3];
+	for ( int i = 0; i < 3; i++ ) {
+		rowNormalOverW[i] = tri.normalOverW0[i] + tri.dNormalOverWdx[i] * ( static_cast<float>( x0 ) + 0.5f ) + tri.dNormalOverWdy[i] * ( static_cast<float>( y0 ) + 0.5f );
+		rowTangent0OverW[i] = tri.tangent0OverW0[i] + tri.dTangent0OverWdx[i] * ( static_cast<float>( x0 ) + 0.5f ) + tri.dTangent0OverWdy[i] * ( static_cast<float>( y0 ) + 0.5f );
+		rowTangent1OverW[i] = tri.tangent1OverW0[i] + tri.dTangent1OverWdx[i] * ( static_cast<float>( x0 ) + 0.5f ) + tri.dTangent1OverWdy[i] * ( static_cast<float>( y0 ) + 0.5f );
+	}
+
+	const long long stepX0 = tri.A[0] * SW_FP_ONE;
+	const long long stepX1 = tri.A[1] * SW_FP_ONE;
+	const long long stepX2 = tri.A[2] * SW_FP_ONE;
+	const long long stepY0 = tri.B[0] * SW_FP_ONE;
+	const long long stepY1 = tri.B[1] * SW_FP_ONE;
+	const long long stepY2 = tri.B[2] * SW_FP_ONE;
+
+	for ( int y = y0; y <= y1; y++ ) {
+		long long e0 = rowE0;
+		long long e1 = rowE1;
+		long long e2 = rowE2;
+		float z = rowZ;
+		float invW = rowInvW;
+		float sOverW = rowSOverW;
+		float tOverW = rowTOverW;
+		float globalOverW[3];
+		if ( tri.writeWorldPosition ) {
+			globalOverW[0] = rowGlobalOverW[0];
+			globalOverW[1] = rowGlobalOverW[1];
+			globalOverW[2] = rowGlobalOverW[2];
+		}
+		float colorOverW[4];
+		if ( tri.needsColorModulation ) {
+			colorOverW[0] = rowColorOverW[0];
+			colorOverW[1] = rowColorOverW[1];
+			colorOverW[2] = rowColorOverW[2];
+			colorOverW[3] = rowColorOverW[3];
+		}
+		float normalOverW[3];
+		float tangent0OverW[3];
+		float tangent1OverW[3];
+		normalOverW[0] = rowNormalOverW[0];
+		normalOverW[1] = rowNormalOverW[1];
+		normalOverW[2] = rowNormalOverW[2];
+		tangent0OverW[0] = rowTangent0OverW[0];
+		tangent0OverW[1] = rowTangent0OverW[1];
+		tangent0OverW[2] = rowTangent0OverW[2];
+		tangent1OverW[0] = rowTangent1OverW[0];
+		tangent1OverW[1] = rowTangent1OverW[1];
+		tangent1OverW[2] = rowTangent1OverW[2];
+
+		float *depth = depthBuffer.Ptr() + y * width + x0;
+		idVec4 *worldPos = worldPositionBuffer.Ptr() + y * width + x0;
+		int pixelIndex = y * width + x0;
+
+		for ( int x = x0; x <= x1; x++ ) {
+			if ( ( e0 | e1 | e2 ) >= 0 && z < *depth && invW != 0.0f ) {
+				const float invPerspective = 1.0f / invW;
+				const float s = sOverW * invPerspective;
+				const float t = tOverW * invPerspective;
+				const unsigned int texel = SampleTexture( tri.textureIndex, s, t );
+				int alpha = static_cast<int>( ( texel >> 24 ) & 255u );
+				if ( tri.needsColorModulation ) {
+					alpha = ByteFromFloat( static_cast<float>( alpha ) * ( 1.0f / 255.0f ) * colorOverW[3] * invPerspective );
+				}
+				if ( alpha >= tri.alphaTestByte ) {
+					*depth = z;
+					if ( tri.writeWorldPosition ) {
+						worldPos->Set( globalOverW[0] * invPerspective, globalOverW[1] * invPerspective, globalOverW[2] * invPerspective, 1.0f );
+					}
+					WriteHybridGBufferPixel( pixelIndex, tri, z, invW, sOverW, tOverW, normalOverW, tangent0OverW, tangent1OverW );
+				}
+			}
+
+			e0 += stepX0;
+			e1 += stepX1;
+			e2 += stepX2;
+			z += tri.dzdx;
+			invW += tri.dinvWdx;
+			sOverW += tri.dsOverWdx;
+			tOverW += tri.dtOverWdx;
+			if ( tri.writeWorldPosition ) {
+				globalOverW[0] += tri.dGlobalOverWdx[0];
+				globalOverW[1] += tri.dGlobalOverWdx[1];
+				globalOverW[2] += tri.dGlobalOverWdx[2];
+			}
+			if ( tri.needsColorModulation ) {
+				colorOverW[0] += tri.dColorOverWdx[0];
+				colorOverW[1] += tri.dColorOverWdx[1];
+				colorOverW[2] += tri.dColorOverWdx[2];
+				colorOverW[3] += tri.dColorOverWdx[3];
+			}
+			normalOverW[0] += tri.dNormalOverWdx[0];
+			normalOverW[1] += tri.dNormalOverWdx[1];
+			normalOverW[2] += tri.dNormalOverWdx[2];
+			tangent0OverW[0] += tri.dTangent0OverWdx[0];
+			tangent0OverW[1] += tri.dTangent0OverWdx[1];
+			tangent0OverW[2] += tri.dTangent0OverWdx[2];
+			tangent1OverW[0] += tri.dTangent1OverWdx[0];
+			tangent1OverW[1] += tri.dTangent1OverWdx[1];
+			tangent1OverW[2] += tri.dTangent1OverWdx[2];
+			depth++;
+			worldPos++;
+			pixelIndex++;
+		}
+
+		rowE0 += stepY0;
+		rowE1 += stepY1;
+		rowE2 += stepY2;
+		rowZ += tri.dzdy;
+		rowInvW += tri.dinvWdy;
+		rowSOverW += tri.dsOverWdy;
+		rowTOverW += tri.dtOverWdy;
+		if ( tri.writeWorldPosition ) {
+			rowGlobalOverW[0] += tri.dGlobalOverWdy[0];
+			rowGlobalOverW[1] += tri.dGlobalOverWdy[1];
+			rowGlobalOverW[2] += tri.dGlobalOverWdy[2];
+		}
+		if ( tri.needsColorModulation ) {
+			rowColorOverW[0] += tri.dColorOverWdy[0];
+			rowColorOverW[1] += tri.dColorOverWdy[1];
+			rowColorOverW[2] += tri.dColorOverWdy[2];
+			rowColorOverW[3] += tri.dColorOverWdy[3];
+		}
+		rowNormalOverW[0] += tri.dNormalOverWdy[0];
+		rowNormalOverW[1] += tri.dNormalOverWdy[1];
+		rowNormalOverW[2] += tri.dNormalOverWdy[2];
+		rowTangent0OverW[0] += tri.dTangent0OverWdy[0];
+		rowTangent0OverW[1] += tri.dTangent0OverWdy[1];
+		rowTangent0OverW[2] += tri.dTangent0OverWdy[2];
+		rowTangent1OverW[0] += tri.dTangent1OverWdy[0];
+		rowTangent1OverW[1] += tri.dTangent1OverWdy[1];
+		rowTangent1OverW[2] += tri.dTangent1OverWdy[2];
 	}
 }
 
@@ -1726,6 +2563,12 @@ void idSoftwareRasterizer::RasterizeTriangleInTileSpecialized( const swTriSetup_
 			rowColorOverW[i] = tri.colorOverW0[i] + tri.dColorOverWdx[i] * ( static_cast<float>( x0 ) + 0.5f ) + tri.dColorOverWdy[i] * ( static_cast<float>( y0 ) + 0.5f );
 		}
 	}
+	float rowGlobalOverW[3];
+	if ( tri.writeWorldPosition ) {
+		for ( int i = 0; i < 3; i++ ) {
+			rowGlobalOverW[i] = tri.globalOverW0[i] + tri.dGlobalOverWdx[i] * ( static_cast<float>( x0 ) + 0.5f ) + tri.dGlobalOverWdy[i] * ( static_cast<float>( y0 ) + 0.5f );
+		}
+	}
 
 	const long long stepX0 = tri.A[0] * SW_FP_ONE;
 	const long long stepX1 = tri.A[1] * SW_FP_ONE;
@@ -1749,17 +2592,28 @@ void idSoftwareRasterizer::RasterizeTriangleInTileSpecialized( const swTriSetup_
 			colorOverW[2] = rowColorOverW[2];
 			colorOverW[3] = rowColorOverW[3];
 		}
+		float globalOverW[3];
+		if ( tri.writeWorldPosition ) {
+			globalOverW[0] = rowGlobalOverW[0];
+			globalOverW[1] = rowGlobalOverW[1];
+			globalOverW[2] = rowGlobalOverW[2];
+		}
 		float *depth = depthBuffer.Ptr() + y * width + x0;
 		unsigned int *color = colorBuffer.Ptr() + y * width + x0;
+		idVec4 *worldPos = worldPositionBuffer.Ptr() + y * width + x0;
 
 		for ( int x = x0; x <= x1; x++ ) {
 			if ( ( e0 | e1 | e2 ) >= 0 ) {
 				const bool depthPass = !DEPTH_TEST || ( tri.depthEqual ? idMath::Fabs( z - *depth ) <= SW_DEPTH_EQUAL_EPSILON : z < *depth );
 				if ( depthPass ) {
 					const unsigned int srcColor = ShadePixel<HAS_TEXTURE, TEXTURE_MODE, COLOR_MOD>( tri, invW, sOverW, tOverW, colorOverW );
-					if ( !ALPHA_TEST || ( ( srcColor >> 24 ) & 255 ) >= tri.alphaTestByte ) {
+					if ( !ALPHA_TEST || static_cast<int>( ( srcColor >> 24 ) & 255u ) >= tri.alphaTestByte ) {
 						if ( DEPTH_WRITE ) {
 							*depth = z;
+							if ( tri.writeWorldPosition && invW != 0.0f ) {
+								const float invPerspective = 1.0f / invW;
+								worldPos->Set( globalOverW[0] * invPerspective, globalOverW[1] * invPerspective, globalOverW[2] * invPerspective, 1.0f );
+							}
 						}
 						WritePixelColor<BLEND_MODE, WRITE_MASK>( tri, srcColor, color );
 					}
@@ -1778,8 +2632,14 @@ void idSoftwareRasterizer::RasterizeTriangleInTileSpecialized( const swTriSetup_
 				colorOverW[2] += tri.dColorOverWdx[2];
 				colorOverW[3] += tri.dColorOverWdx[3];
 			}
+			if ( tri.writeWorldPosition ) {
+				globalOverW[0] += tri.dGlobalOverWdx[0];
+				globalOverW[1] += tri.dGlobalOverWdx[1];
+				globalOverW[2] += tri.dGlobalOverWdx[2];
+			}
 			depth++;
 			color++;
+			worldPos++;
 		}
 
 		rowE0 += stepY0;
@@ -1795,7 +2655,51 @@ void idSoftwareRasterizer::RasterizeTriangleInTileSpecialized( const swTriSetup_
 			rowColorOverW[2] += tri.dColorOverWdy[2];
 			rowColorOverW[3] += tri.dColorOverWdy[3];
 		}
+		if ( tri.writeWorldPosition ) {
+			rowGlobalOverW[0] += tri.dGlobalOverWdy[0];
+			rowGlobalOverW[1] += tri.dGlobalOverWdy[1];
+			rowGlobalOverW[2] += tri.dGlobalOverWdy[2];
+		}
 	}
+}
+
+void idSoftwareRasterizer::WriteHybridGBufferPixel( int pixelIndex, const swTriSetup_t &tri, float z, float invW, float sOverW, float tOverW, const float normalOverW[3], const float tangent0OverW[3], const float tangent1OverW[3] ) {
+	if ( pixelIndex < 0 || pixelIndex >= hybridGBuffer.depth.Num() ) {
+		return;
+	}
+
+	float s = 0.0f;
+	float t = 0.0f;
+	idVec3 normal( 0.0f, 0.0f, 1.0f );
+	idVec3 tangent0( 1.0f, 0.0f, 0.0f );
+	idVec3 tangent1( 0.0f, 1.0f, 0.0f );
+	if ( invW != 0.0f ) {
+		const float invPerspective = 1.0f / invW;
+		s = sOverW * invPerspective;
+		t = tOverW * invPerspective;
+		normal.Set( normalOverW[0] * invPerspective, normalOverW[1] * invPerspective, normalOverW[2] * invPerspective );
+		if ( normal.Normalize() == 0.0f ) {
+			normal.Set( 0.0f, 0.0f, 1.0f );
+		}
+		tangent0.Set( tangent0OverW[0] * invPerspective, tangent0OverW[1] * invPerspective, tangent0OverW[2] * invPerspective );
+		if ( tangent0.Normalize() == 0.0f ) {
+			tangent0.Set( 1.0f, 0.0f, 0.0f );
+		}
+		tangent1.Set( tangent1OverW[0] * invPerspective, tangent1OverW[1] * invPerspective, tangent1OverW[2] * invPerspective );
+		if ( tangent1.Normalize() == 0.0f ) {
+			tangent1.Set( 0.0f, 1.0f, 0.0f );
+		}
+	}
+
+	hybridGBuffer.depth[pixelIndex] = z;
+	hybridGBuffer.normalPacked[pixelIndex] = PackNormal10( normal );
+	hybridGBuffer.tangentPacked[pixelIndex] = PackNormal10( tangent0 );
+	hybridGBuffer.bitangentPacked[pixelIndex] = PackNormal10( tangent1 );
+	hybridGBuffer.uvPacked[pixelIndex] = PackUV16( s, t );
+	hybridGBuffer.materialId[pixelIndex] = tri.materialId;
+	hybridGBuffer.albedoOrTextureId[pixelIndex] = tri.albedoOrTextureId;
+	hybridGBuffer.specularAndFlags[pixelIndex] = tri.specularAndFlags;
+	hybridGBuffer.surfaceId[pixelIndex] = tri.surfaceId;
 }
 
 void idSoftwareRasterizer::RasterizeInteractionTriangleInTile( const swInteractionTri_t &tri, int tileX, int tileY ) {
@@ -1842,7 +2746,7 @@ void idSoftwareRasterizer::RasterizeInteractionTriangleInTile( const swInteracti
 			if ( ( e0 | e1 | e2 ) >= 0 ) {
 				const bool depthPass = tri.depthEqual ? idMath::Fabs( z - *depth ) <= SW_DEPTH_EQUAL_EPSILON : z < *depth;
 				if ( depthPass ) {
-					const unsigned int srcColor = ShadeInteractionPixel( tri, invW, attrOverW );
+					const unsigned int srcColor = ShadeInteractionPixel( tri, x, y, invW, attrOverW );
 					if ( ( srcColor & 0x00ffffffu ) != 0 ) {
 						*color = AdditiveColor( srcColor, *color );
 					}
@@ -1872,7 +2776,14 @@ void idSoftwareRasterizer::RasterizeInteractionTriangleInTile( const swInteracti
 	}
 }
 
-unsigned int idSoftwareRasterizer::ShadeInteractionPixel( const swInteractionTri_t &tri, float invW, const float attrOverW[SW_INTERACTION_ATTR_COUNT] ) const {
+float idSoftwareRasterizer::ShadowVisibility( int x, int y ) const {
+	if ( !shadowMaskActive || x < 0 || y < 0 || x >= width || y >= height || shadowMask.Num() != width * height ) {
+		return 1.0f;
+	}
+	return static_cast<float>( shadowMask[y * width + x] ) * ( 1.0f / 255.0f );
+}
+
+unsigned int idSoftwareRasterizer::ShadeInteractionPixel( const swInteractionTri_t &tri, int x, int y, float invW, const float attrOverW[SW_INTERACTION_ATTR_COUNT] ) const {
 	if ( invW == 0.0f ) {
 		return 0;
 	}
@@ -1953,6 +2864,11 @@ unsigned int idSoftwareRasterizer::ShadeInteractionPixel( const swInteractionTri
 		return 0;
 	}
 
+	const float shadowVisibility = tri.ambientLight ? 1.0f : ShadowVisibility( x, y );
+	if ( shadowVisibility <= 0.0f ) {
+		return 0;
+	}
+
 	float vertexScale[4];
 	if ( tri.vertexColor == SVC_MODULATE ) {
 		vertexScale[0] = attr[SW_ATTR_COLOR_R];
@@ -1969,9 +2885,9 @@ unsigned int idSoftwareRasterizer::ShadeInteractionPixel( const swInteractionTri
 	}
 
 	const unsigned int diffuseTexel = SampleTexture( tri.diffuseTextureIndex, diffuseS, diffuseT );
-	float r = ColorChannel( diffuseTexel, 16 ) * tri.diffuseColor[0] * ColorChannel( lightTexel, 16 ) * falloff * nDotL * vertexScale[0];
-	float g = ColorChannel( diffuseTexel, 8 ) * tri.diffuseColor[1] * ColorChannel( lightTexel, 8 ) * falloff * nDotL * vertexScale[1];
-	float b = ColorChannel( diffuseTexel, 0 ) * tri.diffuseColor[2] * ColorChannel( lightTexel, 0 ) * falloff * nDotL * vertexScale[2];
+	float r = ColorChannel( diffuseTexel, 16 ) * tri.diffuseColor[0] * ColorChannel( lightTexel, 16 ) * falloff * nDotL * shadowVisibility * vertexScale[0];
+	float g = ColorChannel( diffuseTexel, 8 ) * tri.diffuseColor[1] * ColorChannel( lightTexel, 8 ) * falloff * nDotL * shadowVisibility * vertexScale[1];
+	float b = ColorChannel( diffuseTexel, 0 ) * tri.diffuseColor[2] * ColorChannel( lightTexel, 0 ) * falloff * nDotL * shadowVisibility * vertexScale[2];
 
 	if ( !tri.ambientLight && ( tri.specularColor[0] > 0.0f || tri.specularColor[1] > 0.0f || tri.specularColor[2] > 0.0f ) ) {
 		idVec3 viewVec = tri.localViewOrigin.ToVec3() - localPos;
@@ -1986,9 +2902,9 @@ unsigned int idSoftwareRasterizer::ShadeInteractionPixel( const swInteractionTri
 					const float specular = idMath::Pow( Max( 0.0f, bumpNormal * halfTS ), 16.0f );
 					if ( specular > 0.0f ) {
 						const unsigned int specularTexel = SampleTexture( tri.specularTextureIndex, specularS, specularT );
-						r += ColorChannel( specularTexel, 16 ) * tri.specularColor[0] * ColorChannel( lightTexel, 16 ) * falloff * specular * vertexScale[0];
-						g += ColorChannel( specularTexel, 8 ) * tri.specularColor[1] * ColorChannel( lightTexel, 8 ) * falloff * specular * vertexScale[1];
-						b += ColorChannel( specularTexel, 0 ) * tri.specularColor[2] * ColorChannel( lightTexel, 0 ) * falloff * specular * vertexScale[2];
+						r += ColorChannel( specularTexel, 16 ) * tri.specularColor[0] * ColorChannel( lightTexel, 16 ) * falloff * specular * shadowVisibility * vertexScale[0];
+						g += ColorChannel( specularTexel, 8 ) * tri.specularColor[1] * ColorChannel( lightTexel, 8 ) * falloff * specular * shadowVisibility * vertexScale[1];
+						b += ColorChannel( specularTexel, 0 ) * tri.specularColor[2] * ColorChannel( lightTexel, 0 ) * falloff * specular * shadowVisibility * vertexScale[2];
 					}
 				}
 			}
@@ -2043,7 +2959,7 @@ ID_INLINE unsigned int idSoftwareRasterizer::BlendColorSpecialized( unsigned int
 		const int r = Min( 255, static_cast<int>( ( src >> 16 ) & 255 ) + static_cast<int>( ( dst >> 16 ) & 255 ) );
 		const int g = Min( 255, static_cast<int>( ( src >> 8 ) & 255 ) + static_cast<int>( ( dst >> 8 ) & 255 ) );
 		const int b = Min( 255, static_cast<int>( src & 255 ) + static_cast<int>( dst & 255 ) );
-		const int a = Min( 255, static_cast<int>( ( src >> 24 ) & 255 ) + static_cast<int>( ( dst >> 24 ) & 255 ) );
+		const int a = static_cast<int>( ( dst >> 24 ) & 255 );
 		return PackColor( r, g, b, a );
 	}
 	if ( BLEND_MODE == SW_BLEND_FILTER ) {
@@ -2119,6 +3035,15 @@ void idSoftwareRasterizer::ApplyLightScale() {
 }
 
 void idSoftwareRasterizer::Present() const {
+	if ( width <= 0 || height <= 0 || colorBuffer.Num() != width * height ) {
+		return;
+	}
+
+	if ( r_softwareVulkanPresent.GetBool() &&
+		 SWVulkan_BlitView( backEnd.viewDef, colorBuffer.Ptr(), width, height, presentWidth, presentHeight ) ) {
+		return;
+	}
+
 	RB_SetGL2D();
 	GL_State( GLS_DEPTHFUNC_ALWAYS | GLS_SRCBLEND_ONE | GLS_DSTBLEND_ZERO );
 	qglDisable( GL_DEPTH_TEST );
@@ -2164,9 +3089,15 @@ void idSoftwareRasterizer::SelectSurfaceStage( int surfIndex, const drawSurf_t *
 	stageInfo.drawStage = true;
 	stageInfo.needsColorModulation = false;
 	stageInfo.alphaTest = false;
+	stageInfo.writeWorldPosition = false;
+	stageInfo.writeGBuffer = false;
 	stageInfo.alphaTestValue = 0.0f;
 	stageInfo.alphaTestByte = 0;
 	stageInfo.fallbackColor = SurfaceColor( surfIndex, surf );
+	stageInfo.materialId = 0;
+	stageInfo.surfaceId = 0;
+	stageInfo.albedoOrTextureId = 0xffffffffu;
+	stageInfo.specularAndFlags = 0;
 
 	const idMaterial *material = surf->material;
 	const float *regs = surf->shaderRegisters;
@@ -2285,6 +3216,11 @@ int idSoftwareRasterizer::TextureIndexForImage( const idImage *image ) {
 		texture.image = image;
 		texture.name = image->imgName;
 		LoadDefaultTexture( texture );
+	}
+	textureCacheGeneration++;
+	if ( textureCacheGeneration == 0 ) {
+		textureCacheGeneration = 1;
+		hybridTextureAtlasGeneration = 0;
 	}
 	return textureCache.Num() - 1;
 }
@@ -2636,6 +3572,56 @@ unsigned int idSoftwareRasterizer::PackColor( int r, int g, int b, int a ) {
 	return ( static_cast<unsigned int>( a ) << 24 ) | ( static_cast<unsigned int>( r ) << 16 ) | ( static_cast<unsigned int>( g ) << 8 ) | static_cast<unsigned int>( b );
 }
 
+int idSoftwareRasterizer::PackSnorm10( float value ) {
+	const float clamped = idMath::ClampFloat( -1.0f, 1.0f, value );
+	const int quantized = Max( -511, Min( 511, idMath::FtoiFast( clamped * 511.0f ) ) );
+	return quantized & 1023;
+}
+
+float idSoftwareRasterizer::UnpackSnorm10( unsigned int packed, int shift ) {
+	int value = static_cast<int>( ( packed >> shift ) & 1023u );
+	if ( value & 512 ) {
+		value |= ~1023;
+	}
+	return idMath::ClampFloat( -1.0f, 1.0f, static_cast<float>( value ) * ( 1.0f / 511.0f ) );
+}
+
+unsigned int idSoftwareRasterizer::PackNormal10( const idVec3 &normal ) {
+	return static_cast<unsigned int>( PackSnorm10( normal[0] ) ) |
+		( static_cast<unsigned int>( PackSnorm10( normal[1] ) ) << 10 ) |
+		( static_cast<unsigned int>( PackSnorm10( normal[2] ) ) << 20 );
+}
+
+unsigned int idSoftwareRasterizer::PackUV16( float s, float t ) {
+	const float wrappedS = WrapTextureCoordinate( s, TR_REPEAT );
+	const float wrappedT = WrapTextureCoordinate( t, TR_REPEAT );
+	const unsigned int us = static_cast<unsigned int>( Max( 0, Min( 65535, idMath::FtoiFast( wrappedS * 65535.0f ) ) ) );
+	const unsigned int vt = static_cast<unsigned int>( Max( 0, Min( 65535, idMath::FtoiFast( wrappedT * 65535.0f ) ) ) );
+	return us | ( vt << 16 );
+}
+
+unsigned int idSoftwareRasterizer::PackOptionalTextureId16( int textureIndex ) {
+	if ( textureIndex < 0 ) {
+		return 0;
+	}
+	return static_cast<unsigned int>( Max( 1, Min( 65535, textureIndex + 1 ) ) );
+}
+
+unsigned int idSoftwareRasterizer::IdDebugColor( unsigned int value ) {
+	if ( value == 0xffffffffu ) {
+		return PackColor( 255, 0, 255, 255 );
+	}
+	value ^= value >> 16;
+	value *= 0x7feb352du;
+	value ^= value >> 15;
+	value *= 0x846ca68bu;
+	value ^= value >> 16;
+	return PackColor( 64 + static_cast<int>( value & 127u ),
+		64 + static_cast<int>( ( value >> 8 ) & 127u ),
+		64 + static_cast<int>( ( value >> 16 ) & 127u ),
+		255 );
+}
+
 unsigned int idSoftwareRasterizer::ModulateColor( unsigned int color, const float scale[4] ) {
 	const int b = ByteFromFloat( static_cast<float>( color & 255 ) / 255.0f * scale[2] );
 	const int g = ByteFromFloat( static_cast<float>( ( color >> 8 ) & 255 ) / 255.0f * scale[1] );
@@ -2687,6 +3673,12 @@ void idSoftwareRasterizer::LerpClipVertex( const swClipVert_t &a, const swClipVe
 	for ( int i = 0; i < 4; i++ ) {
 		out.clip[i] = a.clip[i] + ( b.clip[i] - a.clip[i] ) * fraction;
 		out.color[i] = a.color[i] + ( b.color[i] - a.color[i] ) * fraction;
+	}
+	for ( int i = 0; i < 3; i++ ) {
+		out.global[i] = a.global[i] + ( b.global[i] - a.global[i] ) * fraction;
+		out.normal[i] = a.normal[i] + ( b.normal[i] - a.normal[i] ) * fraction;
+		out.tangent[0][i] = a.tangent[0][i] + ( b.tangent[0][i] - a.tangent[0][i] ) * fraction;
+		out.tangent[1][i] = a.tangent[1][i] + ( b.tangent[1][i] - a.tangent[1][i] ) * fraction;
 	}
 	for ( int i = 0; i < SW_INTERACTION_ATTR_COUNT; i++ ) {
 		out.attr[i] = a.attr[i] + ( b.attr[i] - a.attr[i] ) * fraction;

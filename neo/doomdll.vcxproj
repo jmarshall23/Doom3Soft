@@ -243,6 +243,7 @@
     <Link>
       <AdditionalLibraryDirectories>openal\lib;sys\win32\dongle;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <OutputFile>../Doom3.exe</OutputFile>
+      <GenerateDebugInformation>DebugFull</GenerateDebugInformation>
     </Link>
     <ClCompile>
       <PrecompiledHeader>Use</PrecompiledHeader>
@@ -309,6 +310,9 @@
     <ClInclude Include="renderer\qgl_linked.h" />
     <ClInclude Include="renderer\RenderSystem.h" />
     <ClInclude Include="renderer\SoftwareRasterizer.h" />
+    <ClInclude Include="renderer\SoftwareHybridComposite_spv.h" />
+    <ClInclude Include="renderer\SoftwareRayQueryShadow_spv.h" />
+    <ClInclude Include="renderer\SoftwareVulkanBridge.h" />
     <ClInclude Include="renderer\RenderWorld.h" />
     <ClInclude Include="renderer\RenderWorld_local.h" />
     <ClInclude Include="renderer\simplex.h" />
@@ -1343,6 +1347,7 @@
       <AdditionalOptions Condition="'$(Platform)'=='x64'">/arch:AVX2 %(AdditionalOptions)</AdditionalOptions>
       <PreprocessorDefinitions Condition="'$(Platform)'=='x64'">SW_COMPILE_AVX2=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
+    <ClCompile Include="renderer\SoftwareVulkanBridge.cpp" />
     <ClCompile Include="renderer\RenderWorld.cpp" />
     <ClCompile Include="renderer\RenderWorld_demo.cpp" />
     <ClCompile Include="renderer\RenderWorld_load.cpp" />
@@ -3130,6 +3135,10 @@
       <Project>{49bec5c6-b964-417a-851e-808886b57400}</Project>
       <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
     </ProjectReference>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="renderer\SoftwareHybridComposite.comp" />
+    <None Include="renderer\SoftwareRayQueryShadow.comp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

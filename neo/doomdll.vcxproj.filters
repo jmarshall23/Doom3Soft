@@ -273,6 +273,15 @@
     <ClInclude Include="renderer\SoftwareRasterizer.h">
       <Filter>Renderer</Filter>
     </ClInclude>
+    <ClInclude Include="renderer\SoftwareHybridComposite_spv.h">
+      <Filter>Renderer</Filter>
+    </ClInclude>
+    <ClInclude Include="renderer\SoftwareRayQueryShadow_spv.h">
+      <Filter>Renderer</Filter>
+    </ClInclude>
+    <ClInclude Include="renderer\SoftwareVulkanBridge.h">
+      <Filter>Renderer</Filter>
+    </ClInclude>
     <ClInclude Include="renderer\RenderWorld.h">
       <Filter>Renderer</Filter>
     </ClInclude>
@@ -867,6 +876,9 @@
       <Filter>Renderer</Filter>
     </ClCompile>
     <ClCompile Include="renderer\SoftwareRasterizer.cpp">
+      <Filter>Renderer</Filter>
+    </ClCompile>
+    <ClCompile Include="renderer\SoftwareVulkanBridge.cpp">
       <Filter>Renderer</Filter>
     </ClCompile>
     <ClCompile Include="renderer\tr_render.cpp">
@@ -2534,5 +2546,13 @@
     <CustomBuildStep Include="tools\script\DialogScriptEditor.h">
       <Filter>Tools\Script</Filter>
     </CustomBuildStep>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="renderer\SoftwareHybridComposite.comp">
+      <Filter>Renderer</Filter>
+    </None>
+    <None Include="renderer\SoftwareRayQueryShadow.comp">
+      <Filter>Renderer</Filter>
+    </None>
   </ItemGroup>
 </Project>

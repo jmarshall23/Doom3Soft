@@ -1,0 +1,3205 @@
+/*
+===========================================================================
+
+Doom 3 GPL Source Code
+Copyright (C) 2026 Justin Marshall
+
+This file is part of the idTech 4 software renderer source code
+
+===========================================================================
+*/
+
+#include "precompiled.h"
+#pragma hdrstop
+
+#define VK_USE_PLATFORM_WIN32_KHR
+#include "../sys/win32/win_local.h"
+#include <stdint.h>
+#include <vulkan/vulkan.h>
+
+#include "tr_local.h"
+#include "SoftwareVulkanBridge.h"
+#include "Software2DComposite_spv.h"
+#include "SoftwareHybridComposite_spv.h"
+#include "SoftwareRayQueryShadow_spv.h"
+
+/*
+===============================================================================
+
+	Vulkan presentation bridge for the software rasterizer.
+
+	The software renderer still owns rasterization.  This layer composites each
+	software-rendered view into a CPU frame buffer and presents that frame through
+	a Vulkan swapchain at the normal backend swap point.  The same device is
+	created with acceleration-structure / ray-query support when the driver
+	exposes it, which gives the shadow path a real Vulkan home without putting GL
+	back into the software renderer's presentation loop.
+
+===============================================================================
+*/
+
+struct swVkBuffer_t {
+	swVkBuffer_t() {
+		buffer = VK_NULL_HANDLE;
+		memory = VK_NULL_HANDLE;
+		size = 0;
+	}
+
+	VkBuffer buffer;
+	VkDeviceMemory memory;
+	VkDeviceSize size;
+};
+
+struct swVkShadowVertex_t {
+	float xyz[3];
+	float pad;
+};
+
+struct swVkCachedBlas_t {
+	swVkCachedBlas_t() {
+		key = NULL;
+		verts = NULL;
+		indexes = NULL;
+		vertCount = 0;
+		indexCount = 0;
+		primitiveCount = 0;
+		sourceFrame = 0;
+		lastUsedFrame = 0;
+		blas = VK_NULL_HANDLE;
+		blasAddress = 0;
+	}
+
+	const srfTriangles_t *key;
+	const idDrawVert *verts;
+	const glIndex_t *indexes;
+	int vertCount;
+	int indexCount;
+	uint32_t primitiveCount;
+	int sourceFrame;
+	int lastUsedFrame;
+	swVkBuffer_t vertexBuffer;
+	swVkBuffer_t indexBuffer;
+	swVkBuffer_t blasBuffer;
+	VkAccelerationStructureKHR blas;
+	VkDeviceAddress blasAddress;
+};
+
+struct swVkRayInstance_t {
+	VkDeviceAddress blasAddress;
+	float modelMatrix[16];
+};
+
+struct swVkShadowPushConstants_t {
+	float lightOrigin[4];
+	uint32_t pixelCount;
+	float bias;
+	float pad[2];
+};
+
+struct swVkHybridPushConstants_t {
+	uint32_t dims[4];
+	int32_t viewport[4];
+	uint32_t debugView;
+	uint32_t textureCount;
+	uint32_t overlayEnabled;
+	uint32_t lightCount;
+	uint32_t shadowEnabled;
+	uint32_t pad[3];
+	float viewOrigin[4];
+};
+
+struct swVk2DPushConstants_t {
+	uint32_t src[4];		// offset, width, height, clear overlay
+	uint32_t frame[4];		// width, height, unused, unused
+	int32_t viewport[4];	// x, y, presentWidth, presentHeight in Doom's bottom-left frame space
+};
+
+struct swVk2DJob_t {
+	swVk2DJob_t() {
+		sourceOffset = 0;
+		sourceWidth = 0;
+		sourceHeight = 0;
+		viewportX = 0;
+		viewportY = 0;
+		presentWidth = 0;
+		presentHeight = 0;
+	}
+
+	int sourceOffset;
+	int sourceWidth;
+	int sourceHeight;
+	int viewportX;
+	int viewportY;
+	int presentWidth;
+	int presentHeight;
+};
+
+static const int SW_VK_MAX_SHADOW_JOBS = 64;
+
+static uint64_t SWVkHashU32( uint64_t hash, uint32_t value ) {
+	hash ^= value;
+	hash *= 1099511628211ULL;
+	return hash;
+}
+
+static uint64_t SWVkHashU64( uint64_t hash, uint64_t value ) {
+	hash = SWVkHashU32( hash, static_cast<uint32_t>( value ) );
+	hash = SWVkHashU32( hash, static_cast<uint32_t>( value >> 32 ) );
+	return hash;
+}
+
+struct swVkShadowJob_t {
+	swVkShadowJob_t() {
+		commandBuffer = VK_NULL_HANDLE;
+		fence = VK_NULL_HANDLE;
+		descriptorSet = VK_NULL_HANDLE;
+		lightKey = 0;
+		width = 0;
+		height = 0;
+		pendingSubmit = false;
+		submitted = false;
+	}
+
+	swVkBuffer_t worldPositionBuffer;
+	swVkBuffer_t shadowMaskBuffer;
+	VkCommandBuffer commandBuffer;
+	VkFence fence;
+	VkDescriptorSet descriptorSet;
+	uintptr_t lightKey;
+	int width;
+	int height;
+	bool pendingSubmit;
+	bool submitted;
+};
+
+class idSoftwareVulkanBridge {
+public:
+	idSoftwareVulkanBridge();
+	~idSoftwareVulkanBridge();
+
+	bool BlitView( const viewDef_t *viewDef, const unsigned int *bgra, int width, int height, int presentWidth, int presentHeight );
+	bool CompositeHybridGBuffer( const viewDef_t *viewDef, const swHybridGBufferUpload_t &gbuffer, int width, int height, int presentWidth, int presentHeight );
+	bool ReadView( const viewDef_t *viewDef, unsigned int *bgra, int width, int height ) const;
+	bool PresentFrame();
+	bool RayQueryAvailable();
+	bool PrepareRayQueryScene( const viewDef_t *viewDef );
+	bool BeginLightShadowMask( const viewLight_t *vLight, const idVec4 *worldPositions, int width, int height );
+	bool FinishLightShadowMask( const viewLight_t *vLight, int width, int height, unsigned char *shadowMask );
+	bool TraceLightShadowMask( const viewLight_t *vLight, const idVec4 *worldPositions, int width, int height, unsigned char *shadowMask );
+	void Shutdown();
+
+private:
+	bool EnsureInitialized();
+	bool CreateInstance();
+	bool CreateSurface();
+	bool PickPhysicalDevice();
+	bool CreateDevice();
+	bool CreateSwapchain();
+	bool CreateCommandObjects();
+	bool Create2DPipeline();
+	bool CreateHybridPipeline();
+	bool CreateShadowPipeline();
+	bool EnsureUploadBuffer( int requiredWidth, int requiredHeight );
+	bool Ensure2DBuffers( int sourcePixelCount );
+	bool EnsureHybridBuffers( int requiredWidth, int requiredHeight, int textureInfoCount, int textureTexelCount, int lightCount );
+	bool EnsureShadowBuffers( int width, int height );
+	bool EnsureFrameBuffer();
+	bool UploadBuffer( swVkBuffer_t &buffer, const void *data, VkDeviceSize size, const char *failureText );
+	bool CreateBuffer( VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, bool deviceAddress, swVkBuffer_t &buffer );
+	void DestroyBuffer( swVkBuffer_t &buffer );
+	VkDeviceAddress GetBufferAddress( VkBuffer buffer ) const;
+	bool ImmediateSubmit( const VkCommandBufferBeginInfo &beginInfo );
+	void WaitForSubmittedWork();
+	bool BuildCachedBlas( swVkCachedBlas_t &entry, const srfTriangles_t *geo, int sourceFrame );
+	bool EnsureCachedBlas( const srfTriangles_t *geo, int sourceFrame, int frameIndex, swVkCachedBlas_t *&entry );
+	bool BuildRayQueryTlas( const idList<swVkRayInstance_t> &instances );
+	void DestroyCachedBlas( swVkCachedBlas_t &entry );
+	void DestroyRayQueryTlas();
+	void DestroyRayQueryScene();
+	void Destroy2DPipeline();
+	void DestroyShadowPipeline();
+	void DestroyHybridPipeline();
+	void DestroyHybridBuffers();
+	uintptr_t ShadowLightKey( const viewLight_t *vLight ) const;
+	bool HasPendingShadowJobs() const;
+	bool EnsureShadowJobResources( swVkShadowJob_t &job, int width, int height );
+	swVkShadowJob_t *AllocShadowJob();
+	bool RecordShadowJob( swVkShadowJob_t &job, const viewLight_t *vLight, const idVec4 *worldPositions, int width, int height );
+	void DestroyShadowJobs();
+	void BeginFrame();
+	void Clear2DJobs();
+	bool Queue2DOverlayBlit( const viewDef_t *viewDef, const unsigned int *bgra, int width, int height, int presentWidth, int presentHeight );
+	void Update2DDescriptorSet();
+	bool Record2DCompositeCommands();
+	void DestroySwapchain();
+	void DestroyUploadBuffer();
+	void LogFailure( const char *text );
+	void UpdateHybridDescriptorSet();
+	bool RecordHybridCompositeCommands();
+
+	bool DeviceHasExtension( VkPhysicalDevice device, const char *name ) const;
+	bool QueryRayQuerySupport( VkPhysicalDevice device ) const;
+	bool FindQueueFamily( VkPhysicalDevice device, uint32_t &family ) const;
+	uint32_t FindMemoryType( uint32_t memoryTypeBits, VkMemoryPropertyFlags properties ) const;
+	VkSurfaceFormatKHR ChooseSurfaceFormat( const idList<VkSurfaceFormatKHR> &formats ) const;
+	VkPresentModeKHR ChoosePresentMode( const idList<VkPresentModeKHR> &modes ) const;
+	VkExtent2D ChooseExtent( const VkSurfaceCapabilitiesKHR &caps ) const;
+	VkCompositeAlphaFlagBitsKHR ChooseCompositeAlpha( VkCompositeAlphaFlagsKHR supported ) const;
+
+	bool initialized;
+	bool failed;
+	bool printedFailure;
+	bool rayQuerySupported;
+	bool frameBegun;
+	bool frameDirty;
+	bool hybridFrameDirty;
+	bool hybridOverlayDirty;
+
+	int frameWidth;
+	int frameHeight;
+	idList<unsigned int> framePixels;
+	int hybridWidth;
+	int hybridHeight;
+	int hybridPresentWidth;
+	int hybridPresentHeight;
+	int hybridViewportX;
+	int hybridViewportY;
+	int hybridDebugView;
+	int hybridTextureCount;
+	int hybridTextureTexelCount;
+	unsigned int hybridUploadedTextureGeneration;
+	int hybridLightCount;
+	bool hybridShadowEnabled;
+	float hybridViewOrigin[3];
+	idList<unsigned int> hybrid2DSourcePixels;
+	idList<swVk2DJob_t> hybrid2DJobs;
+
+	VkInstance instance;
+	VkSurfaceKHR surface;
+	VkPhysicalDevice physicalDevice;
+	VkDevice device;
+	VkQueue queue;
+	uint32_t queueFamily;
+
+	VkSwapchainKHR swapchain;
+	VkFormat swapchainFormat;
+	VkExtent2D swapchainExtent;
+	idList<VkImage> swapchainImages;
+	idList<VkImageLayout> swapchainLayouts;
+
+	VkCommandPool commandPool;
+	VkCommandBuffer commandBuffer;
+	VkSemaphore imageAvailableSemaphore;
+	VkSemaphore renderFinishedSemaphore;
+	VkFence inFlightFence;
+
+	VkBuffer uploadBuffer;
+	VkDeviceMemory uploadMemory;
+	VkDeviceSize uploadBufferSize;
+
+	swVkBuffer_t hybridDepthBuffer;
+	swVkBuffer_t hybridNormalBuffer;
+	swVkBuffer_t hybridTangentBuffer;
+	swVkBuffer_t hybridBitangentBuffer;
+	swVkBuffer_t hybridUVBuffer;
+	swVkBuffer_t hybridMaterialBuffer;
+	swVkBuffer_t hybridAlbedoBuffer;
+	swVkBuffer_t hybridSpecularBuffer;
+	swVkBuffer_t hybridSurfaceBuffer;
+	swVkBuffer_t hybridFrameBuffer;
+	swVkBuffer_t hybridOverlayBuffer;
+	swVkBuffer_t hybrid2DSourceBuffer;
+	swVkBuffer_t hybridTextureInfoBuffer;
+	swVkBuffer_t hybridTextureTexelBuffer;
+	swVkBuffer_t hybridWorldPositionBuffer;
+	swVkBuffer_t hybridLightBuffer;
+
+	VkDescriptorSetLayout hybridDescriptorSetLayout;
+	VkDescriptorPool hybridDescriptorPool;
+	VkDescriptorSet hybridDescriptorSet;
+	VkPipelineLayout hybridPipelineLayout;
+	VkPipeline hybridPipeline;
+	VkShaderModule hybridShaderModule;
+
+	swVkBuffer_t shadowScratchBuffer;
+	swVkBuffer_t tlasBuffer;
+	swVkBuffer_t instanceBuffer;
+	swVkBuffer_t worldPositionBuffer;
+	swVkBuffer_t shadowMaskBuffer;
+	swVkShadowJob_t shadowJobs[SW_VK_MAX_SHADOW_JOBS];
+	idList<swVkCachedBlas_t> rayBlasCache;
+
+	VkDescriptorSetLayout twoDDescriptorSetLayout;
+	VkDescriptorPool twoDDescriptorPool;
+	VkDescriptorSet twoDDescriptorSet;
+	VkPipelineLayout twoDPipelineLayout;
+	VkPipeline twoDPipeline;
+	VkShaderModule twoDShaderModule;
+
+	VkAccelerationStructureKHR tlas;
+	bool rayQuerySceneReady;
+	int rayQuerySceneFrame;
+	uint64_t rayTlasSignature;
+	int rayTlasInstanceCount;
+
+	VkDescriptorSetLayout shadowDescriptorSetLayout;
+	VkDescriptorPool shadowDescriptorPool;
+	VkDescriptorSet shadowDescriptorSet;
+	VkPipelineLayout shadowPipelineLayout;
+	VkPipeline shadowPipeline;
+	VkShaderModule shadowShaderModule;
+
+	PFN_vkGetPhysicalDeviceFeatures2 vkGetPhysicalDeviceFeatures2Local;
+	PFN_vkGetBufferDeviceAddressKHR vkGetBufferDeviceAddressKHRLocal;
+	PFN_vkCreateAccelerationStructureKHR vkCreateAccelerationStructureKHRLocal;
+	PFN_vkDestroyAccelerationStructureKHR vkDestroyAccelerationStructureKHRLocal;
+	PFN_vkGetAccelerationStructureDeviceAddressKHR vkGetAccelerationStructureDeviceAddressKHRLocal;
+	PFN_vkGetAccelerationStructureBuildSizesKHR vkGetAccelerationStructureBuildSizesKHRLocal;
+	PFN_vkCmdBuildAccelerationStructuresKHR vkCmdBuildAccelerationStructuresKHRLocal;
+};
+
+static idSoftwareVulkanBridge swVulkanBridge;
+
+idSoftwareVulkanBridge::idSoftwareVulkanBridge() {
+	initialized = false;
+	failed = false;
+	printedFailure = false;
+	rayQuerySupported = false;
+	frameBegun = false;
+	frameDirty = false;
+	hybridFrameDirty = false;
+	hybridOverlayDirty = false;
+	frameWidth = 0;
+	frameHeight = 0;
+	hybridWidth = 0;
+	hybridHeight = 0;
+	hybridPresentWidth = 0;
+	hybridPresentHeight = 0;
+	hybridViewportX = 0;
+	hybridViewportY = 0;
+	hybridDebugView = 0;
+	hybridTextureCount = 0;
+	hybridTextureTexelCount = 0;
+	hybridUploadedTextureGeneration = 0;
+	hybridLightCount = 0;
+	hybridShadowEnabled = false;
+	hybridViewOrigin[0] = hybridViewOrigin[1] = hybridViewOrigin[2] = 0.0f;
+
+	instance = VK_NULL_HANDLE;
+	surface = VK_NULL_HANDLE;
+	physicalDevice = VK_NULL_HANDLE;
+	device = VK_NULL_HANDLE;
+	queue = VK_NULL_HANDLE;
+	queueFamily = 0;
+
+	swapchain = VK_NULL_HANDLE;
+	swapchainFormat = VK_FORMAT_UNDEFINED;
+	swapchainExtent.width = 0;
+	swapchainExtent.height = 0;
+
+	commandPool = VK_NULL_HANDLE;
+	commandBuffer = VK_NULL_HANDLE;
+	imageAvailableSemaphore = VK_NULL_HANDLE;
+	renderFinishedSemaphore = VK_NULL_HANDLE;
+	inFlightFence = VK_NULL_HANDLE;
+
+	uploadBuffer = VK_NULL_HANDLE;
+	uploadMemory = VK_NULL_HANDLE;
+	uploadBufferSize = 0;
+
+	hybridDescriptorSetLayout = VK_NULL_HANDLE;
+	hybridDescriptorPool = VK_NULL_HANDLE;
+	hybridDescriptorSet = VK_NULL_HANDLE;
+	hybridPipelineLayout = VK_NULL_HANDLE;
+	hybridPipeline = VK_NULL_HANDLE;
+	hybridShaderModule = VK_NULL_HANDLE;
+
+	twoDDescriptorSetLayout = VK_NULL_HANDLE;
+	twoDDescriptorPool = VK_NULL_HANDLE;
+	twoDDescriptorSet = VK_NULL_HANDLE;
+	twoDPipelineLayout = VK_NULL_HANDLE;
+	twoDPipeline = VK_NULL_HANDLE;
+	twoDShaderModule = VK_NULL_HANDLE;
+
+	tlas = VK_NULL_HANDLE;
+	rayQuerySceneReady = false;
+	rayQuerySceneFrame = 0;
+	rayTlasSignature = 0;
+	rayTlasInstanceCount = 0;
+
+	shadowDescriptorSetLayout = VK_NULL_HANDLE;
+	shadowDescriptorPool = VK_NULL_HANDLE;
+	shadowDescriptorSet = VK_NULL_HANDLE;
+	shadowPipelineLayout = VK_NULL_HANDLE;
+	shadowPipeline = VK_NULL_HANDLE;
+	shadowShaderModule = VK_NULL_HANDLE;
+
+	vkGetPhysicalDeviceFeatures2Local = NULL;
+	vkGetBufferDeviceAddressKHRLocal = NULL;
+	vkCreateAccelerationStructureKHRLocal = NULL;
+	vkDestroyAccelerationStructureKHRLocal = NULL;
+	vkGetAccelerationStructureDeviceAddressKHRLocal = NULL;
+	vkGetAccelerationStructureBuildSizesKHRLocal = NULL;
+	vkCmdBuildAccelerationStructuresKHRLocal = NULL;
+}
+
+idSoftwareVulkanBridge::~idSoftwareVulkanBridge() {
+	Shutdown();
+}
+
+void idSoftwareVulkanBridge::LogFailure( const char *text ) {
+	if ( !printedFailure ) {
+		common->Warning( "software vulkan: %s", text );
+		printedFailure = true;
+	}
+}
+
+bool idSoftwareVulkanBridge::EnsureInitialized() {
+	if ( initialized ) {
+		return true;
+	}
+	if ( failed ) {
+		return false;
+	}
+	if ( !r_softwareVulkanPresent.GetBool() ) {
+		return false;
+	}
+	if ( !win32.hWnd ) {
+		LogFailure( "window handle is not ready" );
+		failed = true;
+		return false;
+	}
+
+	if ( !CreateInstance() || !CreateSurface() || !PickPhysicalDevice() || !CreateDevice() || !CreateSwapchain() || !CreateCommandObjects() || !Create2DPipeline() || !CreateHybridPipeline() || !CreateShadowPipeline() ) {
+		Shutdown();
+		failed = true;
+		return false;
+	}
+
+	initialized = true;
+	common->Printf( "software vulkan: presentation enabled (%dx%d)%s\n",
+		static_cast<int>( swapchainExtent.width ),
+		static_cast<int>( swapchainExtent.height ),
+		rayQuerySupported ? ", ray query shadows supported" : "" );
+	return true;
+}
+
+bool idSoftwareVulkanBridge::CreateInstance() {
+	VkApplicationInfo appInfo;
+	memset( &appInfo, 0, sizeof( appInfo ) );
+	appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+	appInfo.pApplicationName = GAME_NAME;
+	appInfo.applicationVersion = VK_MAKE_VERSION( 1, 0, 0 );
+	appInfo.pEngineName = "Doom3Soft";
+	appInfo.engineVersion = VK_MAKE_VERSION( 1, 0, 0 );
+	appInfo.apiVersion = VK_API_VERSION_1_2;
+
+	const char *extensions[] = {
+		VK_KHR_SURFACE_EXTENSION_NAME,
+		VK_KHR_WIN32_SURFACE_EXTENSION_NAME
+	};
+
+	VkInstanceCreateInfo createInfo;
+	memset( &createInfo, 0, sizeof( createInfo ) );
+	createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+	createInfo.pApplicationInfo = &appInfo;
+	createInfo.enabledExtensionCount = sizeof( extensions ) / sizeof( extensions[0] );
+	createInfo.ppEnabledExtensionNames = extensions;
+
+	if ( vkCreateInstance( &createInfo, NULL, &instance ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateInstance failed" );
+		return false;
+	}
+
+	vkGetPhysicalDeviceFeatures2Local =
+		reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>( vkGetInstanceProcAddr( instance, "vkGetPhysicalDeviceFeatures2" ) );
+	if ( !vkGetPhysicalDeviceFeatures2Local ) {
+		vkGetPhysicalDeviceFeatures2Local =
+			reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>( vkGetInstanceProcAddr( instance, "vkGetPhysicalDeviceFeatures2KHR" ) );
+	}
+	return true;
+}
+
+bool idSoftwareVulkanBridge::CreateSurface() {
+	VkWin32SurfaceCreateInfoKHR createInfo;
+	memset( &createInfo, 0, sizeof( createInfo ) );
+	createInfo.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
+	createInfo.hinstance = win32.hInstance ? win32.hInstance : GetModuleHandle( NULL );
+	createInfo.hwnd = win32.hWnd;
+
+	if ( vkCreateWin32SurfaceKHR( instance, &createInfo, NULL, &surface ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateWin32SurfaceKHR failed" );
+		return false;
+	}
+	return true;
+}
+
+bool idSoftwareVulkanBridge::FindQueueFamily( VkPhysicalDevice testDevice, uint32_t &family ) const {
+	uint32_t queueFamilyCount = 0;
+	vkGetPhysicalDeviceQueueFamilyProperties( testDevice, &queueFamilyCount, NULL );
+	if ( queueFamilyCount == 0 ) {
+		return false;
+	}
+
+	idList<VkQueueFamilyProperties> queueFamilies;
+	queueFamilies.SetNum( queueFamilyCount, false );
+	vkGetPhysicalDeviceQueueFamilyProperties( testDevice, &queueFamilyCount, queueFamilies.Ptr() );
+
+	for ( uint32_t i = 0; i < queueFamilyCount; i++ ) {
+		VkBool32 presentSupport = VK_FALSE;
+		vkGetPhysicalDeviceSurfaceSupportKHR( testDevice, i, surface, &presentSupport );
+		if ( ( queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT ) && presentSupport ) {
+			family = i;
+			return true;
+		}
+	}
+	return false;
+}
+
+bool idSoftwareVulkanBridge::DeviceHasExtension( VkPhysicalDevice testDevice, const char *name ) const {
+	uint32_t extensionCount = 0;
+	vkEnumerateDeviceExtensionProperties( testDevice, NULL, &extensionCount, NULL );
+	if ( extensionCount == 0 ) {
+		return false;
+	}
+
+	idList<VkExtensionProperties> extensions;
+	extensions.SetNum( extensionCount, false );
+	vkEnumerateDeviceExtensionProperties( testDevice, NULL, &extensionCount, extensions.Ptr() );
+
+	for ( uint32_t i = 0; i < extensionCount; i++ ) {
+		if ( strcmp( extensions[i].extensionName, name ) == 0 ) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool idSoftwareVulkanBridge::QueryRayQuerySupport( VkPhysicalDevice testDevice ) const {
+	if ( !vkGetPhysicalDeviceFeatures2Local ) {
+		return false;
+	}
+	if ( !DeviceHasExtension( testDevice, VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME ) ||
+		 !DeviceHasExtension( testDevice, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME ) ||
+		 !DeviceHasExtension( testDevice, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME ) ||
+		 !DeviceHasExtension( testDevice, VK_KHR_RAY_QUERY_EXTENSION_NAME ) ) {
+		return false;
+	}
+
+	VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures;
+	memset( &rayQueryFeatures, 0, sizeof( rayQueryFeatures ) );
+	rayQueryFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+
+	VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationFeatures;
+	memset( &accelerationFeatures, 0, sizeof( accelerationFeatures ) );
+	accelerationFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+	accelerationFeatures.pNext = &rayQueryFeatures;
+
+	VkPhysicalDeviceBufferDeviceAddressFeatures bufferAddressFeatures;
+	memset( &bufferAddressFeatures, 0, sizeof( bufferAddressFeatures ) );
+	bufferAddressFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+	bufferAddressFeatures.pNext = &accelerationFeatures;
+
+	VkPhysicalDeviceFeatures2 features;
+	memset( &features, 0, sizeof( features ) );
+	features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+	features.pNext = &bufferAddressFeatures;
+
+	vkGetPhysicalDeviceFeatures2Local( testDevice, &features );
+	return bufferAddressFeatures.bufferDeviceAddress &&
+		accelerationFeatures.accelerationStructure &&
+		rayQueryFeatures.rayQuery;
+}
+
+bool idSoftwareVulkanBridge::PickPhysicalDevice() {
+	uint32_t deviceCount = 0;
+	vkEnumeratePhysicalDevices( instance, &deviceCount, NULL );
+	if ( deviceCount == 0 ) {
+		LogFailure( "no Vulkan physical devices found" );
+		return false;
+	}
+
+	idList<VkPhysicalDevice> devices;
+	devices.SetNum( deviceCount, false );
+	vkEnumeratePhysicalDevices( instance, &deviceCount, devices.Ptr() );
+
+	VkPhysicalDevice fallbackDevice = VK_NULL_HANDLE;
+	uint32_t fallbackQueueFamily = 0;
+	bool fallbackRayQuery = false;
+
+	for ( uint32_t i = 0; i < deviceCount; i++ ) {
+		uint32_t candidateQueueFamily = 0;
+		if ( !FindQueueFamily( devices[i], candidateQueueFamily ) ) {
+			continue;
+		}
+		if ( !DeviceHasExtension( devices[i], VK_KHR_SWAPCHAIN_EXTENSION_NAME ) ) {
+			continue;
+		}
+
+		uint32_t formatCount = 0;
+		uint32_t presentModeCount = 0;
+		vkGetPhysicalDeviceSurfaceFormatsKHR( devices[i], surface, &formatCount, NULL );
+		vkGetPhysicalDeviceSurfacePresentModesKHR( devices[i], surface, &presentModeCount, NULL );
+		if ( formatCount == 0 || presentModeCount == 0 ) {
+			continue;
+		}
+
+		const bool candidateRayQuery = QueryRayQuerySupport( devices[i] );
+		if ( fallbackDevice == VK_NULL_HANDLE || candidateRayQuery ) {
+			fallbackDevice = devices[i];
+			fallbackQueueFamily = candidateQueueFamily;
+			fallbackRayQuery = candidateRayQuery;
+			if ( candidateRayQuery ) {
+				break;
+			}
+		}
+	}
+
+	if ( fallbackDevice == VK_NULL_HANDLE ) {
+		LogFailure( "no Vulkan device supports graphics+present+swapchain" );
+		return false;
+	}
+
+	physicalDevice = fallbackDevice;
+	queueFamily = fallbackQueueFamily;
+	rayQuerySupported = fallbackRayQuery;
+	return true;
+}
+
+bool idSoftwareVulkanBridge::CreateDevice() {
+	float queuePriority = 1.0f;
+
+	VkDeviceQueueCreateInfo queueInfo;
+	memset( &queueInfo, 0, sizeof( queueInfo ) );
+	queueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+	queueInfo.queueFamilyIndex = queueFamily;
+	queueInfo.queueCount = 1;
+	queueInfo.pQueuePriorities = &queuePriority;
+
+	const char *extensions[8];
+	uint32_t extensionCount = 0;
+	extensions[extensionCount++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+	if ( rayQuerySupported ) {
+		extensions[extensionCount++] = VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME;
+		extensions[extensionCount++] = VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME;
+		extensions[extensionCount++] = VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME;
+		extensions[extensionCount++] = VK_KHR_RAY_QUERY_EXTENSION_NAME;
+	}
+
+	VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures;
+	memset( &rayQueryFeatures, 0, sizeof( rayQueryFeatures ) );
+	rayQueryFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+	rayQueryFeatures.rayQuery = rayQuerySupported ? VK_TRUE : VK_FALSE;
+
+	VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationFeatures;
+	memset( &accelerationFeatures, 0, sizeof( accelerationFeatures ) );
+	accelerationFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+	accelerationFeatures.accelerationStructure = rayQuerySupported ? VK_TRUE : VK_FALSE;
+	accelerationFeatures.pNext = rayQuerySupported ? &rayQueryFeatures : NULL;
+
+	VkPhysicalDeviceBufferDeviceAddressFeatures bufferAddressFeatures;
+	memset( &bufferAddressFeatures, 0, sizeof( bufferAddressFeatures ) );
+	bufferAddressFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+	bufferAddressFeatures.bufferDeviceAddress = rayQuerySupported ? VK_TRUE : VK_FALSE;
+	bufferAddressFeatures.pNext = rayQuerySupported ? &accelerationFeatures : NULL;
+
+	VkPhysicalDeviceFeatures2 enabledFeatures;
+	memset( &enabledFeatures, 0, sizeof( enabledFeatures ) );
+	enabledFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+	enabledFeatures.pNext = rayQuerySupported ? &bufferAddressFeatures : NULL;
+
+	VkDeviceCreateInfo createInfo;
+	memset( &createInfo, 0, sizeof( createInfo ) );
+	createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+	createInfo.pNext = rayQuerySupported ? &enabledFeatures : NULL;
+	createInfo.queueCreateInfoCount = 1;
+	createInfo.pQueueCreateInfos = &queueInfo;
+	createInfo.enabledExtensionCount = extensionCount;
+	createInfo.ppEnabledExtensionNames = extensions;
+
+	if ( vkCreateDevice( physicalDevice, &createInfo, NULL, &device ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateDevice failed" );
+		return false;
+	}
+
+	vkGetDeviceQueue( device, queueFamily, 0, &queue );
+
+	if ( rayQuerySupported ) {
+		vkGetBufferDeviceAddressKHRLocal =
+			reinterpret_cast<PFN_vkGetBufferDeviceAddressKHR>( vkGetDeviceProcAddr( device, "vkGetBufferDeviceAddressKHR" ) );
+		vkCreateAccelerationStructureKHRLocal =
+			reinterpret_cast<PFN_vkCreateAccelerationStructureKHR>( vkGetDeviceProcAddr( device, "vkCreateAccelerationStructureKHR" ) );
+		vkDestroyAccelerationStructureKHRLocal =
+			reinterpret_cast<PFN_vkDestroyAccelerationStructureKHR>( vkGetDeviceProcAddr( device, "vkDestroyAccelerationStructureKHR" ) );
+		vkGetAccelerationStructureDeviceAddressKHRLocal =
+			reinterpret_cast<PFN_vkGetAccelerationStructureDeviceAddressKHR>( vkGetDeviceProcAddr( device, "vkGetAccelerationStructureDeviceAddressKHR" ) );
+		vkGetAccelerationStructureBuildSizesKHRLocal =
+			reinterpret_cast<PFN_vkGetAccelerationStructureBuildSizesKHR>( vkGetDeviceProcAddr( device, "vkGetAccelerationStructureBuildSizesKHR" ) );
+		vkCmdBuildAccelerationStructuresKHRLocal =
+			reinterpret_cast<PFN_vkCmdBuildAccelerationStructuresKHR>( vkGetDeviceProcAddr( device, "vkCmdBuildAccelerationStructuresKHR" ) );
+
+		if ( !vkGetBufferDeviceAddressKHRLocal || !vkCreateAccelerationStructureKHRLocal ||
+			 !vkDestroyAccelerationStructureKHRLocal || !vkGetAccelerationStructureDeviceAddressKHRLocal ||
+			 !vkGetAccelerationStructureBuildSizesKHRLocal ||
+			 !vkCmdBuildAccelerationStructuresKHRLocal ) {
+			rayQuerySupported = false;
+			common->Warning( "software vulkan: ray-query device functions missing; shadows disabled" );
+		}
+	}
+	return true;
+}
+
+VkSurfaceFormatKHR idSoftwareVulkanBridge::ChooseSurfaceFormat( const idList<VkSurfaceFormatKHR> &formats ) const {
+	for ( int i = 0; i < formats.Num(); i++ ) {
+		if ( formats[i].format == VK_FORMAT_B8G8R8A8_UNORM ) {
+			return formats[i];
+		}
+	}
+	for ( int i = 0; i < formats.Num(); i++ ) {
+		if ( formats[i].format == VK_FORMAT_B8G8R8A8_SRGB ) {
+			return formats[i];
+		}
+	}
+	return formats[0];
+}
+
+VkPresentModeKHR idSoftwareVulkanBridge::ChoosePresentMode( const idList<VkPresentModeKHR> &modes ) const {
+	for ( int i = 0; i < modes.Num(); i++ ) {
+		if ( modes[i] == VK_PRESENT_MODE_MAILBOX_KHR ) {
+			return modes[i];
+		}
+	}
+	return VK_PRESENT_MODE_FIFO_KHR;
+}
+
+VkCompositeAlphaFlagBitsKHR idSoftwareVulkanBridge::ChooseCompositeAlpha( VkCompositeAlphaFlagsKHR supported ) const {
+	if ( supported & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR ) {
+		return VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+	}
+	if ( supported & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR ) {
+		return VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
+	}
+	if ( supported & VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR ) {
+		return VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
+	}
+	return VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+}
+
+VkExtent2D idSoftwareVulkanBridge::ChooseExtent( const VkSurfaceCapabilitiesKHR &caps ) const {
+	if ( caps.currentExtent.width != UINT32_MAX ) {
+		return caps.currentExtent;
+	}
+
+	RECT clientRect;
+	GetClientRect( win32.hWnd, &clientRect );
+
+	VkExtent2D extent;
+	extent.width = Max( 1, static_cast<int>( clientRect.right - clientRect.left ) );
+	extent.height = Max( 1, static_cast<int>( clientRect.bottom - clientRect.top ) );
+	extent.width = Max( caps.minImageExtent.width, Min( caps.maxImageExtent.width, extent.width ) );
+	extent.height = Max( caps.minImageExtent.height, Min( caps.maxImageExtent.height, extent.height ) );
+	return extent;
+}
+
+bool idSoftwareVulkanBridge::CreateSwapchain() {
+	VkSurfaceCapabilitiesKHR caps;
+	if ( vkGetPhysicalDeviceSurfaceCapabilitiesKHR( physicalDevice, surface, &caps ) != VK_SUCCESS ) {
+		LogFailure( "vkGetPhysicalDeviceSurfaceCapabilitiesKHR failed" );
+		return false;
+	}
+
+	uint32_t formatCount = 0;
+	vkGetPhysicalDeviceSurfaceFormatsKHR( physicalDevice, surface, &formatCount, NULL );
+	idList<VkSurfaceFormatKHR> formats;
+	formats.SetNum( formatCount, false );
+	vkGetPhysicalDeviceSurfaceFormatsKHR( physicalDevice, surface, &formatCount, formats.Ptr() );
+
+	uint32_t presentModeCount = 0;
+	vkGetPhysicalDeviceSurfacePresentModesKHR( physicalDevice, surface, &presentModeCount, NULL );
+	idList<VkPresentModeKHR> presentModes;
+	presentModes.SetNum( presentModeCount, false );
+	vkGetPhysicalDeviceSurfacePresentModesKHR( physicalDevice, surface, &presentModeCount, presentModes.Ptr() );
+
+	const VkSurfaceFormatKHR surfaceFormat = ChooseSurfaceFormat( formats );
+	const VkPresentModeKHR presentMode = ChoosePresentMode( presentModes );
+	const VkExtent2D extent = ChooseExtent( caps );
+
+	uint32_t imageCount = caps.minImageCount + 1;
+	if ( caps.maxImageCount > 0 && imageCount > caps.maxImageCount ) {
+		imageCount = caps.maxImageCount;
+	}
+
+	VkSwapchainCreateInfoKHR createInfo;
+	memset( &createInfo, 0, sizeof( createInfo ) );
+	createInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+	createInfo.surface = surface;
+	createInfo.minImageCount = imageCount;
+	createInfo.imageFormat = surfaceFormat.format;
+	createInfo.imageColorSpace = surfaceFormat.colorSpace;
+	createInfo.imageExtent = extent;
+	createInfo.imageArrayLayers = 1;
+	createInfo.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+	createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	createInfo.preTransform = caps.currentTransform;
+	createInfo.compositeAlpha = ChooseCompositeAlpha( caps.supportedCompositeAlpha );
+	createInfo.presentMode = presentMode;
+	createInfo.clipped = VK_TRUE;
+	createInfo.oldSwapchain = VK_NULL_HANDLE;
+
+	if ( vkCreateSwapchainKHR( device, &createInfo, NULL, &swapchain ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateSwapchainKHR failed" );
+		return false;
+	}
+
+	uint32_t swapchainImageCount = 0;
+	vkGetSwapchainImagesKHR( device, swapchain, &swapchainImageCount, NULL );
+	swapchainImages.SetNum( swapchainImageCount, false );
+	vkGetSwapchainImagesKHR( device, swapchain, &swapchainImageCount, swapchainImages.Ptr() );
+
+	swapchainLayouts.SetNum( swapchainImageCount, false );
+	for ( int i = 0; i < swapchainLayouts.Num(); i++ ) {
+		swapchainLayouts[i] = VK_IMAGE_LAYOUT_UNDEFINED;
+	}
+
+	swapchainFormat = surfaceFormat.format;
+	swapchainExtent = extent;
+	frameWidth = static_cast<int>( swapchainExtent.width );
+	frameHeight = static_cast<int>( swapchainExtent.height );
+	return true;
+}
+
+bool idSoftwareVulkanBridge::CreateCommandObjects() {
+	VkCommandPoolCreateInfo poolInfo;
+	memset( &poolInfo, 0, sizeof( poolInfo ) );
+	poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+	poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+	poolInfo.queueFamilyIndex = queueFamily;
+
+	if ( vkCreateCommandPool( device, &poolInfo, NULL, &commandPool ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateCommandPool failed" );
+		return false;
+	}
+
+	VkCommandBufferAllocateInfo allocInfo;
+	memset( &allocInfo, 0, sizeof( allocInfo ) );
+	allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	allocInfo.commandPool = commandPool;
+	allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	allocInfo.commandBufferCount = 1;
+
+	if ( vkAllocateCommandBuffers( device, &allocInfo, &commandBuffer ) != VK_SUCCESS ) {
+		LogFailure( "vkAllocateCommandBuffers failed" );
+		return false;
+	}
+
+	VkSemaphoreCreateInfo semaphoreInfo;
+	memset( &semaphoreInfo, 0, sizeof( semaphoreInfo ) );
+	semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+	if ( vkCreateSemaphore( device, &semaphoreInfo, NULL, &imageAvailableSemaphore ) != VK_SUCCESS ||
+		 vkCreateSemaphore( device, &semaphoreInfo, NULL, &renderFinishedSemaphore ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateSemaphore failed" );
+		return false;
+	}
+
+	VkFenceCreateInfo fenceInfo;
+	memset( &fenceInfo, 0, sizeof( fenceInfo ) );
+	fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+	fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+
+	if ( vkCreateFence( device, &fenceInfo, NULL, &inFlightFence ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateFence failed" );
+		return false;
+	}
+	return true;
+}
+
+bool idSoftwareVulkanBridge::CreateBuffer( VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, bool deviceAddress, swVkBuffer_t &buffer ) {
+	DestroyBuffer( buffer );
+
+	VkBufferCreateInfo bufferInfo;
+	memset( &bufferInfo, 0, sizeof( bufferInfo ) );
+	bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	bufferInfo.size = size;
+	bufferInfo.usage = usage | ( deviceAddress ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0 );
+	bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+	if ( vkCreateBuffer( device, &bufferInfo, NULL, &buffer.buffer ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateBuffer failed" );
+		return false;
+	}
+
+	VkMemoryRequirements memoryRequirements;
+	vkGetBufferMemoryRequirements( device, buffer.buffer, &memoryRequirements );
+
+	const uint32_t memoryType = FindMemoryType( memoryRequirements.memoryTypeBits, properties );
+	if ( memoryType == UINT32_MAX ) {
+		LogFailure( "no matching Vulkan memory type" );
+		return false;
+	}
+
+	VkMemoryAllocateFlagsInfo flagsInfo;
+	memset( &flagsInfo, 0, sizeof( flagsInfo ) );
+	flagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+	flagsInfo.flags = deviceAddress ? VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT : 0;
+
+	VkMemoryAllocateInfo allocInfo;
+	memset( &allocInfo, 0, sizeof( allocInfo ) );
+	allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocInfo.pNext = deviceAddress ? &flagsInfo : NULL;
+	allocInfo.allocationSize = memoryRequirements.size;
+	allocInfo.memoryTypeIndex = memoryType;
+
+	if ( vkAllocateMemory( device, &allocInfo, NULL, &buffer.memory ) != VK_SUCCESS ) {
+		LogFailure( "vkAllocateMemory failed" );
+		return false;
+	}
+
+	if ( vkBindBufferMemory( device, buffer.buffer, buffer.memory, 0 ) != VK_SUCCESS ) {
+		LogFailure( "vkBindBufferMemory failed" );
+		return false;
+	}
+
+	buffer.size = size;
+	return true;
+}
+
+void idSoftwareVulkanBridge::DestroyBuffer( swVkBuffer_t &buffer ) {
+	if ( device == VK_NULL_HANDLE ) {
+		buffer.buffer = VK_NULL_HANDLE;
+		buffer.memory = VK_NULL_HANDLE;
+		buffer.size = 0;
+		return;
+	}
+	if ( buffer.buffer != VK_NULL_HANDLE ) {
+		vkDestroyBuffer( device, buffer.buffer, NULL );
+		buffer.buffer = VK_NULL_HANDLE;
+	}
+	if ( buffer.memory != VK_NULL_HANDLE ) {
+		vkFreeMemory( device, buffer.memory, NULL );
+		buffer.memory = VK_NULL_HANDLE;
+	}
+	buffer.size = 0;
+}
+
+VkDeviceAddress idSoftwareVulkanBridge::GetBufferAddress( VkBuffer buffer ) const {
+	VkBufferDeviceAddressInfo addressInfo;
+	memset( &addressInfo, 0, sizeof( addressInfo ) );
+	addressInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+	addressInfo.buffer = buffer;
+	return vkGetBufferDeviceAddressKHRLocal( device, &addressInfo );
+}
+
+bool idSoftwareVulkanBridge::ImmediateSubmit( const VkCommandBufferBeginInfo &beginInfo ) {
+	vkWaitForFences( device, 1, &inFlightFence, VK_TRUE, UINT64_MAX );
+	vkResetFences( device, 1, &inFlightFence );
+	vkResetCommandBuffer( commandBuffer, 0 );
+
+	if ( vkBeginCommandBuffer( commandBuffer, &beginInfo ) != VK_SUCCESS ) {
+		LogFailure( "vkBeginCommandBuffer failed" );
+		return false;
+	}
+
+	return true;
+}
+
+void idSoftwareVulkanBridge::WaitForSubmittedWork() {
+	if ( device != VK_NULL_HANDLE && inFlightFence != VK_NULL_HANDLE ) {
+		vkWaitForFences( device, 1, &inFlightFence, VK_TRUE, UINT64_MAX );
+	}
+}
+
+bool idSoftwareVulkanBridge::Create2DPipeline() {
+	VkDescriptorSetLayoutBinding bindings[2];
+	memset( bindings, 0, sizeof( bindings ) );
+	for ( uint32_t i = 0; i < 2; i++ ) {
+		bindings[i].binding = i;
+		bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		bindings[i].descriptorCount = 1;
+		bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	}
+
+	VkDescriptorSetLayoutCreateInfo layoutInfo;
+	memset( &layoutInfo, 0, sizeof( layoutInfo ) );
+	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	layoutInfo.bindingCount = 2;
+	layoutInfo.pBindings = bindings;
+	if ( vkCreateDescriptorSetLayout( device, &layoutInfo, NULL, &twoDDescriptorSetLayout ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateDescriptorSetLayout 2D failed" );
+		return false;
+	}
+
+	VkPushConstantRange pushRange;
+	memset( &pushRange, 0, sizeof( pushRange ) );
+	pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	pushRange.offset = 0;
+	pushRange.size = sizeof( swVk2DPushConstants_t );
+
+	VkPipelineLayoutCreateInfo pipelineLayoutInfo;
+	memset( &pipelineLayoutInfo, 0, sizeof( pipelineLayoutInfo ) );
+	pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	pipelineLayoutInfo.setLayoutCount = 1;
+	pipelineLayoutInfo.pSetLayouts = &twoDDescriptorSetLayout;
+	pipelineLayoutInfo.pushConstantRangeCount = 1;
+	pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+	if ( vkCreatePipelineLayout( device, &pipelineLayoutInfo, NULL, &twoDPipelineLayout ) != VK_SUCCESS ) {
+		LogFailure( "vkCreatePipelineLayout 2D failed" );
+		return false;
+	}
+
+	VkShaderModuleCreateInfo shaderInfo;
+	memset( &shaderInfo, 0, sizeof( shaderInfo ) );
+	shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+	shaderInfo.codeSize = sw2DCompositeCompSpvSize;
+	shaderInfo.pCode = sw2DCompositeCompSpv;
+	if ( vkCreateShaderModule( device, &shaderInfo, NULL, &twoDShaderModule ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateShaderModule 2D failed" );
+		return false;
+	}
+
+	VkPipelineShaderStageCreateInfo stageInfo;
+	memset( &stageInfo, 0, sizeof( stageInfo ) );
+	stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+	stageInfo.module = twoDShaderModule;
+	stageInfo.pName = "main";
+
+	VkComputePipelineCreateInfo pipelineInfo;
+	memset( &pipelineInfo, 0, sizeof( pipelineInfo ) );
+	pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+	pipelineInfo.stage = stageInfo;
+	pipelineInfo.layout = twoDPipelineLayout;
+	if ( vkCreateComputePipelines( device, VK_NULL_HANDLE, 1, &pipelineInfo, NULL, &twoDPipeline ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateComputePipelines 2D failed" );
+		return false;
+	}
+
+	VkDescriptorPoolSize poolSize;
+	memset( &poolSize, 0, sizeof( poolSize ) );
+	poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	poolSize.descriptorCount = 2;
+
+	VkDescriptorPoolCreateInfo poolInfo;
+	memset( &poolInfo, 0, sizeof( poolInfo ) );
+	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	poolInfo.maxSets = 1;
+	poolInfo.poolSizeCount = 1;
+	poolInfo.pPoolSizes = &poolSize;
+	if ( vkCreateDescriptorPool( device, &poolInfo, NULL, &twoDDescriptorPool ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateDescriptorPool 2D failed" );
+		return false;
+	}
+
+	VkDescriptorSetAllocateInfo setInfo;
+	memset( &setInfo, 0, sizeof( setInfo ) );
+	setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	setInfo.descriptorPool = twoDDescriptorPool;
+	setInfo.descriptorSetCount = 1;
+	setInfo.pSetLayouts = &twoDDescriptorSetLayout;
+	if ( vkAllocateDescriptorSets( device, &setInfo, &twoDDescriptorSet ) != VK_SUCCESS ) {
+		LogFailure( "vkAllocateDescriptorSets 2D failed" );
+		return false;
+	}
+	return true;
+}
+
+bool idSoftwareVulkanBridge::CreateHybridPipeline() {
+	VkDescriptorSetLayoutBinding bindings[16];
+	memset( bindings, 0, sizeof( bindings ) );
+	for ( uint32_t i = 0; i < 13; i++ ) {
+		bindings[i].binding = i;
+		bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		bindings[i].descriptorCount = 1;
+		bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	}
+	bindings[13].binding = 13;
+	bindings[13].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+	bindings[13].descriptorCount = 1;
+	bindings[13].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	for ( uint32_t i = 14; i < 16; i++ ) {
+		bindings[i].binding = i;
+		bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		bindings[i].descriptorCount = 1;
+		bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	}
+
+	VkDescriptorSetLayoutCreateInfo layoutInfo;
+	memset( &layoutInfo, 0, sizeof( layoutInfo ) );
+	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	layoutInfo.bindingCount = 16;
+	layoutInfo.pBindings = bindings;
+	if ( vkCreateDescriptorSetLayout( device, &layoutInfo, NULL, &hybridDescriptorSetLayout ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateDescriptorSetLayout hybrid failed" );
+		return false;
+	}
+
+	VkPushConstantRange pushRange;
+	memset( &pushRange, 0, sizeof( pushRange ) );
+	pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	pushRange.offset = 0;
+	pushRange.size = sizeof( swVkHybridPushConstants_t );
+
+	VkPipelineLayoutCreateInfo pipelineLayoutInfo;
+	memset( &pipelineLayoutInfo, 0, sizeof( pipelineLayoutInfo ) );
+	pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	pipelineLayoutInfo.setLayoutCount = 1;
+	pipelineLayoutInfo.pSetLayouts = &hybridDescriptorSetLayout;
+	pipelineLayoutInfo.pushConstantRangeCount = 1;
+	pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+	if ( vkCreatePipelineLayout( device, &pipelineLayoutInfo, NULL, &hybridPipelineLayout ) != VK_SUCCESS ) {
+		LogFailure( "vkCreatePipelineLayout hybrid failed" );
+		return false;
+	}
+
+	VkShaderModuleCreateInfo shaderInfo;
+	memset( &shaderInfo, 0, sizeof( shaderInfo ) );
+	shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+	shaderInfo.codeSize = swHybridCompositeCompSpvSize;
+	shaderInfo.pCode = swHybridCompositeCompSpv;
+	if ( vkCreateShaderModule( device, &shaderInfo, NULL, &hybridShaderModule ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateShaderModule hybrid failed" );
+		return false;
+	}
+
+	VkPipelineShaderStageCreateInfo stageInfo;
+	memset( &stageInfo, 0, sizeof( stageInfo ) );
+	stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+	stageInfo.module = hybridShaderModule;
+	stageInfo.pName = "main";
+
+	VkComputePipelineCreateInfo pipelineInfo;
+	memset( &pipelineInfo, 0, sizeof( pipelineInfo ) );
+	pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+	pipelineInfo.stage = stageInfo;
+	pipelineInfo.layout = hybridPipelineLayout;
+	if ( vkCreateComputePipelines( device, VK_NULL_HANDLE, 1, &pipelineInfo, NULL, &hybridPipeline ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateComputePipelines hybrid failed" );
+		return false;
+	}
+
+	VkDescriptorPoolSize poolSizes[2];
+	memset( poolSizes, 0, sizeof( poolSizes ) );
+	poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	poolSizes[0].descriptorCount = 15;
+	poolSizes[1].type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+	poolSizes[1].descriptorCount = 1;
+
+	VkDescriptorPoolCreateInfo poolInfo;
+	memset( &poolInfo, 0, sizeof( poolInfo ) );
+	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	poolInfo.maxSets = 1;
+	poolInfo.poolSizeCount = 2;
+	poolInfo.pPoolSizes = poolSizes;
+	if ( vkCreateDescriptorPool( device, &poolInfo, NULL, &hybridDescriptorPool ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateDescriptorPool hybrid failed" );
+		return false;
+	}
+
+	VkDescriptorSetAllocateInfo setInfo;
+	memset( &setInfo, 0, sizeof( setInfo ) );
+	setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	setInfo.descriptorPool = hybridDescriptorPool;
+	setInfo.descriptorSetCount = 1;
+	setInfo.pSetLayouts = &hybridDescriptorSetLayout;
+	if ( vkAllocateDescriptorSets( device, &setInfo, &hybridDescriptorSet ) != VK_SUCCESS ) {
+		LogFailure( "vkAllocateDescriptorSets hybrid failed" );
+		return false;
+	}
+	return true;
+}
+
+bool idSoftwareVulkanBridge::CreateShadowPipeline() {
+	if ( !rayQuerySupported ) {
+		return true;
+	}
+
+	VkDescriptorSetLayoutBinding bindings[3];
+	memset( bindings, 0, sizeof( bindings ) );
+	bindings[0].binding = 0;
+	bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+	bindings[0].descriptorCount = 1;
+	bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	bindings[1].binding = 1;
+	bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	bindings[1].descriptorCount = 1;
+	bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	bindings[2].binding = 2;
+	bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	bindings[2].descriptorCount = 1;
+	bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+	VkDescriptorSetLayoutCreateInfo layoutInfo;
+	memset( &layoutInfo, 0, sizeof( layoutInfo ) );
+	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	layoutInfo.bindingCount = 3;
+	layoutInfo.pBindings = bindings;
+	if ( vkCreateDescriptorSetLayout( device, &layoutInfo, NULL, &shadowDescriptorSetLayout ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateDescriptorSetLayout failed" );
+		return false;
+	}
+
+	VkPushConstantRange pushRange;
+	memset( &pushRange, 0, sizeof( pushRange ) );
+	pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	pushRange.offset = 0;
+	pushRange.size = sizeof( swVkShadowPushConstants_t );
+
+	VkPipelineLayoutCreateInfo pipelineLayoutInfo;
+	memset( &pipelineLayoutInfo, 0, sizeof( pipelineLayoutInfo ) );
+	pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	pipelineLayoutInfo.setLayoutCount = 1;
+	pipelineLayoutInfo.pSetLayouts = &shadowDescriptorSetLayout;
+	pipelineLayoutInfo.pushConstantRangeCount = 1;
+	pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+	if ( vkCreatePipelineLayout( device, &pipelineLayoutInfo, NULL, &shadowPipelineLayout ) != VK_SUCCESS ) {
+		LogFailure( "vkCreatePipelineLayout failed" );
+		return false;
+	}
+
+	VkShaderModuleCreateInfo shaderInfo;
+	memset( &shaderInfo, 0, sizeof( shaderInfo ) );
+	shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+	shaderInfo.codeSize = swRayQueryShadowCompSpvSize;
+	shaderInfo.pCode = swRayQueryShadowCompSpv;
+	if ( vkCreateShaderModule( device, &shaderInfo, NULL, &shadowShaderModule ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateShaderModule failed" );
+		return false;
+	}
+
+	VkPipelineShaderStageCreateInfo stageInfo;
+	memset( &stageInfo, 0, sizeof( stageInfo ) );
+	stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+	stageInfo.module = shadowShaderModule;
+	stageInfo.pName = "main";
+
+	VkComputePipelineCreateInfo pipelineInfo;
+	memset( &pipelineInfo, 0, sizeof( pipelineInfo ) );
+	pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+	pipelineInfo.stage = stageInfo;
+	pipelineInfo.layout = shadowPipelineLayout;
+	if ( vkCreateComputePipelines( device, VK_NULL_HANDLE, 1, &pipelineInfo, NULL, &shadowPipeline ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateComputePipelines failed" );
+		return false;
+	}
+
+	VkDescriptorPoolSize poolSizes[2];
+	memset( poolSizes, 0, sizeof( poolSizes ) );
+	poolSizes[0].type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+	poolSizes[0].descriptorCount = SW_VK_MAX_SHADOW_JOBS;
+	poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	poolSizes[1].descriptorCount = SW_VK_MAX_SHADOW_JOBS * 2;
+
+	VkDescriptorPoolCreateInfo poolInfo;
+	memset( &poolInfo, 0, sizeof( poolInfo ) );
+	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	poolInfo.maxSets = SW_VK_MAX_SHADOW_JOBS;
+	poolInfo.poolSizeCount = 2;
+	poolInfo.pPoolSizes = poolSizes;
+	if ( vkCreateDescriptorPool( device, &poolInfo, NULL, &shadowDescriptorPool ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateDescriptorPool failed" );
+		return false;
+	}
+	return true;
+}
+
+uint32_t idSoftwareVulkanBridge::FindMemoryType( uint32_t memoryTypeBits, VkMemoryPropertyFlags properties ) const {
+	VkPhysicalDeviceMemoryProperties memoryProperties;
+	vkGetPhysicalDeviceMemoryProperties( physicalDevice, &memoryProperties );
+
+	for ( uint32_t i = 0; i < memoryProperties.memoryTypeCount; i++ ) {
+		if ( ( memoryTypeBits & ( 1u << i ) ) &&
+			 ( memoryProperties.memoryTypes[i].propertyFlags & properties ) == properties ) {
+			return i;
+		}
+	}
+	return UINT32_MAX;
+}
+
+bool idSoftwareVulkanBridge::EnsureUploadBuffer( int requiredWidth, int requiredHeight ) {
+	const VkDeviceSize requiredSize = static_cast<VkDeviceSize>( requiredWidth ) * static_cast<VkDeviceSize>( requiredHeight ) * sizeof( unsigned int );
+	if ( uploadBuffer != VK_NULL_HANDLE && uploadBufferSize >= requiredSize ) {
+		return true;
+	}
+
+	DestroyUploadBuffer();
+
+	VkBufferCreateInfo bufferInfo;
+	memset( &bufferInfo, 0, sizeof( bufferInfo ) );
+	bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	bufferInfo.size = requiredSize;
+	bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+	bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+	if ( vkCreateBuffer( device, &bufferInfo, NULL, &uploadBuffer ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateBuffer failed" );
+		return false;
+	}
+
+	VkMemoryRequirements memoryRequirements;
+	vkGetBufferMemoryRequirements( device, uploadBuffer, &memoryRequirements );
+
+	const uint32_t memoryType = FindMemoryType( memoryRequirements.memoryTypeBits,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT );
+	if ( memoryType == UINT32_MAX ) {
+		LogFailure( "no host-visible Vulkan upload memory type" );
+		return false;
+	}
+
+	VkMemoryAllocateInfo allocInfo;
+	memset( &allocInfo, 0, sizeof( allocInfo ) );
+	allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocInfo.allocationSize = memoryRequirements.size;
+	allocInfo.memoryTypeIndex = memoryType;
+
+	if ( vkAllocateMemory( device, &allocInfo, NULL, &uploadMemory ) != VK_SUCCESS ) {
+		LogFailure( "vkAllocateMemory failed" );
+		return false;
+	}
+
+	if ( vkBindBufferMemory( device, uploadBuffer, uploadMemory, 0 ) != VK_SUCCESS ) {
+		LogFailure( "vkBindBufferMemory failed" );
+		return false;
+	}
+
+	uploadBufferSize = requiredSize;
+	return true;
+}
+
+bool idSoftwareVulkanBridge::UploadBuffer( swVkBuffer_t &buffer, const void *data, VkDeviceSize size, const char *failureText ) {
+	if ( !data || buffer.memory == VK_NULL_HANDLE || buffer.size < size ) {
+		return false;
+	}
+
+	void *mapped = NULL;
+	if ( vkMapMemory( device, buffer.memory, 0, size, 0, &mapped ) != VK_SUCCESS ) {
+		LogFailure( failureText );
+		return false;
+	}
+	memcpy( mapped, data, static_cast<size_t>( size ) );
+	vkUnmapMemory( device, buffer.memory );
+	return true;
+}
+
+bool idSoftwareVulkanBridge::Ensure2DBuffers( int sourcePixelCount ) {
+	if ( sourcePixelCount <= 0 ) {
+		return false;
+	}
+	const VkDeviceSize sourceSize = static_cast<VkDeviceSize>( sourcePixelCount ) * sizeof( uint32_t );
+	const VkMemoryPropertyFlags hostMemory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	if ( hybrid2DSourceBuffer.buffer == VK_NULL_HANDLE || hybrid2DSourceBuffer.size < sourceSize ) {
+		if ( !CreateBuffer( sourceSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybrid2DSourceBuffer ) ) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool idSoftwareVulkanBridge::EnsureHybridBuffers( int requiredWidth, int requiredHeight, int textureInfoCount, int textureTexelCount, int lightCount ) {
+	if ( requiredWidth <= 0 || requiredHeight <= 0 || frameWidth <= 0 || frameHeight <= 0 ) {
+		return false;
+	}
+
+	textureInfoCount = Max( 1, textureInfoCount );
+	textureTexelCount = Max( 1, textureTexelCount );
+	lightCount = Max( 1, lightCount );
+
+	const VkDeviceSize pixelCount = static_cast<VkDeviceSize>( requiredWidth ) * static_cast<VkDeviceSize>( requiredHeight );
+	const VkDeviceSize depthSize = pixelCount * sizeof( float );
+	const VkDeviceSize uintSize = pixelCount * sizeof( uint32_t );
+	const VkDeviceSize worldPositionSize = pixelCount * sizeof( idVec4 );
+	const VkDeviceSize frameSize = static_cast<VkDeviceSize>( frameWidth ) * static_cast<VkDeviceSize>( frameHeight ) * sizeof( uint32_t );
+	const VkDeviceSize textureInfoSize = static_cast<VkDeviceSize>( textureInfoCount ) * sizeof( swHybridTextureInfo_t );
+	const VkDeviceSize textureTexelSize = static_cast<VkDeviceSize>( textureTexelCount ) * sizeof( uint32_t );
+	const VkDeviceSize lightSize = static_cast<VkDeviceSize>( lightCount ) * sizeof( swHybridLight_t );
+	const VkMemoryPropertyFlags hostMemory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+	if ( hybridDepthBuffer.buffer == VK_NULL_HANDLE || hybridDepthBuffer.size < depthSize ) {
+		if ( !CreateBuffer( depthSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridDepthBuffer ) ) {
+			return false;
+		}
+	}
+	if ( hybridNormalBuffer.buffer == VK_NULL_HANDLE || hybridNormalBuffer.size < uintSize ) {
+		if ( !CreateBuffer( uintSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridNormalBuffer ) ) {
+			return false;
+		}
+	}
+	if ( hybridTangentBuffer.buffer == VK_NULL_HANDLE || hybridTangentBuffer.size < uintSize ) {
+		if ( !CreateBuffer( uintSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridTangentBuffer ) ) {
+			return false;
+		}
+	}
+	if ( hybridBitangentBuffer.buffer == VK_NULL_HANDLE || hybridBitangentBuffer.size < uintSize ) {
+		if ( !CreateBuffer( uintSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridBitangentBuffer ) ) {
+			return false;
+		}
+	}
+	if ( hybridUVBuffer.buffer == VK_NULL_HANDLE || hybridUVBuffer.size < uintSize ) {
+		if ( !CreateBuffer( uintSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridUVBuffer ) ) {
+			return false;
+		}
+	}
+	if ( hybridMaterialBuffer.buffer == VK_NULL_HANDLE || hybridMaterialBuffer.size < uintSize ) {
+		if ( !CreateBuffer( uintSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridMaterialBuffer ) ) {
+			return false;
+		}
+	}
+	if ( hybridAlbedoBuffer.buffer == VK_NULL_HANDLE || hybridAlbedoBuffer.size < uintSize ) {
+		if ( !CreateBuffer( uintSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridAlbedoBuffer ) ) {
+			return false;
+		}
+	}
+	if ( hybridSpecularBuffer.buffer == VK_NULL_HANDLE || hybridSpecularBuffer.size < uintSize ) {
+		if ( !CreateBuffer( uintSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridSpecularBuffer ) ) {
+			return false;
+		}
+	}
+	if ( hybridSurfaceBuffer.buffer == VK_NULL_HANDLE || hybridSurfaceBuffer.size < uintSize ) {
+		if ( !CreateBuffer( uintSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridSurfaceBuffer ) ) {
+			return false;
+		}
+	}
+	if ( hybridWorldPositionBuffer.buffer == VK_NULL_HANDLE || hybridWorldPositionBuffer.size < worldPositionSize ) {
+		if ( !CreateBuffer( worldPositionSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridWorldPositionBuffer ) ) {
+			return false;
+		}
+	}
+	if ( hybridFrameBuffer.buffer == VK_NULL_HANDLE || hybridFrameBuffer.size < frameSize ) {
+		if ( !CreateBuffer( frameSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false, hybridFrameBuffer ) ) {
+			return false;
+		}
+	}
+	if ( hybridOverlayBuffer.buffer == VK_NULL_HANDLE || hybridOverlayBuffer.size < frameSize ) {
+		if ( !CreateBuffer( frameSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false, hybridOverlayBuffer ) ) {
+			return false;
+		}
+	}
+	if ( hybridTextureInfoBuffer.buffer == VK_NULL_HANDLE || hybridTextureInfoBuffer.size < textureInfoSize ) {
+		if ( !CreateBuffer( textureInfoSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridTextureInfoBuffer ) ) {
+			return false;
+		}
+	}
+	if ( hybridTextureTexelBuffer.buffer == VK_NULL_HANDLE || hybridTextureTexelBuffer.size < textureTexelSize ) {
+		if ( !CreateBuffer( textureTexelSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridTextureTexelBuffer ) ) {
+			return false;
+		}
+	}
+	if ( hybridLightBuffer.buffer == VK_NULL_HANDLE || hybridLightBuffer.size < lightSize ) {
+		if ( !CreateBuffer( lightSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridLightBuffer ) ) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void idSoftwareVulkanBridge::Update2DDescriptorSet() {
+	if ( twoDDescriptorSet == VK_NULL_HANDLE || hybrid2DSourceBuffer.buffer == VK_NULL_HANDLE || hybridOverlayBuffer.buffer == VK_NULL_HANDLE ) {
+		return;
+	}
+
+	VkDescriptorBufferInfo infos[2];
+	memset( infos, 0, sizeof( infos ) );
+	infos[0].buffer = hybrid2DSourceBuffer.buffer;
+	infos[0].range = hybrid2DSourceBuffer.size;
+	infos[1].buffer = hybridOverlayBuffer.buffer;
+	infos[1].range = hybridOverlayBuffer.size;
+
+	VkWriteDescriptorSet writes[2];
+	memset( writes, 0, sizeof( writes ) );
+	for ( uint32_t i = 0; i < 2; i++ ) {
+		writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[i].dstSet = twoDDescriptorSet;
+		writes[i].dstBinding = i;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		writes[i].pBufferInfo = &infos[i];
+	}
+	vkUpdateDescriptorSets( device, 2, writes, 0, NULL );
+}
+
+void idSoftwareVulkanBridge::UpdateHybridDescriptorSet() {
+	VkDescriptorBufferInfo infos[15];
+	memset( infos, 0, sizeof( infos ) );
+	infos[0].buffer = hybridDepthBuffer.buffer;
+	infos[0].range = hybridDepthBuffer.size;
+	infos[1].buffer = hybridNormalBuffer.buffer;
+	infos[1].range = hybridNormalBuffer.size;
+	infos[2].buffer = hybridUVBuffer.buffer;
+	infos[2].range = hybridUVBuffer.size;
+	infos[3].buffer = hybridMaterialBuffer.buffer;
+	infos[3].range = hybridMaterialBuffer.size;
+	infos[4].buffer = hybridAlbedoBuffer.buffer;
+	infos[4].range = hybridAlbedoBuffer.size;
+	infos[5].buffer = hybridSpecularBuffer.buffer;
+	infos[5].range = hybridSpecularBuffer.size;
+	infos[6].buffer = hybridSurfaceBuffer.buffer;
+	infos[6].range = hybridSurfaceBuffer.size;
+	infos[7].buffer = hybridFrameBuffer.buffer;
+	infos[7].range = hybridFrameBuffer.size;
+	infos[8].buffer = hybridOverlayBuffer.buffer;
+	infos[8].range = hybridOverlayBuffer.size;
+	infos[9].buffer = hybridTextureInfoBuffer.buffer;
+	infos[9].range = hybridTextureInfoBuffer.size;
+	infos[10].buffer = hybridTextureTexelBuffer.buffer;
+	infos[10].range = hybridTextureTexelBuffer.size;
+	infos[11].buffer = hybridWorldPositionBuffer.buffer;
+	infos[11].range = hybridWorldPositionBuffer.size;
+	infos[12].buffer = hybridLightBuffer.buffer;
+	infos[12].range = hybridLightBuffer.size;
+	infos[13].buffer = hybridTangentBuffer.buffer;
+	infos[13].range = hybridTangentBuffer.size;
+	infos[14].buffer = hybridBitangentBuffer.buffer;
+	infos[14].range = hybridBitangentBuffer.size;
+
+	const uint32_t bindingMap[15] = {
+		0, 1, 2, 3, 4, 5, 6, 7,
+		8, 9, 10, 11, 12, 14, 15
+	};
+
+	VkWriteDescriptorSet writes[15];
+	memset( writes, 0, sizeof( writes ) );
+	for ( uint32_t i = 0; i < 15; i++ ) {
+		writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[i].dstSet = hybridDescriptorSet;
+		writes[i].dstBinding = bindingMap[i];
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		writes[i].pBufferInfo = &infos[i];
+	}
+	vkUpdateDescriptorSets( device, 15, writes, 0, NULL );
+
+	if ( tlas != VK_NULL_HANDLE ) {
+		VkWriteDescriptorSetAccelerationStructureKHR asInfo;
+		memset( &asInfo, 0, sizeof( asInfo ) );
+		asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+		asInfo.accelerationStructureCount = 1;
+		asInfo.pAccelerationStructures = &tlas;
+
+		VkWriteDescriptorSet asWrite;
+		memset( &asWrite, 0, sizeof( asWrite ) );
+		asWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		asWrite.pNext = &asInfo;
+		asWrite.dstSet = hybridDescriptorSet;
+		asWrite.dstBinding = 13;
+		asWrite.descriptorCount = 1;
+		asWrite.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+		vkUpdateDescriptorSets( device, 1, &asWrite, 0, NULL );
+	}
+}
+
+bool idSoftwareVulkanBridge::EnsureShadowBuffers( int width, int height ) {
+	if ( !rayQuerySupported || width <= 0 || height <= 0 ) {
+		return false;
+	}
+
+	const VkDeviceSize positionSize = static_cast<VkDeviceSize>( width ) * static_cast<VkDeviceSize>( height ) * sizeof( idVec4 );
+	const VkDeviceSize maskSize = static_cast<VkDeviceSize>( width ) * static_cast<VkDeviceSize>( height ) * sizeof( uint32_t );
+
+	if ( worldPositionBuffer.buffer == VK_NULL_HANDLE || worldPositionBuffer.size < positionSize ) {
+		if ( !CreateBuffer( positionSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, false, worldPositionBuffer ) ) {
+			return false;
+		}
+	}
+	if ( shadowMaskBuffer.buffer == VK_NULL_HANDLE || shadowMaskBuffer.size < maskSize ) {
+		if ( !CreateBuffer( maskSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, false, shadowMaskBuffer ) ) {
+			return false;
+		}
+	}
+	return true;
+}
+
+uintptr_t idSoftwareVulkanBridge::ShadowLightKey( const viewLight_t *vLight ) const {
+	if ( !vLight ) {
+		return 0;
+	}
+	if ( vLight->lightDef ) {
+		return reinterpret_cast<uintptr_t>( vLight->lightDef );
+	}
+
+	const int x = idMath::Ftoi( vLight->globalLightOrigin[0] * 8.0f );
+	const int y = idMath::Ftoi( vLight->globalLightOrigin[1] * 8.0f );
+	const int z = idMath::Ftoi( vLight->globalLightOrigin[2] * 8.0f );
+	return ( static_cast<uintptr_t>( x & 0xffff ) << 32 ) ^
+		( static_cast<uintptr_t>( y & 0xffff ) << 16 ) ^
+		static_cast<uintptr_t>( z & 0xffff );
+}
+
+bool idSoftwareVulkanBridge::HasPendingShadowJobs() const {
+	for ( int i = 0; i < SW_VK_MAX_SHADOW_JOBS; i++ ) {
+		const swVkShadowJob_t &job = shadowJobs[i];
+		if ( job.pendingSubmit ) {
+			return true;
+		}
+		if ( job.submitted && job.fence != VK_NULL_HANDLE && vkGetFenceStatus( device, job.fence ) == VK_NOT_READY ) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool idSoftwareVulkanBridge::EnsureShadowJobResources( swVkShadowJob_t &job, int width, int height ) {
+	if ( !rayQuerySupported || width <= 0 || height <= 0 ) {
+		return false;
+	}
+
+	if ( job.commandBuffer == VK_NULL_HANDLE ) {
+		VkCommandBufferAllocateInfo allocInfo;
+		memset( &allocInfo, 0, sizeof( allocInfo ) );
+		allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+		allocInfo.commandPool = commandPool;
+		allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+		allocInfo.commandBufferCount = 1;
+		if ( vkAllocateCommandBuffers( device, &allocInfo, &job.commandBuffer ) != VK_SUCCESS ) {
+			LogFailure( "vkAllocateCommandBuffers shadow failed" );
+			return false;
+		}
+	}
+
+	if ( job.fence == VK_NULL_HANDLE ) {
+		VkFenceCreateInfo fenceInfo;
+		memset( &fenceInfo, 0, sizeof( fenceInfo ) );
+		fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+		fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+		if ( vkCreateFence( device, &fenceInfo, NULL, &job.fence ) != VK_SUCCESS ) {
+			LogFailure( "vkCreateFence shadow failed" );
+			return false;
+		}
+	}
+
+	if ( job.descriptorSet == VK_NULL_HANDLE ) {
+		VkDescriptorSetAllocateInfo setInfo;
+		memset( &setInfo, 0, sizeof( setInfo ) );
+		setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+		setInfo.descriptorPool = shadowDescriptorPool;
+		setInfo.descriptorSetCount = 1;
+		setInfo.pSetLayouts = &shadowDescriptorSetLayout;
+		if ( vkAllocateDescriptorSets( device, &setInfo, &job.descriptorSet ) != VK_SUCCESS ) {
+			LogFailure( "vkAllocateDescriptorSets shadow failed" );
+			return false;
+		}
+	}
+
+	const VkDeviceSize positionSize = static_cast<VkDeviceSize>( width ) * static_cast<VkDeviceSize>( height ) * sizeof( idVec4 );
+	const VkDeviceSize maskSize = static_cast<VkDeviceSize>( width ) * static_cast<VkDeviceSize>( height ) * sizeof( uint32_t );
+
+	if ( job.worldPositionBuffer.buffer == VK_NULL_HANDLE || job.worldPositionBuffer.size < positionSize ) {
+		if ( !CreateBuffer( positionSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, false, job.worldPositionBuffer ) ) {
+			return false;
+		}
+	}
+	if ( job.shadowMaskBuffer.buffer == VK_NULL_HANDLE || job.shadowMaskBuffer.size < maskSize ) {
+		if ( !CreateBuffer( maskSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, false, job.shadowMaskBuffer ) ) {
+			return false;
+		}
+	}
+	return true;
+}
+
+swVkShadowJob_t *idSoftwareVulkanBridge::AllocShadowJob() {
+	for ( int i = 0; i < SW_VK_MAX_SHADOW_JOBS; i++ ) {
+		swVkShadowJob_t &job = shadowJobs[i];
+		if ( job.pendingSubmit ) {
+			continue;
+		}
+		if ( !job.submitted || job.fence == VK_NULL_HANDLE || vkGetFenceStatus( device, job.fence ) == VK_SUCCESS ) {
+			job.submitted = false;
+			return &job;
+		}
+	}
+	return NULL;
+}
+
+bool idSoftwareVulkanBridge::RecordShadowJob( swVkShadowJob_t &job, const viewLight_t *vLight, const idVec4 *worldPositions, int width, int height ) {
+	if ( !vLight || !worldPositions || !rayQuerySceneReady || !tlas || !shadowPipeline ) {
+		return false;
+	}
+	if ( !EnsureShadowJobResources( job, width, height ) ) {
+		return false;
+	}
+
+	const int pixelCount = width * height;
+	const VkDeviceSize positionSize = static_cast<VkDeviceSize>( pixelCount ) * sizeof( idVec4 );
+	const VkDeviceSize maskSize = static_cast<VkDeviceSize>( pixelCount ) * sizeof( uint32_t );
+
+	void *mapped = NULL;
+	if ( vkMapMemory( device, job.worldPositionBuffer.memory, 0, positionSize, 0, &mapped ) != VK_SUCCESS ) {
+		LogFailure( "vkMapMemory world positions failed" );
+		return false;
+	}
+	memcpy( mapped, worldPositions, positionSize );
+	vkUnmapMemory( device, job.worldPositionBuffer.memory );
+
+	if ( vkMapMemory( device, job.shadowMaskBuffer.memory, 0, maskSize, 0, &mapped ) != VK_SUCCESS ) {
+		LogFailure( "vkMapMemory shadow mask clear failed" );
+		return false;
+	}
+	memset( mapped, 255, static_cast<size_t>( maskSize ) );
+	vkUnmapMemory( device, job.shadowMaskBuffer.memory );
+
+	VkWriteDescriptorSetAccelerationStructureKHR asInfo;
+	memset( &asInfo, 0, sizeof( asInfo ) );
+	asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+	asInfo.accelerationStructureCount = 1;
+	asInfo.pAccelerationStructures = &tlas;
+
+	VkDescriptorBufferInfo positionInfo;
+	memset( &positionInfo, 0, sizeof( positionInfo ) );
+	positionInfo.buffer = job.worldPositionBuffer.buffer;
+	positionInfo.offset = 0;
+	positionInfo.range = positionSize;
+
+	VkDescriptorBufferInfo maskInfo;
+	memset( &maskInfo, 0, sizeof( maskInfo ) );
+	maskInfo.buffer = job.shadowMaskBuffer.buffer;
+	maskInfo.offset = 0;
+	maskInfo.range = maskSize;
+
+	VkWriteDescriptorSet writes[3];
+	memset( writes, 0, sizeof( writes ) );
+	writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	writes[0].pNext = &asInfo;
+	writes[0].dstSet = job.descriptorSet;
+	writes[0].dstBinding = 0;
+	writes[0].descriptorCount = 1;
+	writes[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+	writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	writes[1].dstSet = job.descriptorSet;
+	writes[1].dstBinding = 1;
+	writes[1].descriptorCount = 1;
+	writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	writes[1].pBufferInfo = &positionInfo;
+	writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	writes[2].dstSet = job.descriptorSet;
+	writes[2].dstBinding = 2;
+	writes[2].descriptorCount = 1;
+	writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	writes[2].pBufferInfo = &maskInfo;
+	vkUpdateDescriptorSets( device, 3, writes, 0, NULL );
+
+	swVkShadowPushConstants_t push;
+	memset( &push, 0, sizeof( push ) );
+	push.lightOrigin[0] = vLight->globalLightOrigin[0];
+	push.lightOrigin[1] = vLight->globalLightOrigin[1];
+	push.lightOrigin[2] = vLight->globalLightOrigin[2];
+	push.lightOrigin[3] = 1.0f;
+	push.pixelCount = pixelCount;
+	push.bias = 2.0f;
+
+	vkResetCommandBuffer( job.commandBuffer, 0 );
+
+	VkCommandBufferBeginInfo beginInfo;
+	memset( &beginInfo, 0, sizeof( beginInfo ) );
+	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	if ( vkBeginCommandBuffer( job.commandBuffer, &beginInfo ) != VK_SUCCESS ) {
+		LogFailure( "vkBeginCommandBuffer shadow failed" );
+		return false;
+	}
+
+	vkCmdBindPipeline( job.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, shadowPipeline );
+	vkCmdBindDescriptorSets( job.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, shadowPipelineLayout, 0, 1, &job.descriptorSet, 0, NULL );
+	vkCmdPushConstants( job.commandBuffer, shadowPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+	vkCmdDispatch( job.commandBuffer, ( pixelCount + 63 ) / 64, 1, 1 );
+
+	VkMemoryBarrier readbackBarrier;
+	memset( &readbackBarrier, 0, sizeof( readbackBarrier ) );
+	readbackBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	readbackBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	readbackBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+	vkCmdPipelineBarrier( job.commandBuffer,
+		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		VK_PIPELINE_STAGE_HOST_BIT,
+		0, 1, &readbackBarrier, 0, NULL, 0, NULL );
+
+	if ( vkEndCommandBuffer( job.commandBuffer ) != VK_SUCCESS ) {
+		LogFailure( "vkEndCommandBuffer shadow failed" );
+		return false;
+	}
+
+	job.lightKey = ShadowLightKey( vLight );
+	job.width = width;
+	job.height = height;
+	job.pendingSubmit = true;
+	job.submitted = false;
+	return true;
+}
+
+void idSoftwareVulkanBridge::DestroyShadowJobs() {
+	for ( int i = 0; i < SW_VK_MAX_SHADOW_JOBS; i++ ) {
+		swVkShadowJob_t &job = shadowJobs[i];
+
+		if ( job.commandBuffer != VK_NULL_HANDLE && commandPool != VK_NULL_HANDLE ) {
+			vkFreeCommandBuffers( device, commandPool, 1, &job.commandBuffer );
+			job.commandBuffer = VK_NULL_HANDLE;
+		}
+		if ( job.fence != VK_NULL_HANDLE ) {
+			vkDestroyFence( device, job.fence, NULL );
+			job.fence = VK_NULL_HANDLE;
+		}
+
+		DestroyBuffer( job.worldPositionBuffer );
+		DestroyBuffer( job.shadowMaskBuffer );
+
+		job.descriptorSet = VK_NULL_HANDLE;
+		job.lightKey = 0;
+		job.width = 0;
+		job.height = 0;
+		job.pendingSubmit = false;
+		job.submitted = false;
+	}
+}
+
+
+bool idSoftwareVulkanBridge::EnsureFrameBuffer() {
+	if ( frameWidth <= 0 || frameHeight <= 0 ) {
+		return false;
+	}
+
+	const int neededPixels = frameWidth * frameHeight;
+	if ( framePixels.Num() != neededPixels ) {
+		framePixels.SetNum( neededPixels, false );
+		frameBegun = false;
+	}
+	return true;
+}
+
+void idSoftwareVulkanBridge::DestroyCachedBlas( swVkCachedBlas_t &entry ) {
+	if ( entry.blas != VK_NULL_HANDLE ) {
+		vkDestroyAccelerationStructureKHRLocal( device, entry.blas, NULL );
+		entry.blas = VK_NULL_HANDLE;
+	}
+	DestroyBuffer( entry.blasBuffer );
+	DestroyBuffer( entry.indexBuffer );
+	DestroyBuffer( entry.vertexBuffer );
+	entry.key = NULL;
+	entry.verts = NULL;
+	entry.indexes = NULL;
+	entry.vertCount = 0;
+	entry.indexCount = 0;
+	entry.primitiveCount = 0;
+	entry.sourceFrame = 0;
+	entry.lastUsedFrame = 0;
+	entry.blasAddress = 0;
+}
+
+bool idSoftwareVulkanBridge::BuildCachedBlas( swVkCachedBlas_t &entry, const srfTriangles_t *geo, int sourceFrame ) {
+	if ( !rayQuerySupported || !geo || !geo->verts || !geo->indexes || geo->numVerts <= 0 || geo->numIndexes < 3 ) {
+		return false;
+	}
+
+	idList<swVkShadowVertex_t> vertices;
+	vertices.SetNum( geo->numVerts, false );
+	for ( int i = 0; i < geo->numVerts; i++ ) {
+		vertices[i].xyz[0] = geo->verts[i].xyz[0];
+		vertices[i].xyz[1] = geo->verts[i].xyz[1];
+		vertices[i].xyz[2] = geo->verts[i].xyz[2];
+		vertices[i].pad = 0.0f;
+	}
+
+	idList<uint32_t> indexes;
+	indexes.SetNum( geo->numIndexes, false );
+	int validIndexCount = 0;
+	for ( int index = 0; index + 2 < geo->numIndexes; index += 3 ) {
+		const int i0 = geo->indexes[index + 0];
+		const int i1 = geo->indexes[index + 1];
+		const int i2 = geo->indexes[index + 2];
+		if ( i0 < 0 || i0 >= geo->numVerts ||
+			 i1 < 0 || i1 >= geo->numVerts ||
+			 i2 < 0 || i2 >= geo->numVerts ) {
+			continue;
+		}
+		indexes[validIndexCount++] = static_cast<uint32_t>( i0 );
+		indexes[validIndexCount++] = static_cast<uint32_t>( i1 );
+		indexes[validIndexCount++] = static_cast<uint32_t>( i2 );
+	}
+	indexes.SetNum( validIndexCount, false );
+	if ( indexes.Num() < 3 ) {
+		return false;
+	}
+
+	const VkDeviceSize vertexSize = static_cast<VkDeviceSize>( vertices.Num() ) * sizeof( vertices[0] );
+	const VkDeviceSize indexSize = static_cast<VkDeviceSize>( indexes.Num() ) * sizeof( indexes[0] );
+	if ( !CreateBuffer( vertexSize,
+			VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			true,
+			entry.vertexBuffer ) ||
+		 !CreateBuffer( indexSize,
+			VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			true,
+			entry.indexBuffer ) ) {
+		DestroyCachedBlas( entry );
+		return false;
+	}
+	if ( !UploadBuffer( entry.vertexBuffer, vertices.Ptr(), vertexSize, "vkMapMemory cached BLAS vertices failed" ) ||
+		 !UploadBuffer( entry.indexBuffer, indexes.Ptr(), indexSize, "vkMapMemory cached BLAS indexes failed" ) ) {
+		DestroyCachedBlas( entry );
+		return false;
+	}
+
+	const uint32_t primitiveCount = indexes.Num() / 3;
+	VkAccelerationStructureGeometryTrianglesDataKHR triangles;
+	memset( &triangles, 0, sizeof( triangles ) );
+	triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+	triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+	triangles.vertexData.deviceAddress = GetBufferAddress( entry.vertexBuffer.buffer );
+	triangles.vertexStride = sizeof( swVkShadowVertex_t );
+	triangles.maxVertex = vertices.Num() - 1;
+	triangles.indexType = VK_INDEX_TYPE_UINT32;
+	triangles.indexData.deviceAddress = GetBufferAddress( entry.indexBuffer.buffer );
+
+	VkAccelerationStructureGeometryKHR blasGeometry;
+	memset( &blasGeometry, 0, sizeof( blasGeometry ) );
+	blasGeometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+	blasGeometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+	blasGeometry.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+	blasGeometry.geometry.triangles = triangles;
+
+	VkAccelerationStructureBuildGeometryInfoKHR buildInfo;
+	memset( &buildInfo, 0, sizeof( buildInfo ) );
+	buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+	buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+	buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+	buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+	buildInfo.geometryCount = 1;
+	buildInfo.pGeometries = &blasGeometry;
+
+	VkAccelerationStructureBuildSizesInfoKHR sizeInfo;
+	memset( &sizeInfo, 0, sizeof( sizeInfo ) );
+	sizeInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+	vkGetAccelerationStructureBuildSizesKHRLocal( device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &buildInfo, &primitiveCount, &sizeInfo );
+
+	if ( !CreateBuffer( sizeInfo.accelerationStructureSize,
+			VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,
+			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+			true,
+			entry.blasBuffer ) ) {
+		DestroyCachedBlas( entry );
+		return false;
+	}
+
+	VkAccelerationStructureCreateInfoKHR createInfo;
+	memset( &createInfo, 0, sizeof( createInfo ) );
+	createInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+	createInfo.buffer = entry.blasBuffer.buffer;
+	createInfo.size = sizeInfo.accelerationStructureSize;
+	createInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+	if ( vkCreateAccelerationStructureKHRLocal( device, &createInfo, NULL, &entry.blas ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateAccelerationStructureKHR cached BLAS failed" );
+		DestroyCachedBlas( entry );
+		return false;
+	}
+
+	swVkBuffer_t scratchBuffer;
+	if ( !CreateBuffer( sizeInfo.buildScratchSize,
+			VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+			true,
+			scratchBuffer ) ) {
+		DestroyCachedBlas( entry );
+		return false;
+	}
+
+	buildInfo.dstAccelerationStructure = entry.blas;
+	buildInfo.scratchData.deviceAddress = GetBufferAddress( scratchBuffer.buffer );
+
+	VkAccelerationStructureBuildRangeInfoKHR rangeInfo;
+	memset( &rangeInfo, 0, sizeof( rangeInfo ) );
+	rangeInfo.primitiveCount = primitiveCount;
+	const VkAccelerationStructureBuildRangeInfoKHR *ranges[] = { &rangeInfo };
+
+	VkCommandBufferBeginInfo beginInfo;
+	memset( &beginInfo, 0, sizeof( beginInfo ) );
+	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	if ( !ImmediateSubmit( beginInfo ) ) {
+		DestroyBuffer( scratchBuffer );
+		DestroyCachedBlas( entry );
+		return false;
+	}
+
+	vkCmdBuildAccelerationStructuresKHRLocal( commandBuffer, 1, &buildInfo, ranges );
+
+	if ( vkEndCommandBuffer( commandBuffer ) != VK_SUCCESS ) {
+		LogFailure( "vkEndCommandBuffer cached BLAS failed" );
+		DestroyBuffer( scratchBuffer );
+		DestroyCachedBlas( entry );
+		return false;
+	}
+
+	VkSubmitInfo submitInfo;
+	memset( &submitInfo, 0, sizeof( submitInfo ) );
+	submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	submitInfo.commandBufferCount = 1;
+	submitInfo.pCommandBuffers = &commandBuffer;
+	if ( vkQueueSubmit( queue, 1, &submitInfo, inFlightFence ) != VK_SUCCESS ) {
+		LogFailure( "vkQueueSubmit cached BLAS failed" );
+		DestroyBuffer( scratchBuffer );
+		DestroyCachedBlas( entry );
+		return false;
+	}
+	vkWaitForFences( device, 1, &inFlightFence, VK_TRUE, UINT64_MAX );
+	DestroyBuffer( scratchBuffer );
+
+	VkAccelerationStructureDeviceAddressInfoKHR addressInfo;
+	memset( &addressInfo, 0, sizeof( addressInfo ) );
+	addressInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
+	addressInfo.accelerationStructure = entry.blas;
+	entry.blasAddress = vkGetAccelerationStructureDeviceAddressKHRLocal( device, &addressInfo );
+	entry.key = geo;
+	entry.verts = geo->verts;
+	entry.indexes = geo->indexes;
+	entry.vertCount = geo->numVerts;
+	entry.indexCount = geo->numIndexes;
+	entry.primitiveCount = primitiveCount;
+	entry.sourceFrame = sourceFrame;
+	return entry.blasAddress != 0;
+}
+
+bool idSoftwareVulkanBridge::EnsureCachedBlas( const srfTriangles_t *geo, int sourceFrame, int frameIndex, swVkCachedBlas_t *&entry ) {
+	entry = NULL;
+	if ( !geo ) {
+		return false;
+	}
+
+	for ( int i = 0; i < rayBlasCache.Num(); i++ ) {
+		swVkCachedBlas_t &candidate = rayBlasCache[i];
+		if ( candidate.key != geo ) {
+			continue;
+		}
+		if ( candidate.verts != geo->verts ||
+			 candidate.indexes != geo->indexes ||
+			 candidate.vertCount != geo->numVerts ||
+			 candidate.indexCount != geo->numIndexes ||
+			 candidate.sourceFrame != sourceFrame ||
+			 candidate.blas == VK_NULL_HANDLE ||
+			 candidate.blasAddress == 0 ) {
+			swVkCachedBlas_t rebuilt;
+			if ( !BuildCachedBlas( rebuilt, geo, sourceFrame ) ) {
+				return false;
+			}
+			WaitForSubmittedWork();
+			DestroyRayQueryTlas();
+			DestroyCachedBlas( candidate );
+			candidate = rebuilt;
+		}
+		candidate.lastUsedFrame = frameIndex;
+		entry = &candidate;
+		return true;
+	}
+
+	const int cacheIndex = rayBlasCache.Num();
+	swVkCachedBlas_t &newEntry = rayBlasCache.Alloc();
+	newEntry = swVkCachedBlas_t();
+	if ( !BuildCachedBlas( newEntry, geo, sourceFrame ) ) {
+		DestroyCachedBlas( newEntry );
+		rayBlasCache.RemoveIndex( cacheIndex );
+		return false;
+	}
+	newEntry.lastUsedFrame = frameIndex;
+	entry = &newEntry;
+	return true;
+}
+
+void idSoftwareVulkanBridge::DestroyRayQueryTlas() {
+	rayQuerySceneReady = false;
+	rayTlasSignature = 0;
+	rayTlasInstanceCount = 0;
+	if ( tlas != VK_NULL_HANDLE ) {
+		vkDestroyAccelerationStructureKHRLocal( device, tlas, NULL );
+		tlas = VK_NULL_HANDLE;
+	}
+	DestroyBuffer( shadowScratchBuffer );
+	DestroyBuffer( instanceBuffer );
+	DestroyBuffer( tlasBuffer );
+}
+
+bool idSoftwareVulkanBridge::BuildRayQueryTlas( const idList<swVkRayInstance_t> &instances ) {
+	if ( !rayQuerySupported || instances.Num() <= 0 ) {
+		DestroyRayQueryTlas();
+		return false;
+	}
+
+	uint64_t signature = 1469598103934665603ULL;
+	signature = SWVkHashU32( signature, static_cast<uint32_t>( instances.Num() ) );
+	for ( int i = 0; i < instances.Num(); i++ ) {
+		signature = SWVkHashU64( signature, instances[i].blasAddress );
+		for ( int j = 0; j < 16; j++ ) {
+			uint32_t bits;
+			memcpy( &bits, &instances[i].modelMatrix[j], sizeof( bits ) );
+			signature = SWVkHashU32( signature, bits );
+		}
+	}
+	if ( rayQuerySceneReady && tlas != VK_NULL_HANDLE && rayTlasInstanceCount == instances.Num() && rayTlasSignature == signature ) {
+		return true;
+	}
+
+	WaitForSubmittedWork();
+	DestroyRayQueryTlas();
+
+	idList<VkAccelerationStructureInstanceKHR> vkInstances;
+	vkInstances.SetNum( instances.Num(), false );
+	for ( int i = 0; i < instances.Num(); i++ ) {
+		const float *m = instances[i].modelMatrix;
+		VkAccelerationStructureInstanceKHR &instance = vkInstances[i];
+		memset( &instance, 0, sizeof( instance ) );
+		instance.transform.matrix[0][0] = m[0];
+		instance.transform.matrix[0][1] = m[4];
+		instance.transform.matrix[0][2] = m[8];
+		instance.transform.matrix[0][3] = m[12];
+		instance.transform.matrix[1][0] = m[1];
+		instance.transform.matrix[1][1] = m[5];
+		instance.transform.matrix[1][2] = m[9];
+		instance.transform.matrix[1][3] = m[13];
+		instance.transform.matrix[2][0] = m[2];
+		instance.transform.matrix[2][1] = m[6];
+		instance.transform.matrix[2][2] = m[10];
+		instance.transform.matrix[2][3] = m[14];
+		instance.instanceCustomIndex = i;
+		instance.mask = 0xff;
+		instance.instanceShaderBindingTableRecordOffset = 0;
+		instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+		instance.accelerationStructureReference = instances[i].blasAddress;
+	}
+
+	const VkDeviceSize instanceSize = static_cast<VkDeviceSize>( vkInstances.Num() ) * sizeof( vkInstances[0] );
+	if ( !CreateBuffer( instanceSize,
+			VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			true,
+			instanceBuffer ) ||
+		 !UploadBuffer( instanceBuffer, vkInstances.Ptr(), instanceSize, "vkMapMemory TLAS instances failed" ) ) {
+		DestroyRayQueryTlas();
+		return false;
+	}
+
+	VkAccelerationStructureGeometryInstancesDataKHR instanceData;
+	memset( &instanceData, 0, sizeof( instanceData ) );
+	instanceData.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+	instanceData.arrayOfPointers = VK_FALSE;
+	instanceData.data.deviceAddress = GetBufferAddress( instanceBuffer.buffer );
+
+	VkAccelerationStructureGeometryKHR tlasGeometry;
+	memset( &tlasGeometry, 0, sizeof( tlasGeometry ) );
+	tlasGeometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+	tlasGeometry.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+	tlasGeometry.geometry.instances = instanceData;
+
+	uint32_t primitiveCount = instances.Num();
+	VkAccelerationStructureBuildGeometryInfoKHR buildInfo;
+	memset( &buildInfo, 0, sizeof( buildInfo ) );
+	buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+	buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+	buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+	buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+	buildInfo.geometryCount = 1;
+	buildInfo.pGeometries = &tlasGeometry;
+
+	VkAccelerationStructureBuildSizesInfoKHR sizeInfo;
+	memset( &sizeInfo, 0, sizeof( sizeInfo ) );
+	sizeInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+	vkGetAccelerationStructureBuildSizesKHRLocal( device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &buildInfo, &primitiveCount, &sizeInfo );
+
+	if ( !CreateBuffer( sizeInfo.accelerationStructureSize,
+			VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,
+			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+			true,
+			tlasBuffer ) ||
+		 !CreateBuffer( sizeInfo.buildScratchSize,
+			VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+			true,
+			shadowScratchBuffer ) ) {
+		DestroyRayQueryTlas();
+		return false;
+	}
+
+	VkAccelerationStructureCreateInfoKHR createInfo;
+	memset( &createInfo, 0, sizeof( createInfo ) );
+	createInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+	createInfo.buffer = tlasBuffer.buffer;
+	createInfo.size = sizeInfo.accelerationStructureSize;
+	createInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+	if ( vkCreateAccelerationStructureKHRLocal( device, &createInfo, NULL, &tlas ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateAccelerationStructureKHR TLAS failed" );
+		DestroyRayQueryTlas();
+		return false;
+	}
+
+	buildInfo.dstAccelerationStructure = tlas;
+	buildInfo.scratchData.deviceAddress = GetBufferAddress( shadowScratchBuffer.buffer );
+
+	VkAccelerationStructureBuildRangeInfoKHR rangeInfo;
+	memset( &rangeInfo, 0, sizeof( rangeInfo ) );
+	rangeInfo.primitiveCount = primitiveCount;
+	const VkAccelerationStructureBuildRangeInfoKHR *ranges[] = { &rangeInfo };
+
+	VkCommandBufferBeginInfo beginInfo;
+	memset( &beginInfo, 0, sizeof( beginInfo ) );
+	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	if ( !ImmediateSubmit( beginInfo ) ) {
+		DestroyRayQueryTlas();
+		return false;
+	}
+
+	vkCmdBuildAccelerationStructuresKHRLocal( commandBuffer, 1, &buildInfo, ranges );
+
+	if ( vkEndCommandBuffer( commandBuffer ) != VK_SUCCESS ) {
+		LogFailure( "vkEndCommandBuffer TLAS failed" );
+		DestroyRayQueryTlas();
+		return false;
+	}
+
+	VkSubmitInfo submitInfo;
+	memset( &submitInfo, 0, sizeof( submitInfo ) );
+	submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	submitInfo.commandBufferCount = 1;
+	submitInfo.pCommandBuffers = &commandBuffer;
+	if ( vkQueueSubmit( queue, 1, &submitInfo, inFlightFence ) != VK_SUCCESS ) {
+		LogFailure( "vkQueueSubmit TLAS failed" );
+		DestroyRayQueryTlas();
+		return false;
+	}
+	vkWaitForFences( device, 1, &inFlightFence, VK_TRUE, UINT64_MAX );
+	rayQuerySceneReady = true;
+	rayTlasSignature = signature;
+	rayTlasInstanceCount = instances.Num();
+	return true;
+}
+
+void idSoftwareVulkanBridge::BeginFrame() {
+	if ( frameBegun ) {
+		return;
+	}
+	if ( framePixels.Num() > 0 ) {
+		memset( framePixels.Ptr(), 0, framePixels.Num() * sizeof( framePixels[0] ) );
+	}
+	Clear2DJobs();
+	frameBegun = true;
+	frameDirty = false;
+	hybridFrameDirty = false;
+	hybridOverlayDirty = false;
+}
+
+void idSoftwareVulkanBridge::Clear2DJobs() {
+	hybrid2DSourcePixels.SetNum( 0, false );
+	hybrid2DJobs.SetNum( 0, false );
+}
+
+bool idSoftwareVulkanBridge::Queue2DOverlayBlit( const viewDef_t *viewDef, const unsigned int *bgra, int srcWidth, int srcHeight, int dstWidth, int dstHeight ) {
+	if ( !viewDef || !bgra || srcWidth <= 0 || srcHeight <= 0 || dstWidth <= 0 || dstHeight <= 0 ) {
+		return false;
+	}
+
+	const int sourcePixelCount = srcWidth * srcHeight;
+	const int sourceOffset = hybrid2DSourcePixels.Num();
+	hybrid2DSourcePixels.SetNum( sourceOffset + sourcePixelCount, false );
+	memcpy( hybrid2DSourcePixels.Ptr() + sourceOffset, bgra, sourcePixelCount * sizeof( bgra[0] ) );
+
+	swVk2DJob_t &job = hybrid2DJobs.Alloc();
+	job.sourceOffset = sourceOffset;
+	job.sourceWidth = srcWidth;
+	job.sourceHeight = srcHeight;
+	job.viewportX = viewDef->viewport.x1;
+	job.viewportY = viewDef->viewport.y1;
+	job.presentWidth = dstWidth;
+	job.presentHeight = dstHeight;
+
+	hybridOverlayDirty = true;
+	frameDirty = true;
+	return true;
+}
+
+bool idSoftwareVulkanBridge::BlitView( const viewDef_t *viewDef, const unsigned int *bgra, int width, int height, int presentWidth, int presentHeight ) {
+	if ( !viewDef || !bgra || width <= 0 || height <= 0 || presentWidth <= 0 || presentHeight <= 0 ) {
+		return false;
+	}
+	if ( !EnsureInitialized() || !EnsureFrameBuffer() ) {
+		return false;
+	}
+
+	BeginFrame();
+	if ( hybridFrameDirty && twoDPipeline != VK_NULL_HANDLE ) {
+		return Queue2DOverlayBlit( viewDef, bgra, width, height, presentWidth, presentHeight );
+	}
+
+	const int dstX0 = viewDef->viewport.x1;
+	const int dstY0 = viewDef->viewport.y1;
+	const int dstX1 = dstX0 + presentWidth - 1;
+	const int dstY1 = dstY0 + presentHeight - 1;
+
+	const int clippedX0 = Max( 0, dstX0 );
+	const int clippedY0 = Max( 0, dstY0 );
+	const int clippedX1 = Min( frameWidth - 1, dstX1 );
+	const int clippedY1 = Min( frameHeight - 1, dstY1 );
+	if ( clippedX0 > clippedX1 || clippedY0 > clippedY1 ) {
+		return true;
+	}
+
+	for ( int dstY = clippedY0; dstY <= clippedY1; dstY++ ) {
+		const int viewY = dstY - dstY0;
+		const int srcY = Min( height - 1, Max( 0, ( viewY * height ) / presentHeight ) );
+		unsigned int *dst = framePixels.Ptr() + dstY * frameWidth + clippedX0;
+		const unsigned int *srcRow = bgra + srcY * width;
+
+		for ( int dstX = clippedX0; dstX <= clippedX1; dstX++ ) {
+			const int viewX = dstX - dstX0;
+			const int srcX = Min( width - 1, Max( 0, ( viewX * width ) / presentWidth ) );
+			*dst++ = srcRow[srcX];
+		}
+	}
+
+	frameDirty = true;
+	if ( hybridFrameDirty ) {
+		hybridOverlayDirty = true;
+	}
+	return true;
+}
+
+bool idSoftwareVulkanBridge::CompositeHybridGBuffer( const viewDef_t *viewDef, const swHybridGBufferUpload_t &gbuffer, int width, int height, int presentWidth, int presentHeight ) {
+	if ( !viewDef || width <= 0 || height <= 0 || presentWidth <= 0 || presentHeight <= 0 ) {
+		return false;
+	}
+	if ( !gbuffer.depth || !gbuffer.normalPacked || !gbuffer.tangentPacked || !gbuffer.bitangentPacked ||
+		 !gbuffer.uvPacked || !gbuffer.materialId ||
+		 !gbuffer.albedoOrTextureId || !gbuffer.specularAndFlags || !gbuffer.surfaceId ||
+		 !gbuffer.worldPositions ||
+		 !gbuffer.textureInfos || gbuffer.textureInfoCount <= 0 ||
+		 !gbuffer.textureTexels || gbuffer.textureTexelCount <= 0 ) {
+		return false;
+	}
+	const swHybridLight_t emptyLight = {};
+	const swHybridLight_t *lights = ( gbuffer.lights && gbuffer.lightCount > 0 ) ? gbuffer.lights : &emptyLight;
+	const int uploadLightCount = Max( 1, gbuffer.lightCount );
+	if ( !EnsureInitialized() || !EnsureFrameBuffer() || !EnsureHybridBuffers( width, height, gbuffer.textureInfoCount, gbuffer.textureTexelCount, uploadLightCount ) ) {
+		return false;
+	}
+
+	const VkDeviceSize pixelCount = static_cast<VkDeviceSize>( width ) * static_cast<VkDeviceSize>( height );
+	const VkDeviceSize depthSize = pixelCount * sizeof( float );
+	const VkDeviceSize uintSize = pixelCount * sizeof( uint32_t );
+	const VkDeviceSize worldPositionSize = pixelCount * sizeof( idVec4 );
+	const VkDeviceSize textureInfoSize = static_cast<VkDeviceSize>( gbuffer.textureInfoCount ) * sizeof( swHybridTextureInfo_t );
+	const VkDeviceSize textureTexelSize = static_cast<VkDeviceSize>( gbuffer.textureTexelCount ) * sizeof( uint32_t );
+	const VkDeviceSize lightSize = static_cast<VkDeviceSize>( uploadLightCount ) * sizeof( swHybridLight_t );
+	if ( !UploadBuffer( hybridDepthBuffer, gbuffer.depth, depthSize, "vkMapMemory hybrid depth failed" ) ||
+		 !UploadBuffer( hybridNormalBuffer, gbuffer.normalPacked, uintSize, "vkMapMemory hybrid normals failed" ) ||
+		 !UploadBuffer( hybridTangentBuffer, gbuffer.tangentPacked, uintSize, "vkMapMemory hybrid tangents failed" ) ||
+		 !UploadBuffer( hybridBitangentBuffer, gbuffer.bitangentPacked, uintSize, "vkMapMemory hybrid bitangents failed" ) ||
+		 !UploadBuffer( hybridUVBuffer, gbuffer.uvPacked, uintSize, "vkMapMemory hybrid uvs failed" ) ||
+		 !UploadBuffer( hybridMaterialBuffer, gbuffer.materialId, uintSize, "vkMapMemory hybrid materials failed" ) ||
+		 !UploadBuffer( hybridAlbedoBuffer, gbuffer.albedoOrTextureId, uintSize, "vkMapMemory hybrid albedo ids failed" ) ||
+		 !UploadBuffer( hybridSpecularBuffer, gbuffer.specularAndFlags, uintSize, "vkMapMemory hybrid specular flags failed" ) ||
+		 !UploadBuffer( hybridSurfaceBuffer, gbuffer.surfaceId, uintSize, "vkMapMemory hybrid surfaces failed" ) ||
+		 !UploadBuffer( hybridWorldPositionBuffer, gbuffer.worldPositions, worldPositionSize, "vkMapMemory hybrid world positions failed" ) ||
+		 !UploadBuffer( hybridLightBuffer, lights, lightSize, "vkMapMemory hybrid lights failed" ) ) {
+		return false;
+	}
+	if ( hybridUploadedTextureGeneration != gbuffer.textureGeneration ) {
+		if ( !UploadBuffer( hybridTextureInfoBuffer, gbuffer.textureInfos, textureInfoSize, "vkMapMemory hybrid texture infos failed" ) ||
+			 !UploadBuffer( hybridTextureTexelBuffer, gbuffer.textureTexels, textureTexelSize, "vkMapMemory hybrid texture texels failed" ) ) {
+			return false;
+		}
+		hybridUploadedTextureGeneration = gbuffer.textureGeneration;
+	}
+
+	hybridShadowEnabled = false;
+	if ( gbuffer.lightCount > 0 && r_softwareRayQueryShadows.GetBool() && r_softwareHybridRayQueryShadows.GetBool() && rayQuerySupported ) {
+		hybridShadowEnabled = PrepareRayQueryScene( viewDef ) && tlas != VK_NULL_HANDLE;
+	}
+	UpdateHybridDescriptorSet();
+	BeginFrame();
+
+	hybridWidth = width;
+	hybridHeight = height;
+	hybridPresentWidth = presentWidth;
+	hybridPresentHeight = presentHeight;
+	hybridViewportX = viewDef->viewport.x1;
+	hybridViewportY = viewDef->viewport.y1;
+	hybridDebugView = idMath::ClampInt( 0, 6, gbuffer.debugView );
+	hybridTextureCount = gbuffer.textureInfoCount;
+	hybridTextureTexelCount = gbuffer.textureTexelCount;
+	hybridLightCount = Max( 0, gbuffer.lightCount );
+	hybridViewOrigin[0] = viewDef->renderView.vieworg[0];
+	hybridViewOrigin[1] = viewDef->renderView.vieworg[1];
+	hybridViewOrigin[2] = viewDef->renderView.vieworg[2];
+	hybridFrameDirty = true;
+	frameDirty = true;
+	return true;
+}
+
+bool idSoftwareVulkanBridge::ReadView( const viewDef_t *viewDef, unsigned int *bgra, int width, int height ) const {
+	if ( !viewDef || !bgra || width <= 0 || height <= 0 ) {
+		return false;
+	}
+	if ( initialized && hybridFrameDirty ) {
+		memset( bgra, 0, width * height * sizeof( bgra[0] ) );
+		return true;
+	}
+	if ( !initialized || !frameBegun || framePixels.Num() != frameWidth * frameHeight ) {
+		return false;
+	}
+
+	const int viewportWidth = Max( 1, viewDef->viewport.x2 - viewDef->viewport.x1 + 1 );
+	const int viewportHeight = Max( 1, viewDef->viewport.y2 - viewDef->viewport.y1 + 1 );
+
+	for ( int y = 0; y < height; y++ ) {
+		const int viewY = ( y * viewportHeight ) / height;
+		const int frameY = viewDef->viewport.y1 + viewY;
+		unsigned int *dst = bgra + y * width;
+
+		if ( frameY < 0 || frameY >= frameHeight ) {
+			memset( dst, 0, width * sizeof( unsigned int ) );
+			continue;
+		}
+
+		for ( int x = 0; x < width; x++ ) {
+			const int viewX = ( x * viewportWidth ) / width;
+			const int frameX = viewDef->viewport.x1 + viewX;
+			dst[x] = ( frameX >= 0 && frameX < frameWidth ) ? framePixels[frameY * frameWidth + frameX] : 0;
+		}
+	}
+	return true;
+}
+
+bool idSoftwareVulkanBridge::Record2DCompositeCommands() {
+	if ( hybrid2DJobs.Num() <= 0 ) {
+		return true;
+	}
+	if ( twoDDescriptorSet == VK_NULL_HANDLE || twoDPipeline == VK_NULL_HANDLE || twoDPipelineLayout == VK_NULL_HANDLE ||
+		 hybrid2DSourceBuffer.buffer == VK_NULL_HANDLE || hybridOverlayBuffer.buffer == VK_NULL_HANDLE ) {
+		return false;
+	}
+
+	VkMemoryBarrier inputBarrier;
+	memset( &inputBarrier, 0, sizeof( inputBarrier ) );
+	inputBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	inputBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+	inputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+	vkCmdPipelineBarrier( commandBuffer,
+		VK_PIPELINE_STAGE_HOST_BIT,
+		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		0, 1, &inputBarrier, 0, NULL, 0, NULL );
+
+	vkCmdBindPipeline( commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, twoDPipeline );
+	vkCmdBindDescriptorSets( commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, twoDPipelineLayout, 0, 1, &twoDDescriptorSet, 0, NULL );
+
+	for ( int i = 0; i < hybrid2DJobs.Num(); i++ ) {
+		const swVk2DJob_t &job = hybrid2DJobs[i];
+		swVk2DPushConstants_t push;
+		memset( &push, 0, sizeof( push ) );
+		push.src[0] = static_cast<uint32_t>( job.sourceOffset );
+		push.src[1] = static_cast<uint32_t>( job.sourceWidth );
+		push.src[2] = static_cast<uint32_t>( job.sourceHeight );
+		push.src[3] = ( i == 0 ) ? 1u : 0u;
+		push.frame[0] = static_cast<uint32_t>( frameWidth );
+		push.frame[1] = static_cast<uint32_t>( frameHeight );
+		push.viewport[0] = job.viewportX;
+		push.viewport[1] = job.viewportY;
+		push.viewport[2] = job.presentWidth;
+		push.viewport[3] = job.presentHeight;
+
+		vkCmdPushConstants( commandBuffer, twoDPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+		const uint32_t dispatchWidth = ( i == 0 ) ? static_cast<uint32_t>( frameWidth ) : static_cast<uint32_t>( job.presentWidth );
+		const uint32_t dispatchHeight = ( i == 0 ) ? static_cast<uint32_t>( frameHeight ) : static_cast<uint32_t>( job.presentHeight );
+		vkCmdDispatch( commandBuffer, ( dispatchWidth + 7u ) / 8u, ( dispatchHeight + 7u ) / 8u, 1 );
+
+		VkMemoryBarrier jobBarrier;
+		memset( &jobBarrier, 0, sizeof( jobBarrier ) );
+		jobBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+		jobBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		jobBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+		vkCmdPipelineBarrier( commandBuffer,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			0, 1, &jobBarrier, 0, NULL, 0, NULL );
+	}
+	return true;
+}
+
+bool idSoftwareVulkanBridge::RecordHybridCompositeCommands() {
+	if ( !hybridFrameDirty || hybridDescriptorSet == VK_NULL_HANDLE || hybridPipeline == VK_NULL_HANDLE || hybridFrameBuffer.buffer == VK_NULL_HANDLE ) {
+		return false;
+	}
+
+	VkMemoryBarrier inputBarrier;
+	memset( &inputBarrier, 0, sizeof( inputBarrier ) );
+	inputBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	inputBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+	inputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+	vkCmdPipelineBarrier( commandBuffer,
+		VK_PIPELINE_STAGE_HOST_BIT,
+		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		0, 1, &inputBarrier, 0, NULL, 0, NULL );
+
+	swVkHybridPushConstants_t push;
+	memset( &push, 0, sizeof( push ) );
+	push.dims[0] = static_cast<uint32_t>( hybridWidth );
+	push.dims[1] = static_cast<uint32_t>( hybridHeight );
+	push.dims[2] = static_cast<uint32_t>( frameWidth );
+	push.dims[3] = static_cast<uint32_t>( frameHeight );
+	push.viewport[0] = hybridViewportX;
+	push.viewport[1] = hybridViewportY;
+	push.viewport[2] = hybridPresentWidth;
+	push.viewport[3] = hybridPresentHeight;
+	push.debugView = static_cast<uint32_t>( hybridDebugView );
+	push.textureCount = static_cast<uint32_t>( Max( 0, hybridTextureCount ) );
+	push.overlayEnabled = hybridOverlayDirty ? 1u : 0u;
+	push.lightCount = static_cast<uint32_t>( Max( 0, hybridLightCount ) );
+	push.shadowEnabled = hybridShadowEnabled ? 1u : 0u;
+	push.viewOrigin[0] = hybridViewOrigin[0];
+	push.viewOrigin[1] = hybridViewOrigin[1];
+	push.viewOrigin[2] = hybridViewOrigin[2];
+	push.viewOrigin[3] = 1.0f;
+
+	vkCmdBindPipeline( commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, hybridPipeline );
+	vkCmdBindDescriptorSets( commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, hybridPipelineLayout, 0, 1, &hybridDescriptorSet, 0, NULL );
+	vkCmdPushConstants( commandBuffer, hybridPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+	vkCmdDispatch( commandBuffer, ( static_cast<uint32_t>( frameWidth ) + 7u ) / 8u, ( static_cast<uint32_t>( frameHeight ) + 7u ) / 8u, 1 );
+
+	VkMemoryBarrier outputBarrier;
+	memset( &outputBarrier, 0, sizeof( outputBarrier ) );
+	outputBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	outputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	outputBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	vkCmdPipelineBarrier( commandBuffer,
+		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		VK_PIPELINE_STAGE_TRANSFER_BIT,
+		0, 1, &outputBarrier, 0, NULL, 0, NULL );
+	return true;
+}
+
+bool idSoftwareVulkanBridge::PresentFrame() {
+	if ( !initialized || !frameDirty ) {
+		return false;
+	}
+	if ( !EnsureFrameBuffer() ) {
+		return false;
+	}
+	const bool useHybridFrame = hybridFrameDirty;
+	if ( useHybridFrame ) {
+		if ( !EnsureHybridBuffers( hybridWidth, hybridHeight, hybridTextureCount, hybridTextureTexelCount, Max( 1, hybridLightCount ) ) ) {
+			return false;
+		}
+		if ( hybridOverlayDirty ) {
+			if ( !Ensure2DBuffers( hybrid2DSourcePixels.Num() ) ) {
+				return false;
+			}
+		}
+	} else if ( !EnsureUploadBuffer( frameWidth, frameHeight ) ) {
+		return false;
+	}
+
+	vkWaitForFences( device, 1, &inFlightFence, VK_TRUE, UINT64_MAX );
+	vkResetFences( device, 1, &inFlightFence );
+
+	if ( useHybridFrame && hybridOverlayDirty ) {
+		const VkDeviceSize sourceSize = static_cast<VkDeviceSize>( hybrid2DSourcePixels.Num() ) * sizeof( uint32_t );
+		if ( sourceSize <= 0 || !UploadBuffer( hybrid2DSourceBuffer, hybrid2DSourcePixels.Ptr(), sourceSize, "vkMapMemory 2D source failed" ) ) {
+			return false;
+		}
+	} else if ( !useHybridFrame ) {
+		void *mapped = NULL;
+		if ( vkMapMemory( device, uploadMemory, 0, uploadBufferSize, 0, &mapped ) != VK_SUCCESS ) {
+			LogFailure( "vkMapMemory failed" );
+			return false;
+		}
+
+		unsigned int *uploadPixels = reinterpret_cast<unsigned int *>( mapped );
+		for ( int y = 0; y < frameHeight; y++ ) {
+			const unsigned int *src = framePixels.Ptr() + ( frameHeight - 1 - y ) * frameWidth;
+			unsigned int *dst = uploadPixels + y * frameWidth;
+			memcpy( dst, src, frameWidth * sizeof( unsigned int ) );
+		}
+		vkUnmapMemory( device, uploadMemory );
+	}
+
+	uint32_t imageIndex = 0;
+	VkResult acquireResult = vkAcquireNextImageKHR( device, swapchain, UINT64_MAX, imageAvailableSemaphore, VK_NULL_HANDLE, &imageIndex );
+	if ( acquireResult == VK_ERROR_OUT_OF_DATE_KHR || acquireResult == VK_SUBOPTIMAL_KHR ) {
+		vkDeviceWaitIdle( device );
+		DestroySwapchain();
+		if ( !CreateSwapchain() ) {
+			return false;
+		}
+		frameBegun = false;
+		frameDirty = false;
+		hybridFrameDirty = false;
+		hybridOverlayDirty = false;
+		Clear2DJobs();
+		return false;
+	}
+	if ( acquireResult != VK_SUCCESS ) {
+		LogFailure( "vkAcquireNextImageKHR failed" );
+		return false;
+	}
+
+	vkResetCommandBuffer( commandBuffer, 0 );
+
+	VkCommandBufferBeginInfo beginInfo;
+	memset( &beginInfo, 0, sizeof( beginInfo ) );
+	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	if ( vkBeginCommandBuffer( commandBuffer, &beginInfo ) != VK_SUCCESS ) {
+		LogFailure( "vkBeginCommandBuffer failed" );
+		return false;
+	}
+
+	if ( useHybridFrame && hybridOverlayDirty ) {
+		Update2DDescriptorSet();
+		if ( !Record2DCompositeCommands() ) {
+			return false;
+		}
+	}
+	if ( useHybridFrame && !RecordHybridCompositeCommands() ) {
+		return false;
+	}
+
+	VkImageMemoryBarrier toTransfer;
+	memset( &toTransfer, 0, sizeof( toTransfer ) );
+	toTransfer.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	toTransfer.oldLayout = swapchainLayouts[imageIndex];
+	toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	toTransfer.image = swapchainImages[imageIndex];
+	toTransfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	toTransfer.subresourceRange.baseMipLevel = 0;
+	toTransfer.subresourceRange.levelCount = 1;
+	toTransfer.subresourceRange.baseArrayLayer = 0;
+	toTransfer.subresourceRange.layerCount = 1;
+	toTransfer.srcAccessMask = 0;
+	toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	vkCmdPipelineBarrier( commandBuffer,
+		VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		VK_PIPELINE_STAGE_TRANSFER_BIT,
+		0, 0, NULL, 0, NULL, 1, &toTransfer );
+
+	VkBufferImageCopy copyRegion;
+	memset( &copyRegion, 0, sizeof( copyRegion ) );
+	copyRegion.bufferOffset = 0;
+	copyRegion.bufferRowLength = frameWidth;
+	copyRegion.bufferImageHeight = frameHeight;
+	copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	copyRegion.imageSubresource.mipLevel = 0;
+	copyRegion.imageSubresource.baseArrayLayer = 0;
+	copyRegion.imageSubresource.layerCount = 1;
+	copyRegion.imageOffset.x = 0;
+	copyRegion.imageOffset.y = 0;
+	copyRegion.imageOffset.z = 0;
+	copyRegion.imageExtent.width = frameWidth;
+	copyRegion.imageExtent.height = frameHeight;
+	copyRegion.imageExtent.depth = 1;
+	vkCmdCopyBufferToImage( commandBuffer, useHybridFrame ? hybridFrameBuffer.buffer : uploadBuffer, swapchainImages[imageIndex],
+		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion );
+
+	VkImageMemoryBarrier toPresent;
+	memset( &toPresent, 0, sizeof( toPresent ) );
+	toPresent.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	toPresent.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+	toPresent.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	toPresent.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	toPresent.image = swapchainImages[imageIndex];
+	toPresent.subresourceRange = toTransfer.subresourceRange;
+	toPresent.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	toPresent.dstAccessMask = 0;
+	vkCmdPipelineBarrier( commandBuffer,
+		VK_PIPELINE_STAGE_TRANSFER_BIT,
+		VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+		0, 0, NULL, 0, NULL, 1, &toPresent );
+
+	if ( vkEndCommandBuffer( commandBuffer ) != VK_SUCCESS ) {
+		LogFailure( "vkEndCommandBuffer failed" );
+		return false;
+	}
+
+	VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+	VkSubmitInfo submitInfo;
+	memset( &submitInfo, 0, sizeof( submitInfo ) );
+	submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	submitInfo.waitSemaphoreCount = 1;
+	submitInfo.pWaitSemaphores = &imageAvailableSemaphore;
+	submitInfo.pWaitDstStageMask = &waitStage;
+	submitInfo.commandBufferCount = 1;
+	submitInfo.pCommandBuffers = &commandBuffer;
+	submitInfo.signalSemaphoreCount = 1;
+	submitInfo.pSignalSemaphores = &renderFinishedSemaphore;
+
+	if ( vkQueueSubmit( queue, 1, &submitInfo, inFlightFence ) != VK_SUCCESS ) {
+		LogFailure( "vkQueueSubmit failed" );
+		return false;
+	}
+
+	VkPresentInfoKHR presentInfo;
+	memset( &presentInfo, 0, sizeof( presentInfo ) );
+	presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+	presentInfo.waitSemaphoreCount = 1;
+	presentInfo.pWaitSemaphores = &renderFinishedSemaphore;
+	presentInfo.swapchainCount = 1;
+	presentInfo.pSwapchains = &swapchain;
+	presentInfo.pImageIndices = &imageIndex;
+
+	VkResult presentResult = vkQueuePresentKHR( queue, &presentInfo );
+	swapchainLayouts[imageIndex] = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+	frameBegun = false;
+	frameDirty = false;
+	hybridFrameDirty = false;
+	hybridOverlayDirty = false;
+	Clear2DJobs();
+
+	if ( presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR ) {
+		vkDeviceWaitIdle( device );
+		DestroySwapchain();
+		CreateSwapchain();
+		return true;
+	}
+	if ( presentResult != VK_SUCCESS ) {
+		LogFailure( "vkQueuePresentKHR failed" );
+		return false;
+	}
+	return true;
+}
+
+bool idSoftwareVulkanBridge::PrepareRayQueryScene( const viewDef_t *viewDef ) {
+	if ( !viewDef || !EnsureInitialized() || !rayQuerySupported ) {
+		return false;
+	}
+	if ( HasPendingShadowJobs() ) {
+		return rayQuerySceneReady && tlas != VK_NULL_HANDLE;
+	}
+
+	rayQuerySceneFrame++;
+	idList<swVkRayInstance_t> instances;
+	instances.SetNum( viewDef->numDrawSurfs, false );
+	int instanceCount = 0;
+
+	for ( int i = 0; i < viewDef->numDrawSurfs; i++ ) {
+		const drawSurf_t *surf = viewDef->drawSurfs[i];
+		if ( !surf || !surf->geo || !surf->space || !surf->material ) {
+			continue;
+		}
+		if ( !surf->material->IsDrawn() || !surf->material->SurfaceCastsShadow() || surf->material->Coverage() == MC_TRANSLUCENT ) {
+			continue;
+		}
+		const float sort = surf->material->GetSort();
+		if ( sort < SS_OPAQUE || sort == SS_PORTAL_SKY || sort >= SS_POST_PROCESS ) {
+			continue;
+		}
+		if ( surf->space->entityDef && ( surf->space->entityDef->parms.noShadow || surf->space->entityDef->parms.weaponDepthHack ) ) {
+			continue;
+		}
+
+		const srfTriangles_t *geo = surf->geo;
+		if ( !geo->verts || !geo->indexes || geo->numVerts <= 0 || geo->numIndexes < 3 ) {
+			continue;
+		}
+
+		int sourceFrame = 0;
+		if ( geo->deformedSurface ) {
+			sourceFrame = rayQuerySceneFrame;
+		}
+		if ( !geo->deformedSurface && surf->space->entityDef && ( surf->space->entityDef->dynamicModel || surf->space->entityDef->cachedDynamicModel ) ) {
+			sourceFrame = surf->space->entityDef->dynamicModelFrameCount;
+		}
+
+		swVkCachedBlas_t *cachedBlas = NULL;
+		if ( !EnsureCachedBlas( geo, sourceFrame, rayQuerySceneFrame, cachedBlas ) || !cachedBlas ) {
+			continue;
+		}
+
+		swVkRayInstance_t &instance = instances[instanceCount++];
+		instance.blasAddress = cachedBlas->blasAddress;
+		memcpy( instance.modelMatrix, surf->space->modelMatrix, sizeof( instance.modelMatrix ) );
+	}
+	instances.SetNum( instanceCount, false );
+
+	bool waitedForPrune = false;
+	for ( int i = rayBlasCache.Num() - 1; i >= 0; i-- ) {
+		if ( rayQuerySceneFrame - rayBlasCache[i].lastUsedFrame > 300 ) {
+			if ( !waitedForPrune ) {
+				WaitForSubmittedWork();
+				DestroyRayQueryTlas();
+				waitedForPrune = true;
+			}
+			DestroyCachedBlas( rayBlasCache[i] );
+			rayBlasCache[i] = swVkCachedBlas_t();
+			rayBlasCache.RemoveIndex( i );
+		}
+	}
+
+	if ( instances.Num() <= 0 ) {
+		WaitForSubmittedWork();
+		DestroyRayQueryTlas();
+		return false;
+	}
+
+	return BuildRayQueryTlas( instances );
+}
+
+bool idSoftwareVulkanBridge::BeginLightShadowMask( const viewLight_t *vLight, const idVec4 *worldPositions, int width, int height ) {
+	if ( !vLight || !worldPositions || !rayQuerySceneReady || !tlas || !shadowPipeline ) {
+		return false;
+	}
+
+	swVkShadowJob_t *job = AllocShadowJob();
+	if ( !job || !RecordShadowJob( *job, vLight, worldPositions, width, height ) ) {
+		return false;
+	}
+
+	if ( job->commandBuffer == VK_NULL_HANDLE || job->fence == VK_NULL_HANDLE || !job->pendingSubmit ) {
+		job->pendingSubmit = false;
+		job->submitted = false;
+		return false;
+	}
+
+	vkResetFences( device, 1, &job->fence );
+
+	VkSubmitInfo submitInfo;
+	memset( &submitInfo, 0, sizeof( submitInfo ) );
+	submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	submitInfo.commandBufferCount = 1;
+	submitInfo.pCommandBuffers = &job->commandBuffer;
+
+	if ( vkQueueSubmit( queue, 1, &submitInfo, job->fence ) != VK_SUCCESS ) {
+		LogFailure( "vkQueueSubmit shadow failed" );
+		job->pendingSubmit = false;
+		job->submitted = false;
+		return false;
+	}
+
+	job->pendingSubmit = false;
+	job->submitted = true;
+	return true;
+}
+
+bool idSoftwareVulkanBridge::FinishLightShadowMask( const viewLight_t *vLight, int width, int height, unsigned char *shadowMask ) {
+	if ( !vLight || !shadowMask || !rayQuerySceneReady ) {
+		return false;
+	}
+
+	const uintptr_t key = ShadowLightKey( vLight );
+	swVkShadowJob_t *job = NULL;
+	for ( int i = 0; i < SW_VK_MAX_SHADOW_JOBS; i++ ) {
+		swVkShadowJob_t &candidate = shadowJobs[i];
+		if ( candidate.lightKey == key && candidate.width == width && candidate.height == height && candidate.submitted && !candidate.pendingSubmit ) {
+			job = &candidate;
+			break;
+		}
+	}
+	if ( !job || job->fence == VK_NULL_HANDLE ) {
+		return false;
+	}
+
+	if ( vkWaitForFences( device, 1, &job->fence, VK_TRUE, UINT64_MAX ) != VK_SUCCESS ) {
+		LogFailure( "vkWaitForFences shadow failed" );
+		job->submitted = false;
+		return false;
+	}
+
+	const int pixelCount = width * height;
+	const VkDeviceSize maskSize = static_cast<VkDeviceSize>( pixelCount ) * sizeof( uint32_t );
+	void *mapped = NULL;
+	if ( vkMapMemory( device, job->shadowMaskBuffer.memory, 0, maskSize, 0, &mapped ) != VK_SUCCESS ) {
+		LogFailure( "vkMapMemory shadow mask read failed" );
+		job->submitted = false;
+		return false;
+	}
+
+	const uint32_t *gpuMask = reinterpret_cast<const uint32_t *>( mapped );
+	for ( int pixel = 0; pixel < pixelCount; pixel++ ) {
+		shadowMask[pixel] = static_cast<unsigned char>( gpuMask[pixel] > 255 ? 255 : gpuMask[pixel] );
+	}
+	vkUnmapMemory( device, job->shadowMaskBuffer.memory );
+	job->submitted = false;
+	return true;
+}
+
+bool idSoftwareVulkanBridge::TraceLightShadowMask( const viewLight_t *vLight, const idVec4 *worldPositions, int width, int height, unsigned char *shadowMask ) {
+	if ( !BeginLightShadowMask( vLight, worldPositions, width, height ) ) {
+		return false;
+	}
+	return FinishLightShadowMask( vLight, width, height, shadowMask );
+}
+
+bool idSoftwareVulkanBridge::RayQueryAvailable() {
+	return EnsureInitialized() && rayQuerySupported;
+}
+
+void idSoftwareVulkanBridge::DestroyUploadBuffer() {
+	if ( uploadBuffer != VK_NULL_HANDLE ) {
+		vkDestroyBuffer( device, uploadBuffer, NULL );
+		uploadBuffer = VK_NULL_HANDLE;
+	}
+	if ( uploadMemory != VK_NULL_HANDLE ) {
+		vkFreeMemory( device, uploadMemory, NULL );
+		uploadMemory = VK_NULL_HANDLE;
+	}
+	uploadBufferSize = 0;
+}
+
+void idSoftwareVulkanBridge::DestroyRayQueryScene() {
+	DestroyRayQueryTlas();
+	for ( int i = 0; i < rayBlasCache.Num(); i++ ) {
+		DestroyCachedBlas( rayBlasCache[i] );
+	}
+	rayBlasCache.Clear();
+	rayQuerySceneFrame = 0;
+}
+
+void idSoftwareVulkanBridge::DestroyHybridBuffers() {
+	DestroyBuffer( hybridLightBuffer );
+	DestroyBuffer( hybridWorldPositionBuffer );
+	DestroyBuffer( hybridTextureTexelBuffer );
+	DestroyBuffer( hybridTextureInfoBuffer );
+	DestroyBuffer( hybrid2DSourceBuffer );
+	DestroyBuffer( hybridOverlayBuffer );
+	DestroyBuffer( hybridFrameBuffer );
+	DestroyBuffer( hybridSurfaceBuffer );
+	DestroyBuffer( hybridSpecularBuffer );
+	DestroyBuffer( hybridAlbedoBuffer );
+	DestroyBuffer( hybridMaterialBuffer );
+	DestroyBuffer( hybridUVBuffer );
+	DestroyBuffer( hybridBitangentBuffer );
+	DestroyBuffer( hybridTangentBuffer );
+	DestroyBuffer( hybridNormalBuffer );
+	DestroyBuffer( hybridDepthBuffer );
+	hybridWidth = 0;
+	hybridHeight = 0;
+	hybridPresentWidth = 0;
+	hybridPresentHeight = 0;
+	hybridViewportX = 0;
+	hybridViewportY = 0;
+	hybridDebugView = 0;
+	hybridTextureCount = 0;
+	hybridTextureTexelCount = 0;
+	hybridUploadedTextureGeneration = 0;
+	hybridLightCount = 0;
+	hybridShadowEnabled = false;
+	hybridFrameDirty = false;
+	hybridOverlayDirty = false;
+	Clear2DJobs();
+}
+
+void idSoftwareVulkanBridge::Destroy2DPipeline() {
+	DestroyBuffer( hybrid2DSourceBuffer );
+	Clear2DJobs();
+
+	if ( twoDPipeline != VK_NULL_HANDLE ) {
+		vkDestroyPipeline( device, twoDPipeline, NULL );
+		twoDPipeline = VK_NULL_HANDLE;
+	}
+	if ( twoDShaderModule != VK_NULL_HANDLE ) {
+		vkDestroyShaderModule( device, twoDShaderModule, NULL );
+		twoDShaderModule = VK_NULL_HANDLE;
+	}
+	if ( twoDPipelineLayout != VK_NULL_HANDLE ) {
+		vkDestroyPipelineLayout( device, twoDPipelineLayout, NULL );
+		twoDPipelineLayout = VK_NULL_HANDLE;
+	}
+	if ( twoDDescriptorPool != VK_NULL_HANDLE ) {
+		vkDestroyDescriptorPool( device, twoDDescriptorPool, NULL );
+		twoDDescriptorPool = VK_NULL_HANDLE;
+		twoDDescriptorSet = VK_NULL_HANDLE;
+	}
+	if ( twoDDescriptorSetLayout != VK_NULL_HANDLE ) {
+		vkDestroyDescriptorSetLayout( device, twoDDescriptorSetLayout, NULL );
+		twoDDescriptorSetLayout = VK_NULL_HANDLE;
+	}
+}
+
+void idSoftwareVulkanBridge::DestroyHybridPipeline() {
+	DestroyHybridBuffers();
+
+	if ( hybridPipeline != VK_NULL_HANDLE ) {
+		vkDestroyPipeline( device, hybridPipeline, NULL );
+		hybridPipeline = VK_NULL_HANDLE;
+	}
+	if ( hybridShaderModule != VK_NULL_HANDLE ) {
+		vkDestroyShaderModule( device, hybridShaderModule, NULL );
+		hybridShaderModule = VK_NULL_HANDLE;
+	}
+	if ( hybridPipelineLayout != VK_NULL_HANDLE ) {
+		vkDestroyPipelineLayout( device, hybridPipelineLayout, NULL );
+		hybridPipelineLayout = VK_NULL_HANDLE;
+	}
+	if ( hybridDescriptorPool != VK_NULL_HANDLE ) {
+		vkDestroyDescriptorPool( device, hybridDescriptorPool, NULL );
+		hybridDescriptorPool = VK_NULL_HANDLE;
+		hybridDescriptorSet = VK_NULL_HANDLE;
+	}
+	if ( hybridDescriptorSetLayout != VK_NULL_HANDLE ) {
+		vkDestroyDescriptorSetLayout( device, hybridDescriptorSetLayout, NULL );
+		hybridDescriptorSetLayout = VK_NULL_HANDLE;
+	}
+}
+
+void idSoftwareVulkanBridge::DestroyShadowPipeline() {
+	DestroyShadowJobs();
+	DestroyRayQueryScene();
+	DestroyBuffer( shadowMaskBuffer );
+	DestroyBuffer( worldPositionBuffer );
+
+	if ( shadowPipeline != VK_NULL_HANDLE ) {
+		vkDestroyPipeline( device, shadowPipeline, NULL );
+		shadowPipeline = VK_NULL_HANDLE;
+	}
+	if ( shadowShaderModule != VK_NULL_HANDLE ) {
+		vkDestroyShaderModule( device, shadowShaderModule, NULL );
+		shadowShaderModule = VK_NULL_HANDLE;
+	}
+	if ( shadowPipelineLayout != VK_NULL_HANDLE ) {
+		vkDestroyPipelineLayout( device, shadowPipelineLayout, NULL );
+		shadowPipelineLayout = VK_NULL_HANDLE;
+	}
+	if ( shadowDescriptorPool != VK_NULL_HANDLE ) {
+		vkDestroyDescriptorPool( device, shadowDescriptorPool, NULL );
+		shadowDescriptorPool = VK_NULL_HANDLE;
+		shadowDescriptorSet = VK_NULL_HANDLE;
+	}
+	if ( shadowDescriptorSetLayout != VK_NULL_HANDLE ) {
+		vkDestroyDescriptorSetLayout( device, shadowDescriptorSetLayout, NULL );
+		shadowDescriptorSetLayout = VK_NULL_HANDLE;
+	}
+}
+
+void idSoftwareVulkanBridge::DestroySwapchain() {
+	DestroyHybridBuffers();
+	if ( swapchain != VK_NULL_HANDLE ) {
+		vkDestroySwapchainKHR( device, swapchain, NULL );
+		swapchain = VK_NULL_HANDLE;
+	}
+	swapchainImages.Clear();
+	swapchainLayouts.Clear();
+	swapchainFormat = VK_FORMAT_UNDEFINED;
+	swapchainExtent.width = 0;
+	swapchainExtent.height = 0;
+}
+
+void idSoftwareVulkanBridge::Shutdown() {
+	if ( device != VK_NULL_HANDLE ) {
+		vkDeviceWaitIdle( device );
+	}
+
+	DestroyUploadBuffer();
+	DestroyHybridPipeline();
+	Destroy2DPipeline();
+	DestroyShadowPipeline();
+	framePixels.Clear();
+	hybrid2DSourcePixels.Clear();
+	hybrid2DJobs.Clear();
+	frameBegun = false;
+	frameDirty = false;
+	hybridFrameDirty = false;
+	hybridOverlayDirty = false;
+
+	if ( inFlightFence != VK_NULL_HANDLE ) {
+		vkDestroyFence( device, inFlightFence, NULL );
+		inFlightFence = VK_NULL_HANDLE;
+	}
+	if ( renderFinishedSemaphore != VK_NULL_HANDLE ) {
+		vkDestroySemaphore( device, renderFinishedSemaphore, NULL );
+		renderFinishedSemaphore = VK_NULL_HANDLE;
+	}
+	if ( imageAvailableSemaphore != VK_NULL_HANDLE ) {
+		vkDestroySemaphore( device, imageAvailableSemaphore, NULL );
+		imageAvailableSemaphore = VK_NULL_HANDLE;
+	}
+	if ( commandPool != VK_NULL_HANDLE ) {
+		vkDestroyCommandPool( device, commandPool, NULL );
+		commandPool = VK_NULL_HANDLE;
+		commandBuffer = VK_NULL_HANDLE;
+	}
+
+	DestroySwapchain();
+
+	if ( device != VK_NULL_HANDLE ) {
+		vkDestroyDevice( device, NULL );
+		device = VK_NULL_HANDLE;
+	}
+	if ( surface != VK_NULL_HANDLE ) {
+		vkDestroySurfaceKHR( instance, surface, NULL );
+		surface = VK_NULL_HANDLE;
+	}
+	if ( instance != VK_NULL_HANDLE ) {
+		vkDestroyInstance( instance, NULL );
+		instance = VK_NULL_HANDLE;
+	}
+
+	initialized = false;
+	failed = false;
+	printedFailure = false;
+	rayQuerySupported = false;
+	rayQuerySceneReady = false;
+	rayTlasSignature = 0;
+	rayTlasInstanceCount = 0;
+	physicalDevice = VK_NULL_HANDLE;
+	queue = VK_NULL_HANDLE;
+	queueFamily = 0;
+	frameWidth = 0;
+	frameHeight = 0;
+	hybridWidth = 0;
+	hybridHeight = 0;
+	hybridPresentWidth = 0;
+	hybridPresentHeight = 0;
+	hybridViewportX = 0;
+	hybridViewportY = 0;
+	hybridDebugView = 0;
+	hybridTextureCount = 0;
+	hybridTextureTexelCount = 0;
+	hybridLightCount = 0;
+	hybridShadowEnabled = false;
+	hybridOverlayDirty = false;
+	twoDDescriptorSet = VK_NULL_HANDLE;
+
+	vkGetPhysicalDeviceFeatures2Local = NULL;
+	vkGetBufferDeviceAddressKHRLocal = NULL;
+	vkCreateAccelerationStructureKHRLocal = NULL;
+	vkDestroyAccelerationStructureKHRLocal = NULL;
+	vkGetAccelerationStructureDeviceAddressKHRLocal = NULL;
+	vkGetAccelerationStructureBuildSizesKHRLocal = NULL;
+	vkCmdBuildAccelerationStructuresKHRLocal = NULL;
+}
+
+bool SWVulkan_BlitView( const viewDef_t *viewDef, const unsigned int *bgra, int width, int height, int presentWidth, int presentHeight ) {
+	return swVulkanBridge.BlitView( viewDef, bgra, width, height, presentWidth, presentHeight );
+}
+
+bool SWVulkan_CompositeHybridGBuffer( const viewDef_t *viewDef, const swHybridGBufferUpload_t &gbuffer, int width, int height, int presentWidth, int presentHeight ) {
+	return swVulkanBridge.CompositeHybridGBuffer( viewDef, gbuffer, width, height, presentWidth, presentHeight );
+}
+
+bool SWVulkan_ReadView( const viewDef_t *viewDef, unsigned int *bgra, int width, int height ) {
+	return swVulkanBridge.ReadView( viewDef, bgra, width, height );
+}
+
+bool SWVulkan_PresentFrame( void ) {
+	return swVulkanBridge.PresentFrame();
+}
+
+bool SWVulkan_RayQueryAvailable( void ) {
+	return swVulkanBridge.RayQueryAvailable();
+}
+
+bool SWVulkan_PrepareRayQueryScene( const viewDef_t *viewDef ) {
+	return swVulkanBridge.PrepareRayQueryScene( viewDef );
+}
+
+bool SWVulkan_BeginLightShadowMask( const viewLight_t *vLight, const idVec4 *worldPositions, int width, int height ) {
+	return swVulkanBridge.BeginLightShadowMask( vLight, worldPositions, width, height );
+}
+
+bool SWVulkan_FinishLightShadowMask( const viewLight_t *vLight, int width, int height, unsigned char *shadowMask ) {
+	return swVulkanBridge.FinishLightShadowMask( vLight, width, height, shadowMask );
+}
+
+bool SWVulkan_TraceLightShadowMask( const viewLight_t *vLight, const idVec4 *worldPositions, int width, int height, unsigned char *shadowMask ) {
+	return swVulkanBridge.TraceLightShadowMask( vLight, worldPositions, width, height, shadowMask );
+}
+
+void SWVulkan_Shutdown( void ) {
+	swVulkanBridge.Shutdown();
+}

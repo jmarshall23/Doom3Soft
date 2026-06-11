@@ -30,6 +30,7 @@ If you have questions concerning this license or the applicable additional terms
 #pragma hdrstop
 
 #include "tr_local.h"
+#include "SoftwareVulkanBridge.h"
 
 // Vista OpenGL wrapper check
 #ifdef _WIN32
@@ -152,6 +153,11 @@ idCVar r_useSoftwareRenderer( "r_useSoftwareRenderer", "1", CVAR_RENDERER | CVAR
 idCVar r_softwareTextureMode( "r_softwareTextureMode", "0", CVAR_RENDERER | CVAR_INTEGER, "software renderer texture debug mode: 0 material, 1 UV gradient, 2 UV checker", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
 idCVar r_softwareRenderScale( "r_softwareRenderScale", "0.5", CVAR_RENDERER | CVAR_FLOAT, "scale the 3D software render buffer before presentation", 0.0f, 1.0f );
 idCVar r_softwareDepthSIMD( "r_softwareDepthSIMD", "1", CVAR_RENDERER | CVAR_BOOL, "use AVX2 packet depth rasterization when available" );
+idCVar r_softwareVulkanPresent( "r_softwareVulkanPresent", "1", CVAR_RENDERER | CVAR_BOOL, "present software-rendered frames through a Vulkan swapchain" );
+idCVar r_softwareRayQueryShadows( "r_softwareRayQueryShadows", "1", CVAR_RENDERER | CVAR_BOOL, "enable Vulkan ray-query shadow backend when available" );
+idCVar r_softwareHybridRayQueryShadows( "r_softwareHybridRayQueryShadows", "1", CVAR_RENDERER | CVAR_BOOL, "enable expensive per-pixel ray-query shadows in the hybrid compute lighting pass" );
+idCVar r_softwareHybridComputeLighting( "r_softwareHybridComputeLighting", "0", CVAR_RENDERER | CVAR_BOOL, "route software rendering through the G-buffer / Vulkan compute lighting path" );
+idCVar r_softwareHybridDebugView( "r_softwareHybridDebugView", "0", CVAR_RENDERER | CVAR_INTEGER, "hybrid renderer debug view: 0 final lit frame, 1 depth, 2 normal, 3 uv, 4 material, 5 texture, 6 surface", 0, 6, idCmdSystem::ArgCompletion_Integer<0,6> );
 idCVar r_useCombinerDisplayLists( "r_useCombinerDisplayLists", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "put all nvidia register combiner programming in display lists" );
 idCVar r_useDepthBoundsTest( "r_useDepthBoundsTest", "1", CVAR_RENDERER | CVAR_BOOL, "use depth bounds test to reduce shadow fill" );
 
@@ -2272,6 +2278,7 @@ idRenderSystemLocal::ShutdownOpenGL
 */
 void idRenderSystemLocal::ShutdownOpenGL( void ) {
 	// free the context and close the window
+	SWVulkan_Shutdown();
 	R_ShutdownFrameData();
 	GLimp_Shutdown();
 	glConfig.isInitialized = false;

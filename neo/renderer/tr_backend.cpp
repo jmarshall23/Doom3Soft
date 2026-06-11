@@ -29,6 +29,7 @@ If you have questions concerning this license or the applicable additional terms
 #pragma hdrstop
 
 #include "tr_local.h"
+#include "SoftwareVulkanBridge.h"
 
 
 frameData_t		*frameData;
@@ -561,7 +562,10 @@ const void	RB_SwapBuffers( const void *data ) {
 
 	// don't flip if drawing to front buffer
 	if ( !r_frontBuffer.GetBool() ) {
-	    GLimp_SwapBuffers();
+		if ( r_softwareVulkanPresent.GetBool() && SWVulkan_PresentFrame() ) {
+			return;
+		}
+		GLimp_SwapBuffers();
 	}
 }
 

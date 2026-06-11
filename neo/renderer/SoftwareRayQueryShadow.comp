@@ -1,0 +1,57 @@
+#version 460
+#extension GL_EXT_ray_query : require
+
+layout( local_size_x = 64 ) in;
+
+layout( set = 0, binding = 0 ) uniform accelerationStructureEXT sceneAS;
+layout( set = 0, binding = 1, std430 ) readonly buffer WorldPositions {
+	vec4 worldPosition[];
+};
+layout( set = 0, binding = 2, std430 ) writeonly buffer ShadowMask {
+	uint visibility[];
+};
+
+layout( push_constant ) uniform PushConstants {
+	vec4 lightOrigin;
+	uint pixelCount;
+	float bias;
+} pc;
+
+void main() {
+	uint index = gl_GlobalInvocationID.x;
+	if ( index >= pc.pixelCount ) {
+		return;
+	}
+
+	vec4 pos = worldPosition[index];
+	if ( pos.w <= 0.0 ) {
+		visibility[index] = 255u;
+		return;
+	}
+
+	vec3 toLight = pc.lightOrigin.xyz - pos.xyz;
+	float distanceToLight = length( toLight );
+	if ( distanceToLight <= pc.bias * 2.0 ) {
+		visibility[index] = 255u;
+		return;
+	}
+
+	vec3 direction = toLight / distanceToLight;
+	vec3 origin = pos.xyz + direction * pc.bias;
+	float tMax = max( 0.0, distanceToLight - pc.bias * 2.0 );
+
+	rayQueryEXT rayQuery;
+	rayQueryInitializeEXT(
+		rayQuery,
+		sceneAS,
+		gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
+		0xff,
+		origin,
+		0.0,
+		direction,
+		tMax );
+	rayQueryProceedEXT( rayQuery );
+
+	bool blocked = rayQueryGetIntersectionTypeEXT( rayQuery, true ) != gl_RayQueryCommittedIntersectionNoneEXT;
+	visibility[index] = blocked ? 0u : 255u;
+}

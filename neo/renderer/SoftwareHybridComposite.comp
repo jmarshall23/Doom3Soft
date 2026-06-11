@@ -1,0 +1,398 @@
+#version 460
+#extension GL_EXT_ray_query : require
+
+layout( local_size_x = 8, local_size_y = 8 ) in;
+
+layout( set = 0, binding = 0, std430 ) readonly buffer DepthBuffer {
+	float depth[];
+};
+layout( set = 0, binding = 1, std430 ) readonly buffer NormalBuffer {
+	uint normalPacked[];
+};
+layout( set = 0, binding = 2, std430 ) readonly buffer UVBuffer {
+	uint uvPacked[];
+};
+layout( set = 0, binding = 3, std430 ) readonly buffer MaterialBuffer {
+	uint materialId[];
+};
+layout( set = 0, binding = 4, std430 ) readonly buffer AlbedoBuffer {
+	uint albedoOrTextureId[];
+};
+layout( set = 0, binding = 5, std430 ) readonly buffer SpecularBuffer {
+	uint specularAndFlags[];
+};
+layout( set = 0, binding = 6, std430 ) readonly buffer SurfaceBuffer {
+	uint surfaceId[];
+};
+layout( set = 0, binding = 7, std430 ) writeonly buffer FrameBuffer {
+	uint framePixels[];
+};
+layout( set = 0, binding = 8, std430 ) readonly buffer OverlayBuffer {
+	uint overlayPixels[];
+};
+
+struct TextureInfo {
+	uint offset;
+	uint width;
+	uint height;
+	uint repeat;
+};
+
+layout( set = 0, binding = 9, std430 ) readonly buffer TextureInfoBuffer {
+	TextureInfo textureInfos[];
+};
+layout( set = 0, binding = 10, std430 ) readonly buffer TextureTexelBuffer {
+	uint textureTexels[];
+};
+layout( set = 0, binding = 11, std430 ) readonly buffer WorldPositionBuffer {
+	vec4 worldPositions[];
+};
+
+struct HybridLight {
+	vec4 originRadius;
+	vec4 color;
+	ivec4 scissor;
+	uvec4 flags;
+	vec4 lightProject[4];
+	uvec4 textureIds;
+};
+
+layout( set = 0, binding = 12, std430 ) readonly buffer LightBuffer {
+	HybridLight lights[];
+};
+layout( set = 0, binding = 13 ) uniform accelerationStructureEXT sceneAS;
+layout( set = 0, binding = 14, std430 ) readonly buffer TangentBuffer {
+	uint tangentPacked[];
+};
+layout( set = 0, binding = 15, std430 ) readonly buffer BitangentBuffer {
+	uint bitangentPacked[];
+};
+
+layout( push_constant ) uniform PushConstants {
+	uvec4 dims;      // gbufferWidth, gbufferHeight, frameWidth, frameHeight
+	ivec4 viewport;  // x, y, presentWidth, presentHeight in Doom's bottom-left frame space
+	uint debugView;
+	uint textureCount;
+	uint overlayEnabled;
+	uint lightCount;
+	uint shadowEnabled;
+	uint pad0;
+	uint pad1;
+	uint pad2;
+	vec4 viewOrigin;
+} pc;
+
+uint PackColor( uint r, uint g, uint b, uint a ) {
+	return ( a << 24 ) | ( r << 16 ) | ( g << 8 ) | b;
+}
+
+uint ByteFromFloat( float value ) {
+	return uint( clamp( value, 0.0, 1.0 ) * 255.0 + 0.5 );
+}
+
+vec4 UnpackColor( uint color ) {
+	return vec4( float( ( color >> 16 ) & 255u ),
+		float( ( color >> 8 ) & 255u ),
+		float( color & 255u ),
+		float( ( color >> 24 ) & 255u ) ) * ( 1.0 / 255.0 );
+}
+
+uint PackColorVec( vec4 color ) {
+	return PackColor( ByteFromFloat( color.r ), ByteFromFloat( color.g ), ByteFromFloat( color.b ), ByteFromFloat( color.a ) );
+}
+
+float UnpackSnorm10( uint packed, uint shift ) {
+	int value = int( ( packed >> shift ) & 1023u );
+	if ( ( value & 512 ) != 0 ) {
+		value |= ~1023;
+	}
+	return clamp( float( value ) / 511.0, -1.0, 1.0 );
+}
+
+uint IdDebugColor( uint value ) {
+	if ( value == 0xffffffffu ) {
+		return PackColor( 255u, 0u, 255u, 255u );
+	}
+	value ^= value >> 16;
+	value *= 0x7feb352du;
+	value ^= value >> 15;
+	value *= 0x846ca68bu;
+	value ^= value >> 16;
+	return PackColor( 64u + ( value & 127u ),
+		64u + ( ( value >> 8 ) & 127u ),
+		64u + ( ( value >> 16 ) & 127u ),
+		255u );
+}
+
+vec3 DecodeNormal( uint packed ) {
+	vec3 normal;
+	normal.x = UnpackSnorm10( packed, 0u );
+	normal.y = UnpackSnorm10( packed, 10u );
+	normal.z = UnpackSnorm10( packed, 20u );
+	float len2 = dot( normal, normal );
+	if ( len2 <= 0.000001 ) {
+		return vec3( 0.0, 0.0, 1.0 );
+	}
+	return normal * inversesqrt( len2 );
+}
+
+uint SampleTextureNearest( uint textureId, uint packedUV ) {
+	if ( textureId == 0xffffffffu || textureId >= pc.textureCount ) {
+		return PackColor( 255u, 255u, 255u, 255u );
+	}
+
+	TextureInfo info = textureInfos[textureId];
+	if ( info.width == 0u || info.height == 0u ) {
+		return PackColor( 255u, 255u, 255u, 255u );
+	}
+
+	uint us = packedUV & 0xffffu;
+	uint vt = ( packedUV >> 16 ) & 0xffffu;
+	uint x = min( info.width - 1u, ( us * info.width ) >> 16 );
+	uint y = min( info.height - 1u, ( vt * info.height ) >> 16 );
+	return textureTexels[info.offset + y * info.width + x];
+}
+
+uint SampleProjectedTexture( uint textureId, vec2 uv, uint fallbackColor ) {
+	if ( textureId == 0xffffffffu || textureId >= pc.textureCount ) {
+		return fallbackColor;
+	}
+
+	TextureInfo info = textureInfos[textureId];
+	if ( info.width == 0u || info.height == 0u ) {
+		return fallbackColor;
+	}
+
+	bool outside = uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0;
+	if ( outside && ( info.repeat == 3u || info.repeat == 4u ) ) {
+		return info.repeat == 4u ? PackColor( 0u, 0u, 0u, 0u ) : PackColor( 0u, 0u, 0u, 255u );
+	}
+	if ( info.repeat == 0u ) {
+		uv = fract( uv );
+		uv += vec2( uv.x < 0.0 ? 1.0 : 0.0, uv.y < 0.0 ? 1.0 : 0.0 );
+	} else {
+		uv = clamp( uv, vec2( 0.0 ), vec2( 1.0 ) );
+	}
+
+	uint x = min( info.width - 1u, uint( uv.x * float( info.width ) ) );
+	uint y = min( info.height - 1u, uint( uv.y * float( info.height ) ) );
+	return textureTexels[info.offset + y * info.width + x];
+}
+
+uint OptionalTextureId( uint packedId ) {
+	return packedId == 0u ? 0xffffffffu : packedId - 1u;
+}
+
+vec3 FallbackTangent( vec3 normal ) {
+	vec3 up = abs( normal.z ) < 0.999 ? vec3( 0.0, 0.0, 1.0 ) : vec3( 0.0, 1.0, 0.0 );
+	return normalize( cross( up, normal ) );
+}
+
+void BuildBasis( uint srcIndex, inout vec3 normal, out vec3 tangent, out vec3 bitangent ) {
+	tangent = DecodeNormal( tangentPacked[srcIndex] );
+	tangent -= normal * dot( tangent, normal );
+	if ( dot( tangent, tangent ) <= 0.000001 ) {
+		tangent = FallbackTangent( normal );
+	} else {
+		tangent = normalize( tangent );
+	}
+
+	bitangent = DecodeNormal( bitangentPacked[srcIndex] );
+	bitangent -= normal * dot( bitangent, normal );
+	bitangent -= tangent * dot( bitangent, tangent );
+	if ( dot( bitangent, bitangent ) <= 0.000001 ) {
+		bitangent = normalize( cross( normal, tangent ) );
+	} else {
+		bitangent = normalize( bitangent );
+	}
+}
+
+vec3 DecodeNormalMapTexel( uint texel ) {
+	vec3 n = UnpackColor( texel ).rgb * 2.0 - 1.0;
+	float len2 = dot( n, n );
+	if ( len2 <= 0.000001 ) {
+		return vec3( 0.0, 0.0, 1.0 );
+	}
+	return n * inversesqrt( len2 );
+}
+
+float TraceShadow( vec3 worldPos, vec3 normal, vec3 lightDir, float distanceToLight ) {
+	if ( pc.shadowEnabled == 0u || distanceToLight <= 4.0 ) {
+		return 1.0;
+	}
+
+	vec3 origin = worldPos + normal * 2.0;
+	float tMax = max( 0.0, distanceToLight - 4.0 );
+	rayQueryEXT rayQuery;
+	rayQueryInitializeEXT(
+		rayQuery,
+		sceneAS,
+		gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
+		0xff,
+		origin,
+		0.0,
+		lightDir,
+		tMax );
+	rayQueryProceedEXT( rayQuery );
+	return rayQueryGetIntersectionTypeEXT( rayQuery, true ) == gl_RayQueryCommittedIntersectionNoneEXT ? 1.0 : 0.0;
+}
+
+uint ShadeTexturedPixel( uint srcIndex, uint viewX, uint viewY ) {
+	vec4 albedo = UnpackColor( SampleTextureNearest( albedoOrTextureId[srcIndex], uvPacked[srcIndex] ) );
+	vec3 normal = DecodeNormal( normalPacked[srcIndex] );
+	vec3 tangent;
+	vec3 bitangent;
+	BuildBasis( srcIndex, normal, tangent, bitangent );
+	uint packedMaterial = specularAndFlags[srcIndex];
+	uint bumpTextureId = OptionalTextureId( packedMaterial & 0xffffu );
+	uint specularTextureId = OptionalTextureId( ( packedMaterial >> 16 ) & 0xffffu );
+	vec3 bumpNormal = vec3( 0.0, 0.0, 1.0 );
+	if ( bumpTextureId != 0xffffffffu && bumpTextureId < pc.textureCount ) {
+		bumpNormal = DecodeNormalMapTexel( SampleTextureNearest( bumpTextureId, uvPacked[srcIndex] ) );
+	}
+	vec3 specularColor = vec3( 0.0 );
+	if ( specularTextureId != 0xffffffffu && specularTextureId < pc.textureCount ) {
+		specularColor = UnpackColor( SampleTextureNearest( specularTextureId, uvPacked[srcIndex] ) ).rgb;
+	}
+	vec3 lit = albedo.rgb * 0.04;
+	vec4 world = worldPositions[srcIndex];
+
+	if ( world.w > 0.0 && pc.lightCount > 0u ) {
+		for ( uint i = 0u; i < pc.lightCount; i++ ) {
+			HybridLight light = lights[i];
+			if ( int( viewX ) < light.scissor.x || int( viewX ) > light.scissor.z ||
+				 int( viewY ) < light.scissor.y || int( viewY ) > light.scissor.w ) {
+				continue;
+			}
+
+			vec3 lightColor = max( light.color.rgb, vec3( 0.0 ) );
+			if ( light.flags.x != 0u ) {
+				lit += albedo.rgb * lightColor;
+				continue;
+			}
+
+			vec4 world4 = vec4( world.xyz, 1.0 );
+			float lightQ = dot( light.lightProject[2], world4 );
+			if ( lightQ <= 0.00001 ) {
+				continue;
+			}
+
+			float lightS = dot( light.lightProject[0], world4 ) / lightQ;
+			float lightT = dot( light.lightProject[1], world4 ) / lightQ;
+			float falloffS = dot( light.lightProject[3], world4 );
+
+			uint lightTextureId = OptionalTextureId( light.textureIds.x );
+			uint falloffTextureId = OptionalTextureId( light.textureIds.y );
+			vec4 lightTexel = UnpackColor( SampleProjectedTexture( lightTextureId, vec2( lightS, lightT ), PackColor( 255u, 255u, 255u, 255u ) ) );
+			float falloff = UnpackColor( SampleProjectedTexture( falloffTextureId, vec2( falloffS, 0.5 ), PackColor( 255u, 255u, 255u, 255u ) ) ).r;
+			if ( falloff <= 0.0 || dot( lightTexel.rgb, lightTexel.rgb ) <= 0.000001 ) {
+				continue;
+			}
+
+			vec3 toLight = light.originRadius.xyz - world.xyz;
+			float dist2 = dot( toLight, toLight );
+			float invDist = inversesqrt( max( dist2, 0.000001 ) );
+			vec3 lightDir = toLight * invDist;
+			float dist = dist2 * invDist;
+			float attenuation = 1.0;
+			vec3 lightTS = vec3( dot( lightDir, tangent ), dot( lightDir, bitangent ), dot( lightDir, normal ) );
+			if ( dot( lightTS, lightTS ) > 0.000001 ) {
+				lightTS = normalize( lightTS );
+			}
+			float nDotL = max( dot( bumpNormal, lightTS ), 0.0 );
+			float shadow = light.flags.z != 0u ? TraceShadow( world.xyz, normal, lightDir, dist ) : 1.0;
+			float lightAmount = nDotL * attenuation * falloff * shadow;
+			vec3 projectedLightColor = lightColor * lightTexel.rgb;
+			lit += albedo.rgb * projectedLightColor * lightAmount;
+			if ( dot( specularColor, specularColor ) > 0.000001 && lightAmount > 0.0 ) {
+				vec3 viewDir = normalize( pc.viewOrigin.xyz - world.xyz );
+				vec3 viewTS = vec3( dot( viewDir, tangent ), dot( viewDir, bitangent ), dot( viewDir, normal ) );
+				if ( dot( viewTS, viewTS ) > 0.000001 ) {
+					viewTS = normalize( viewTS );
+				}
+				vec3 halfTS = normalize( lightTS + viewTS );
+				float spec = pow( max( dot( bumpNormal, halfTS ), 0.0 ), 16.0 );
+				lit += specularColor * projectedLightColor * spec * attenuation * falloff * shadow;
+			}
+		}
+	} else {
+		vec3 lightDir = normalize( vec3( -0.35, 0.45, 0.82 ) );
+		float nDotL = max( dot( normal, lightDir ), 0.0 );
+		lit += albedo.rgb * ( 0.16 + 0.80 * nDotL );
+	}
+
+	return PackColorVec( vec4( lit, albedo.a ) );
+}
+
+uint BlendOverlay( uint baseColor, uint overlayColor ) {
+	float overlayAlpha = float( ( overlayColor >> 24 ) & 255u ) * ( 1.0 / 255.0 );
+	if ( overlayAlpha <= 0.0 ) {
+		return baseColor;
+	}
+	if ( overlayAlpha >= 1.0 ) {
+		return overlayColor;
+	}
+
+	vec4 base = UnpackColor( baseColor );
+	vec4 overlay = UnpackColor( overlayColor );
+	vec3 rgb = clamp( overlay.rgb + base.rgb * ( 1.0 - overlayAlpha ), vec3( 0.0 ), vec3( 1.0 ) );
+	float alpha = overlayAlpha + base.a * ( 1.0 - overlayAlpha );
+	return PackColorVec( vec4( rgb, alpha ) );
+}
+
+void main() {
+	uint frameX = gl_GlobalInvocationID.x;
+	uint uploadY = gl_GlobalInvocationID.y;
+	if ( frameX >= pc.dims.z || uploadY >= pc.dims.w ) {
+		return;
+	}
+
+	uint outIndex = uploadY * pc.dims.z + frameX;
+	uint logicalY = pc.dims.w - 1u - uploadY;
+	uint color = PackColor( 0u, 0u, 0u, 255u );
+
+	if ( int( frameX ) >= pc.viewport.x &&
+		 int( logicalY ) >= pc.viewport.y &&
+		 int( frameX ) < pc.viewport.x + pc.viewport.z &&
+		 int( logicalY ) < pc.viewport.y + pc.viewport.w ) {
+		uint viewX = uint( int( frameX ) - pc.viewport.x );
+		uint viewY = uint( int( logicalY ) - pc.viewport.y );
+		uint srcX = min( pc.dims.x - 1u, ( viewX * pc.dims.x ) / uint( pc.viewport.z ) );
+		uint srcY = min( pc.dims.y - 1u, ( viewY * pc.dims.y ) / uint( pc.viewport.w ) );
+		uint srcIndex = srcY * pc.dims.x + srcX;
+
+		if ( depth[srcIndex] < 1.0 && surfaceId[srcIndex] != 0u ) {
+			if ( pc.debugView == 0u ) {
+				color = ShadeTexturedPixel( srcIndex, viewX, viewY );
+			} else if ( pc.debugView == 1u ) {
+				uint v = ByteFromFloat( 1.0 - depth[srcIndex] );
+				color = PackColor( v, v, v, 255u );
+			} else if ( pc.debugView == 2u ) {
+				uint packed = normalPacked[srcIndex];
+				uint r = ByteFromFloat( UnpackSnorm10( packed, 0u ) * 0.5 + 0.5 );
+				uint g = ByteFromFloat( UnpackSnorm10( packed, 10u ) * 0.5 + 0.5 );
+				uint b = ByteFromFloat( UnpackSnorm10( packed, 20u ) * 0.5 + 0.5 );
+				color = PackColor( r, g, b, 255u );
+			} else if ( pc.debugView == 3u ) {
+				uint packed = uvPacked[srcIndex];
+				color = PackColor( ( packed & 0xffffu ) >> 8,
+					( ( packed >> 16 ) & 0xffffu ) >> 8,
+					64u,
+					255u );
+			} else if ( pc.debugView == 4u ) {
+				color = IdDebugColor( materialId[srcIndex] );
+			} else if ( pc.debugView == 5u ) {
+				color = SampleTextureNearest( albedoOrTextureId[srcIndex], uvPacked[srcIndex] );
+			} else if ( pc.debugView == 6u ) {
+				color = IdDebugColor( surfaceId[srcIndex] );
+			}
+		}
+	}
+
+	if ( pc.overlayEnabled != 0u ) {
+		uint overlayIndex = logicalY * pc.dims.z + frameX;
+		color = BlendOverlay( color, overlayPixels[overlayIndex] );
+	}
+
+	framePixels[outIndex] = color;
+}
