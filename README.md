@@ -1,6 +1,6 @@
 # Doom3Software Rasterizer
 
-A CPU-based software rasterizer experiment for Doom 3-style rendering.
+A CPU-based software rasterizer experiment for Doom 3 rendering.
 
 ![Doom3Software Rasterizer](https://i.ibb.co/mC0wbV9Z/image.webp)
 
