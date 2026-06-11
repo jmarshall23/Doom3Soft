@@ -3248,17 +3248,17 @@ void idSoftwareRasterizer::WriteHybridGBufferPixel( int pixelIndex, const swTriS
 		s = sOverW * invPerspective;
 		t = tOverW * invPerspective;
 		normal.Set( normalOverW[0] * invPerspective, normalOverW[1] * invPerspective, normalOverW[2] * invPerspective );
-		if ( normal.Normalize() == 0.0f ) {
-			normal.Set( 0.0f, 0.0f, 1.0f );
-		}
+		//if ( normal.Normalize() == 0.0f ) {
+		//	normal.Set( 0.0f, 0.0f, 1.0f );
+		//}
 		tangent0.Set( tangent0OverW[0] * invPerspective, tangent0OverW[1] * invPerspective, tangent0OverW[2] * invPerspective );
-		if ( tangent0.Normalize() == 0.0f ) {
-			tangent0.Set( 1.0f, 0.0f, 0.0f );
-		}
+		//if ( tangent0.Normalize() == 0.0f ) {
+		//	tangent0.Set( 1.0f, 0.0f, 0.0f );
+		//}
 		tangent1.Set( tangent1OverW[0] * invPerspective, tangent1OverW[1] * invPerspective, tangent1OverW[2] * invPerspective );
-		if ( tangent1.Normalize() == 0.0f ) {
-			tangent1.Set( 0.0f, 1.0f, 0.0f );
-		}
+		//if ( tangent1.Normalize() == 0.0f ) {
+		//	tangent1.Set( 0.0f, 1.0f, 0.0f );
+		//}
 	}
 
 	hybridGBuffer.depth[pixelIndex] = z;
