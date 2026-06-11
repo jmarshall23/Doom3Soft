@@ -152,14 +152,32 @@ struct swVk2DJob_t {
 };
 
 static const int SW_VK_MAX_SHADOW_JOBS = 64;
-static const uint32_t SW_VK_COMPUTE_GROUP_SIZE_X = 16;
-static const uint32_t SW_VK_COMPUTE_GROUP_SIZE_Y = 8;
+static const uint32_t SW_VK_LINEAR_GROUP_SIZE_X = 32;
+static const uint32_t SW_VK_LINEAR_GROUP_SIZE_Y = 4;
+static const uint32_t SW_VK_OVERLAY_GROUP_SIZE_X = 16;
+static const uint32_t SW_VK_OVERLAY_GROUP_SIZE_Y = 8;
 static const uint32_t SW_VK_SHADOW_GROUP_SIZE_X = 128;
 static const VkDeviceSize SW_VK_MIN_TEXTURE_INFO_BYTES = 4096 * sizeof( swHybridTextureInfo_t );
 static const VkDeviceSize SW_VK_MIN_TEXTURE_TEXEL_BYTES = 32 * 1024 * 1024 * sizeof( uint32_t );
 
 static uint32_t SWVkDispatchGroups( uint32_t size, uint32_t groupSize ) {
 	return ( size + groupSize - 1u ) / groupSize;
+}
+
+static void SWVkComputeMemoryBarrier( VkCommandBuffer commandBuffer, VkAccessFlags srcAccess, VkAccessFlags dstAccess ) {
+	VkMemoryBarrier barrier;
+	memset( &barrier, 0, sizeof( barrier ) );
+	barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	barrier.srcAccessMask = srcAccess;
+	barrier.dstAccessMask = dstAccess;
+	vkCmdPipelineBarrier( commandBuffer,
+		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		0, 1, &barrier, 0, NULL, 0, NULL );
+}
+
+static bool SWVkRectsOverlap( int ax0, int ay0, int ax1, int ay1, int bx0, int by0, int bx1, int by1 ) {
+	return ax0 < bx1 && bx0 < ax1 && ay0 < by1 && by0 < ay1;
 }
 
 static VkDeviceSize SWVkGrowBufferSize( VkDeviceSize required, VkDeviceSize minimum ) {
@@ -2897,8 +2915,8 @@ bool idSoftwareVulkanBridge::Record2DCompositeCommands( bool targetFrame ) {
 		const uint32_t dispatchWidth = ( i == 0 ) ? static_cast<uint32_t>( frameWidth ) : static_cast<uint32_t>( job.presentWidth );
 		const uint32_t dispatchHeight = ( i == 0 ) ? static_cast<uint32_t>( frameHeight ) : static_cast<uint32_t>( job.presentHeight );
 		vkCmdDispatch( commandBuffer,
-			SWVkDispatchGroups( dispatchWidth, SW_VK_COMPUTE_GROUP_SIZE_X ),
-			SWVkDispatchGroups( dispatchHeight, SW_VK_COMPUTE_GROUP_SIZE_Y ), 1 );
+			SWVkDispatchGroups( dispatchWidth, SW_VK_LINEAR_GROUP_SIZE_X ),
+			SWVkDispatchGroups( dispatchHeight, SW_VK_LINEAR_GROUP_SIZE_Y ), 1 );
 
 		VkMemoryBarrier jobBarrier;
 		memset( &jobBarrier, 0, sizeof( jobBarrier ) );
@@ -2957,19 +2975,17 @@ bool idSoftwareVulkanBridge::RecordOverlayRasterCommands( bool targetFrame ) {
 		push.targetFrame = 0u;
 		vkCmdPushConstants( commandBuffer, overlayPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
 		vkCmdDispatch( commandBuffer,
-			SWVkDispatchGroups( static_cast<uint32_t>( frameWidth ), SW_VK_COMPUTE_GROUP_SIZE_X ),
-			SWVkDispatchGroups( static_cast<uint32_t>( frameHeight ), SW_VK_COMPUTE_GROUP_SIZE_Y ), 1 );
+			SWVkDispatchGroups( static_cast<uint32_t>( frameWidth ), SW_VK_OVERLAY_GROUP_SIZE_X ),
+			SWVkDispatchGroups( static_cast<uint32_t>( frameHeight ), SW_VK_OVERLAY_GROUP_SIZE_Y ), 1 );
 
-		VkMemoryBarrier clearBarrier;
-		memset( &clearBarrier, 0, sizeof( clearBarrier ) );
-		clearBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-		clearBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-		clearBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-		vkCmdPipelineBarrier( commandBuffer,
-			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			0, 1, &clearBarrier, 0, NULL, 0, NULL );
+		SWVkComputeMemoryBarrier( commandBuffer, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT );
 	}
+
+	bool pendingOverlayWrites = false;
+	int dirtyX0 = 0;
+	int dirtyY0 = 0;
+	int dirtyX1 = 0;
+	int dirtyY1 = 0;
 
 	for ( int i = 0; i < hybridOverlayTris.Num(); i++ ) {
 		const swHybridOverlayTri_t &tri = hybridOverlayTris[i];
@@ -2989,6 +3005,11 @@ bool idSoftwareVulkanBridge::RecordOverlayRasterCommands( bool targetFrame ) {
 		const int y1 = Max( 0, Min( frameHeight, maxFrameY ) );
 		if ( x1 <= x0 || y1 <= y0 ) {
 			continue;
+		}
+
+		if ( pendingOverlayWrites && SWVkRectsOverlap( dirtyX0, dirtyY0, dirtyX1, dirtyY1, x0, y0, x1, y1 ) ) {
+			SWVkComputeMemoryBarrier( commandBuffer, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT );
+			pendingOverlayWrites = false;
 		}
 
 		memset( &push, 0, sizeof( push ) );
@@ -3013,18 +3034,24 @@ bool idSoftwareVulkanBridge::RecordOverlayRasterCommands( bool targetFrame ) {
 
 		vkCmdPushConstants( commandBuffer, overlayPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
 		vkCmdDispatch( commandBuffer,
-			SWVkDispatchGroups( static_cast<uint32_t>( x1 - x0 ), SW_VK_COMPUTE_GROUP_SIZE_X ),
-			SWVkDispatchGroups( static_cast<uint32_t>( y1 - y0 ), SW_VK_COMPUTE_GROUP_SIZE_Y ), 1 );
+			SWVkDispatchGroups( static_cast<uint32_t>( x1 - x0 ), SW_VK_OVERLAY_GROUP_SIZE_X ),
+			SWVkDispatchGroups( static_cast<uint32_t>( y1 - y0 ), SW_VK_OVERLAY_GROUP_SIZE_Y ), 1 );
 
-		VkMemoryBarrier triBarrier;
-		memset( &triBarrier, 0, sizeof( triBarrier ) );
-		triBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-		triBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-		triBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-		vkCmdPipelineBarrier( commandBuffer,
-			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			0, 1, &triBarrier, 0, NULL, 0, NULL );
+		if ( pendingOverlayWrites ) {
+			dirtyX0 = Min( dirtyX0, x0 );
+			dirtyY0 = Min( dirtyY0, y0 );
+			dirtyX1 = Max( dirtyX1, x1 );
+			dirtyY1 = Max( dirtyY1, y1 );
+		} else {
+			dirtyX0 = x0;
+			dirtyY0 = y0;
+			dirtyX1 = x1;
+			dirtyY1 = y1;
+			pendingOverlayWrites = true;
+		}
+	}
+	if ( pendingOverlayWrites ) {
+		SWVkComputeMemoryBarrier( commandBuffer, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT );
 	}
 	return true;
 }
@@ -3044,9 +3071,6 @@ bool idSoftwareVulkanBridge::RecordHybridCompositeCommands( bool outputForComput
 		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		0, 1, &inputBarrier, 0, NULL, 0, NULL );
 
-	const VkDeviceSize frameSize = static_cast<VkDeviceSize>( frameWidth ) * static_cast<VkDeviceSize>( frameHeight ) * sizeof( uint32_t );
-	vkCmdFillBuffer( commandBuffer, hybridFrameBuffer.buffer, 0, frameSize, 0xff000000u );
-
 	const int dispatchX0 = Max( 0, hybridViewportX );
 	const int dispatchY0 = Max( 0, hybridViewportY );
 	const int dispatchX1 = Max( dispatchX0, Min( frameWidth, hybridViewportX + hybridPresentWidth ) );
@@ -3054,19 +3078,28 @@ bool idSoftwareVulkanBridge::RecordHybridCompositeCommands( bool outputForComput
 	const uint32_t dispatchWidth = hybridOverlayOnly ? 0u : static_cast<uint32_t>( dispatchX1 - dispatchX0 );
 	const uint32_t dispatchHeight = hybridOverlayOnly ? 0u : static_cast<uint32_t>( dispatchY1 - dispatchY0 );
 	const bool dispatchComposite = dispatchWidth != 0u && dispatchHeight != 0u;
+	const bool fullFrameComposite = dispatchComposite &&
+		dispatchX0 == 0 && dispatchY0 == 0 &&
+		dispatchWidth == static_cast<uint32_t>( frameWidth ) &&
+		dispatchHeight == static_cast<uint32_t>( frameHeight );
 
-	VkMemoryBarrier clearBarrier;
-	memset( &clearBarrier, 0, sizeof( clearBarrier ) );
-	clearBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-	clearBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-	clearBarrier.dstAccessMask = !dispatchComposite ?
-		( outputForCompute ? ( VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT ) : VK_ACCESS_TRANSFER_READ_BIT ) :
-		VK_ACCESS_SHADER_WRITE_BIT;
-	const VkPipelineStageFlags clearDstStage = dispatchComposite || outputForCompute ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT;
-	vkCmdPipelineBarrier( commandBuffer,
-		VK_PIPELINE_STAGE_TRANSFER_BIT,
-		clearDstStage,
-		0, 1, &clearBarrier, 0, NULL, 0, NULL );
+	if ( !fullFrameComposite ) {
+		const VkDeviceSize frameSize = static_cast<VkDeviceSize>( frameWidth ) * static_cast<VkDeviceSize>( frameHeight ) * sizeof( uint32_t );
+		vkCmdFillBuffer( commandBuffer, hybridFrameBuffer.buffer, 0, frameSize, 0xff000000u );
+
+		VkMemoryBarrier clearBarrier;
+		memset( &clearBarrier, 0, sizeof( clearBarrier ) );
+		clearBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+		clearBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		clearBarrier.dstAccessMask = !dispatchComposite ?
+			( outputForCompute ? ( VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT ) : VK_ACCESS_TRANSFER_READ_BIT ) :
+			VK_ACCESS_SHADER_WRITE_BIT;
+		const VkPipelineStageFlags clearDstStage = dispatchComposite || outputForCompute ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT;
+		vkCmdPipelineBarrier( commandBuffer,
+			VK_PIPELINE_STAGE_TRANSFER_BIT,
+			clearDstStage,
+			0, 1, &clearBarrier, 0, NULL, 0, NULL );
+	}
 
 	if ( !dispatchComposite ) {
 		return true;
@@ -3103,8 +3136,8 @@ bool idSoftwareVulkanBridge::RecordHybridCompositeCommands( bool outputForComput
 	vkCmdBindDescriptorSets( commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, hybridPipelineLayout, 0, 1, &hybridDescriptorSet, 0, NULL );
 	vkCmdPushConstants( commandBuffer, hybridPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
 	vkCmdDispatch( commandBuffer,
-		SWVkDispatchGroups( dispatchWidth, SW_VK_COMPUTE_GROUP_SIZE_X ),
-		SWVkDispatchGroups( dispatchHeight, SW_VK_COMPUTE_GROUP_SIZE_Y ), 1 );
+		SWVkDispatchGroups( dispatchWidth, SW_VK_LINEAR_GROUP_SIZE_X ),
+		SWVkDispatchGroups( dispatchHeight, SW_VK_LINEAR_GROUP_SIZE_Y ), 1 );
 
 	VkMemoryBarrier outputBarrier;
 	memset( &outputBarrier, 0, sizeof( outputBarrier ) );

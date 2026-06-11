@@ -56,6 +56,35 @@ static const unsigned int SW_OVERLAY_FLAG_ALPHA_TEST = BIT(2);
 static const unsigned int SW_OVERLAY_FLAG_DEPTH_TEST = BIT(3);
 static const unsigned int SW_OVERLAY_FLAG_DEPTH_EQUAL = BIT(4);
 
+static void SWFillPattern( void *dst, const void *pattern, int count, size_t elementSize ) {
+	if ( !dst || !pattern || count <= 0 || elementSize == 0 ) {
+		return;
+	}
+
+	byte *out = reinterpret_cast<byte *>( dst );
+	const size_t totalBytes = static_cast<size_t>( count ) * elementSize;
+	memcpy( out, pattern, elementSize );
+	size_t copiedBytes = elementSize;
+	while ( copiedBytes < totalBytes ) {
+		const size_t remainingBytes = totalBytes - copiedBytes;
+		const size_t copyBytes = copiedBytes < remainingBytes ? copiedBytes : remainingBytes;
+		memcpy( out + copiedBytes, out, copyBytes );
+		copiedBytes += copyBytes;
+	}
+}
+
+template<class type>
+static void SWFillList( idList<type> &list, const type &value ) {
+	SWFillPattern( list.Ptr(), &value, list.Num(), sizeof( type ) );
+}
+
+template<class type>
+static void SWZeroList( idList<type> &list ) {
+	if ( list.Num() > 0 ) {
+		memset( list.Ptr(), 0, static_cast<size_t>( list.Num() ) * sizeof( type ) );
+	}
+}
+
 enum swBlendMode_t {
 	SW_BLEND_REPLACE,
 	SW_BLEND_ALPHA,
@@ -548,17 +577,15 @@ void idSoftwareRasterizer::Resize( int newWidth, int newHeight ) {
 }
 
 void idSoftwareRasterizer::Clear( bool clearColor ) {
-	for ( int i = 0; i < depthBuffer.Num(); i++ ) {
-		depthBuffer[i] = 1.0f;
-		worldPositionBuffer[i].Set( 0.0f, 0.0f, 0.0f, 0.0f );
-	}
+	const float clearDepth = 1.0f;
+	SWFillList( depthBuffer, clearDepth );
+	SWZeroList( worldPositionBuffer );
 	ClearHybridGBuffer();
 	shadowMaskActive = false;
 	hybridSurfaceSerial = 1;
 	if ( clearColor ) {
-		for ( int i = 0; i < colorBuffer.Num(); i++ ) {
-			colorBuffer[i] = 0xff000000u;
-		}
+		const unsigned int clearColorValue = 0xff000000u;
+		SWFillList( colorBuffer, clearColorValue );
 	}
 
 	triangles.SetNum( 0, false );
@@ -568,20 +595,29 @@ void idSoftwareRasterizer::Clear( bool clearColor ) {
 
 void idSoftwareRasterizer::ClearHybridGBuffer() {
 	const int pixelCount = width * height;
-	if ( hybridGBuffer.depth.Num() != pixelCount ) {
+	if ( hybridGBuffer.depth.Num() != pixelCount ||
+		 hybridGBuffer.normalPacked.Num() != pixelCount ||
+		 hybridGBuffer.tangentPacked.Num() != pixelCount ||
+		 hybridGBuffer.bitangentPacked.Num() != pixelCount ||
+		 hybridGBuffer.uvPacked.Num() != pixelCount ||
+		 hybridGBuffer.materialId.Num() != pixelCount ||
+		 hybridGBuffer.albedoOrTextureId.Num() != pixelCount ||
+		 hybridGBuffer.specularAndFlags.Num() != pixelCount ||
+		 hybridGBuffer.surfaceId.Num() != pixelCount ) {
 		return;
 	}
-	for ( int i = 0; i < pixelCount; i++ ) {
-		hybridGBuffer.depth[i] = 1.0f;
-		hybridGBuffer.normalPacked[i] = 0;
-		hybridGBuffer.tangentPacked[i] = 0;
-		hybridGBuffer.bitangentPacked[i] = 0;
-		hybridGBuffer.uvPacked[i] = 0;
-		hybridGBuffer.materialId[i] = 0;
-		hybridGBuffer.albedoOrTextureId[i] = 0xffffffffu;
-		hybridGBuffer.specularAndFlags[i] = 0;
-		hybridGBuffer.surfaceId[i] = 0;
-	}
+
+	const float clearDepth = 1.0f;
+	const unsigned int invalidTextureId = 0xffffffffu;
+	SWFillList( hybridGBuffer.depth, clearDepth );
+	SWZeroList( hybridGBuffer.normalPacked );
+	SWZeroList( hybridGBuffer.tangentPacked );
+	SWZeroList( hybridGBuffer.bitangentPacked );
+	SWZeroList( hybridGBuffer.uvPacked );
+	SWZeroList( hybridGBuffer.materialId );
+	SWFillList( hybridGBuffer.albedoOrTextureId, invalidTextureId );
+	SWZeroList( hybridGBuffer.specularAndFlags );
+	SWZeroList( hybridGBuffer.surfaceId );
 }
 
 void idSoftwareRasterizer::ClearTileBins() {
@@ -676,9 +712,7 @@ void idSoftwareRasterizer::DrawView( const viewDef_t *viewDef ) {
 						return;
 					}
 
-					for ( int i = 0; i < colorBuffer.Num(); i++ ) {
-						colorBuffer[i] = 0;
-					}
+					SWZeroList( colorBuffer );
 					RasterizeTiles();
 					Present();
 				}
@@ -1814,13 +1848,12 @@ void idSoftwareRasterizer::BuildHybridTextureUpload( swHybridGBufferUpload_t &gb
 		const int textureCount = Max( 1, textureCache.Num() );
 
 		hybridTextureInfos.SetNum( textureCount, false );
-		for ( int i = 0; i < textureCount; i++ ) {
-			swHybridTextureInfo_t &info = hybridTextureInfos[i];
-			info.offset = 0;
-			info.width = 1;
-			info.height = 1;
-			info.repeat = TR_REPEAT;
-		}
+		swHybridTextureInfo_t defaultInfo;
+		defaultInfo.offset = 0;
+		defaultInfo.width = 1;
+		defaultInfo.height = 1;
+		defaultInfo.repeat = TR_REPEAT;
+		SWFillList( hybridTextureInfos, defaultInfo );
 
 		int totalTexels = 1;
 		for ( int i = 0; i < textureCache.Num(); i++ ) {

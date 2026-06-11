@@ -102,6 +102,11 @@ void main() {
 
 	vec3 direction = toLight / distanceToLight;
 	uint samples = pc.radius > 0.0 ? clamp( pc.sampleCount, 1u, MAX_SHADOW_SAMPLES ) : 1u;
+	if ( samples <= 1u ) {
+		visibility[index] = uint( clamp( TraceVisibility( pos.xyz, pc.lightOrigin.xyz ), 0.0, 1.0 ) * 255.0 + 0.5 );
+		return;
+	}
+
 	vec3 right;
 	vec3 up;
 	BuildShadowBasis( direction, right, up );
