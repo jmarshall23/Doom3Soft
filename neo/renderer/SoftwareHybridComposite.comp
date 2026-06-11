@@ -76,7 +76,7 @@ layout( push_constant ) uniform PushConstants {
 	uint overlayEnabled;
 	uint lightCount;
 	uint shadowEnabled;
-	uint pad0;
+	uint overlayOnly;
 	uint pad1;
 	uint pad2;
 	vec4 viewOrigin;
@@ -327,6 +327,11 @@ uint ShadeTexturedPixel( uint srcIndex, uint viewX, uint viewY ) {
 uint BlendOverlay( uint baseColor, uint overlayColor ) {
 	float overlayAlpha = float( ( overlayColor >> 24 ) & 255u ) * ( 1.0 / 255.0 );
 	if ( overlayAlpha <= 0.0 ) {
+		vec4 overlay = UnpackColor( overlayColor );
+		if ( dot( overlay.rgb, overlay.rgb ) > 0.000001 ) {
+			vec4 base = UnpackColor( baseColor );
+			return PackColorVec( vec4( clamp( base.rgb + overlay.rgb, vec3( 0.0 ), vec3( 1.0 ) ), base.a ) );
+		}
 		return baseColor;
 	}
 	if ( overlayAlpha >= 1.0 ) {
@@ -351,7 +356,8 @@ void main() {
 	uint logicalY = pc.dims.w - 1u - uploadY;
 	uint color = PackColor( 0u, 0u, 0u, 255u );
 
-	if ( int( frameX ) >= pc.viewport.x &&
+	if ( pc.overlayOnly == 0u &&
+		 int( frameX ) >= pc.viewport.x &&
 		 int( logicalY ) >= pc.viewport.y &&
 		 int( frameX ) < pc.viewport.x + pc.viewport.z &&
 		 int( logicalY ) < pc.viewport.y + pc.viewport.w ) {

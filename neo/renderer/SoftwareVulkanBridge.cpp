@@ -21,6 +21,7 @@ This file is part of the idTech 4 software renderer source code
 #include "SoftwareVulkanBridge.h"
 #include "Software2DComposite_spv.h"
 #include "SoftwareHybridComposite_spv.h"
+#include "SoftwareOverlayRaster_spv.h"
 #include "SoftwareRayQueryShadow_spv.h"
 
 /*
@@ -104,7 +105,8 @@ struct swVkHybridPushConstants_t {
 	uint32_t overlayEnabled;
 	uint32_t lightCount;
 	uint32_t shadowEnabled;
-	uint32_t pad[3];
+	uint32_t overlayOnly;
+	uint32_t pad[2];
 	float viewOrigin[4];
 };
 
@@ -112,6 +114,18 @@ struct swVk2DPushConstants_t {
 	uint32_t src[4];		// offset, width, height, clear overlay
 	uint32_t frame[4];		// width, height, unused, unused
 	int32_t viewport[4];	// x, y, presentWidth, presentHeight in Doom's bottom-left frame space
+	uint32_t targetFrame;
+	uint32_t pad[3];
+};
+
+struct swVkOverlayPushConstants_t {
+	uint32_t tri[4];		// index, clear, dispatch width, dispatch height
+	uint32_t dims[4];		// source width, source height, frame width, frame height
+	int32_t viewport[4];	// x, y, presentWidth, presentHeight
+	int32_t dispatch[4];	// x, y, width, height
+	uint32_t textureCount;
+	uint32_t targetFrame;
+	uint32_t pad[2];
 };
 
 struct swVk2DJob_t {
@@ -179,6 +193,8 @@ public:
 
 	bool BlitView( const viewDef_t *viewDef, const unsigned int *bgra, int width, int height, int presentWidth, int presentHeight );
 	bool CompositeHybridGBuffer( const viewDef_t *viewDef, const swHybridGBufferUpload_t &gbuffer, int width, int height, int presentWidth, int presentHeight );
+	bool UpdateHybridTextures( const swHybridTextureInfo_t *textureInfos, int textureInfoCount, const unsigned int *textureTexels, int textureTexelCount, unsigned int textureGeneration );
+	bool QueueHybridOverlayTriangles( const viewDef_t *viewDef, const swHybridOverlayTri_t *tris, int triCount, int width, int height, int presentWidth, int presentHeight );
 	bool ReadView( const viewDef_t *viewDef, unsigned int *bgra, int width, int height ) const;
 	bool PresentFrame();
 	bool RayQueryAvailable();
@@ -197,10 +213,12 @@ private:
 	bool CreateSwapchain();
 	bool CreateCommandObjects();
 	bool Create2DPipeline();
+	bool CreateOverlayPipeline();
 	bool CreateHybridPipeline();
 	bool CreateShadowPipeline();
 	bool EnsureUploadBuffer( int requiredWidth, int requiredHeight );
 	bool Ensure2DBuffers( int sourcePixelCount );
+	bool EnsureOverlayBuffers( int triCount );
 	bool EnsureHybridBuffers( int requiredWidth, int requiredHeight, int textureInfoCount, int textureTexelCount, int lightCount );
 	bool EnsureShadowBuffers( int width, int height );
 	bool EnsureFrameBuffer();
@@ -217,6 +235,7 @@ private:
 	void DestroyRayQueryTlas();
 	void DestroyRayQueryScene();
 	void Destroy2DPipeline();
+	void DestroyOverlayPipeline();
 	void DestroyShadowPipeline();
 	void DestroyHybridPipeline();
 	void DestroyHybridBuffers();
@@ -229,13 +248,16 @@ private:
 	void BeginFrame();
 	void Clear2DJobs();
 	bool Queue2DOverlayBlit( const viewDef_t *viewDef, const unsigned int *bgra, int width, int height, int presentWidth, int presentHeight );
-	void Update2DDescriptorSet();
-	bool Record2DCompositeCommands();
+	void Update2DDescriptorSet( bool targetFrame );
+	void UpdateOverlayDescriptorSet( bool targetFrame );
+	bool Record2DCompositeCommands( bool targetFrame );
+	bool RecordOverlayRasterCommands( bool targetFrame );
 	void DestroySwapchain();
 	void DestroyUploadBuffer();
 	void LogFailure( const char *text );
 	void UpdateHybridDescriptorSet();
-	bool RecordHybridCompositeCommands();
+	bool RecordHybridCompositeCommands( bool outputForCompute );
+	void RecordHybridFrameTransferBarrier();
 
 	bool DeviceHasExtension( VkPhysicalDevice device, const char *name ) const;
 	bool QueryRayQuerySupport( VkPhysicalDevice device ) const;
@@ -254,6 +276,7 @@ private:
 	bool frameDirty;
 	bool hybridFrameDirty;
 	bool hybridOverlayDirty;
+	bool hybridOverlayOnly;
 
 	int frameWidth;
 	int frameHeight;
@@ -273,6 +296,13 @@ private:
 	float hybridViewOrigin[3];
 	idList<unsigned int> hybrid2DSourcePixels;
 	idList<swVk2DJob_t> hybrid2DJobs;
+	idList<swHybridOverlayTri_t> hybridOverlayTris;
+	int hybridOverlaySourceWidth;
+	int hybridOverlaySourceHeight;
+	int hybridOverlayPresentWidth;
+	int hybridOverlayPresentHeight;
+	int hybridOverlayViewportX;
+	int hybridOverlayViewportY;
 
 	VkInstance instance;
 	VkSurfaceKHR surface;
@@ -309,6 +339,7 @@ private:
 	swVkBuffer_t hybridFrameBuffer;
 	swVkBuffer_t hybridOverlayBuffer;
 	swVkBuffer_t hybrid2DSourceBuffer;
+	swVkBuffer_t hybridOverlayTriBuffer;
 	swVkBuffer_t hybridTextureInfoBuffer;
 	swVkBuffer_t hybridTextureTexelBuffer;
 	swVkBuffer_t hybridWorldPositionBuffer;
@@ -335,6 +366,13 @@ private:
 	VkPipelineLayout twoDPipelineLayout;
 	VkPipeline twoDPipeline;
 	VkShaderModule twoDShaderModule;
+
+	VkDescriptorSetLayout overlayDescriptorSetLayout;
+	VkDescriptorPool overlayDescriptorPool;
+	VkDescriptorSet overlayDescriptorSet;
+	VkPipelineLayout overlayPipelineLayout;
+	VkPipeline overlayPipeline;
+	VkShaderModule overlayShaderModule;
 
 	VkAccelerationStructureKHR tlas;
 	bool rayQuerySceneReady;
@@ -369,6 +407,7 @@ idSoftwareVulkanBridge::idSoftwareVulkanBridge() {
 	frameDirty = false;
 	hybridFrameDirty = false;
 	hybridOverlayDirty = false;
+	hybridOverlayOnly = false;
 	frameWidth = 0;
 	frameHeight = 0;
 	hybridWidth = 0;
@@ -384,6 +423,12 @@ idSoftwareVulkanBridge::idSoftwareVulkanBridge() {
 	hybridLightCount = 0;
 	hybridShadowEnabled = false;
 	hybridViewOrigin[0] = hybridViewOrigin[1] = hybridViewOrigin[2] = 0.0f;
+	hybridOverlaySourceWidth = 0;
+	hybridOverlaySourceHeight = 0;
+	hybridOverlayPresentWidth = 0;
+	hybridOverlayPresentHeight = 0;
+	hybridOverlayViewportX = 0;
+	hybridOverlayViewportY = 0;
 
 	instance = VK_NULL_HANDLE;
 	surface = VK_NULL_HANDLE;
@@ -420,6 +465,13 @@ idSoftwareVulkanBridge::idSoftwareVulkanBridge() {
 	twoDPipelineLayout = VK_NULL_HANDLE;
 	twoDPipeline = VK_NULL_HANDLE;
 	twoDShaderModule = VK_NULL_HANDLE;
+
+	overlayDescriptorSetLayout = VK_NULL_HANDLE;
+	overlayDescriptorPool = VK_NULL_HANDLE;
+	overlayDescriptorSet = VK_NULL_HANDLE;
+	overlayPipelineLayout = VK_NULL_HANDLE;
+	overlayPipeline = VK_NULL_HANDLE;
+	overlayShaderModule = VK_NULL_HANDLE;
 
 	tlas = VK_NULL_HANDLE;
 	rayQuerySceneReady = false;
@@ -470,7 +522,7 @@ bool idSoftwareVulkanBridge::EnsureInitialized() {
 		return false;
 	}
 
-	if ( !CreateInstance() || !CreateSurface() || !PickPhysicalDevice() || !CreateDevice() || !CreateSwapchain() || !CreateCommandObjects() || !Create2DPipeline() || !CreateHybridPipeline() || !CreateShadowPipeline() ) {
+	if ( !CreateInstance() || !CreateSurface() || !PickPhysicalDevice() || !CreateDevice() || !CreateSwapchain() || !CreateCommandObjects() || !Create2DPipeline() || !CreateOverlayPipeline() || !CreateHybridPipeline() || !CreateShadowPipeline() ) {
 		Shutdown();
 		failed = true;
 		return false;
@@ -1103,6 +1155,100 @@ bool idSoftwareVulkanBridge::Create2DPipeline() {
 	return true;
 }
 
+bool idSoftwareVulkanBridge::CreateOverlayPipeline() {
+	VkDescriptorSetLayoutBinding bindings[5];
+	memset( bindings, 0, sizeof( bindings ) );
+	for ( uint32_t i = 0; i < 5; i++ ) {
+		bindings[i].binding = i;
+		bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		bindings[i].descriptorCount = 1;
+		bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	}
+
+	VkDescriptorSetLayoutCreateInfo layoutInfo;
+	memset( &layoutInfo, 0, sizeof( layoutInfo ) );
+	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	layoutInfo.bindingCount = 5;
+	layoutInfo.pBindings = bindings;
+	if ( vkCreateDescriptorSetLayout( device, &layoutInfo, NULL, &overlayDescriptorSetLayout ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateDescriptorSetLayout overlay failed" );
+		return false;
+	}
+
+	VkPushConstantRange pushRange;
+	memset( &pushRange, 0, sizeof( pushRange ) );
+	pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	pushRange.offset = 0;
+	pushRange.size = sizeof( swVkOverlayPushConstants_t );
+
+	VkPipelineLayoutCreateInfo pipelineLayoutInfo;
+	memset( &pipelineLayoutInfo, 0, sizeof( pipelineLayoutInfo ) );
+	pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	pipelineLayoutInfo.setLayoutCount = 1;
+	pipelineLayoutInfo.pSetLayouts = &overlayDescriptorSetLayout;
+	pipelineLayoutInfo.pushConstantRangeCount = 1;
+	pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+	if ( vkCreatePipelineLayout( device, &pipelineLayoutInfo, NULL, &overlayPipelineLayout ) != VK_SUCCESS ) {
+		LogFailure( "vkCreatePipelineLayout overlay failed" );
+		return false;
+	}
+
+	VkShaderModuleCreateInfo shaderInfo;
+	memset( &shaderInfo, 0, sizeof( shaderInfo ) );
+	shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+	shaderInfo.codeSize = swOverlayRasterCompSpvSize;
+	shaderInfo.pCode = swOverlayRasterCompSpv;
+	if ( vkCreateShaderModule( device, &shaderInfo, NULL, &overlayShaderModule ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateShaderModule overlay failed" );
+		return false;
+	}
+
+	VkPipelineShaderStageCreateInfo stageInfo;
+	memset( &stageInfo, 0, sizeof( stageInfo ) );
+	stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+	stageInfo.module = overlayShaderModule;
+	stageInfo.pName = "main";
+
+	VkComputePipelineCreateInfo pipelineInfo;
+	memset( &pipelineInfo, 0, sizeof( pipelineInfo ) );
+	pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+	pipelineInfo.stage = stageInfo;
+	pipelineInfo.layout = overlayPipelineLayout;
+	if ( vkCreateComputePipelines( device, VK_NULL_HANDLE, 1, &pipelineInfo, NULL, &overlayPipeline ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateComputePipelines overlay failed" );
+		return false;
+	}
+
+	VkDescriptorPoolSize poolSize;
+	memset( &poolSize, 0, sizeof( poolSize ) );
+	poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	poolSize.descriptorCount = 5;
+
+	VkDescriptorPoolCreateInfo poolInfo;
+	memset( &poolInfo, 0, sizeof( poolInfo ) );
+	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	poolInfo.maxSets = 1;
+	poolInfo.poolSizeCount = 1;
+	poolInfo.pPoolSizes = &poolSize;
+	if ( vkCreateDescriptorPool( device, &poolInfo, NULL, &overlayDescriptorPool ) != VK_SUCCESS ) {
+		LogFailure( "vkCreateDescriptorPool overlay failed" );
+		return false;
+	}
+
+	VkDescriptorSetAllocateInfo setInfo;
+	memset( &setInfo, 0, sizeof( setInfo ) );
+	setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	setInfo.descriptorPool = overlayDescriptorPool;
+	setInfo.descriptorSetCount = 1;
+	setInfo.pSetLayouts = &overlayDescriptorSetLayout;
+	if ( vkAllocateDescriptorSets( device, &setInfo, &overlayDescriptorSet ) != VK_SUCCESS ) {
+		LogFailure( "vkAllocateDescriptorSets overlay failed" );
+		return false;
+	}
+	return true;
+}
+
 bool idSoftwareVulkanBridge::CreateHybridPipeline() {
 	VkDescriptorSetLayoutBinding bindings[16];
 	memset( bindings, 0, sizeof( bindings ) );
@@ -1396,6 +1542,18 @@ bool idSoftwareVulkanBridge::Ensure2DBuffers( int sourcePixelCount ) {
 	return true;
 }
 
+bool idSoftwareVulkanBridge::EnsureOverlayBuffers( int triCount ) {
+	triCount = Max( 1, triCount );
+	const VkDeviceSize triSize = static_cast<VkDeviceSize>( triCount ) * sizeof( swHybridOverlayTri_t );
+	const VkMemoryPropertyFlags hostMemory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	if ( hybridOverlayTriBuffer.buffer == VK_NULL_HANDLE || hybridOverlayTriBuffer.size < triSize ) {
+		if ( !CreateBuffer( triSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridOverlayTriBuffer ) ) {
+			return false;
+		}
+	}
+	return true;
+}
+
 bool idSoftwareVulkanBridge::EnsureHybridBuffers( int requiredWidth, int requiredHeight, int textureInfoCount, int textureTexelCount, int lightCount ) {
 	if ( requiredWidth <= 0 || requiredHeight <= 0 || frameWidth <= 0 || frameHeight <= 0 ) {
 		return false;
@@ -1493,8 +1651,9 @@ bool idSoftwareVulkanBridge::EnsureHybridBuffers( int requiredWidth, int require
 	return true;
 }
 
-void idSoftwareVulkanBridge::Update2DDescriptorSet() {
-	if ( twoDDescriptorSet == VK_NULL_HANDLE || hybrid2DSourceBuffer.buffer == VK_NULL_HANDLE || hybridOverlayBuffer.buffer == VK_NULL_HANDLE ) {
+void idSoftwareVulkanBridge::Update2DDescriptorSet( bool targetFrame ) {
+	swVkBuffer_t &targetBuffer = targetFrame ? hybridFrameBuffer : hybridOverlayBuffer;
+	if ( twoDDescriptorSet == VK_NULL_HANDLE || hybrid2DSourceBuffer.buffer == VK_NULL_HANDLE || targetBuffer.buffer == VK_NULL_HANDLE ) {
 		return;
 	}
 
@@ -1502,8 +1661,8 @@ void idSoftwareVulkanBridge::Update2DDescriptorSet() {
 	memset( infos, 0, sizeof( infos ) );
 	infos[0].buffer = hybrid2DSourceBuffer.buffer;
 	infos[0].range = hybrid2DSourceBuffer.size;
-	infos[1].buffer = hybridOverlayBuffer.buffer;
-	infos[1].range = hybridOverlayBuffer.size;
+	infos[1].buffer = targetBuffer.buffer;
+	infos[1].range = targetBuffer.size;
 
 	VkWriteDescriptorSet writes[2];
 	memset( writes, 0, sizeof( writes ) );
@@ -1516,6 +1675,43 @@ void idSoftwareVulkanBridge::Update2DDescriptorSet() {
 		writes[i].pBufferInfo = &infos[i];
 	}
 	vkUpdateDescriptorSets( device, 2, writes, 0, NULL );
+}
+
+void idSoftwareVulkanBridge::UpdateOverlayDescriptorSet( bool targetFrame ) {
+	swVkBuffer_t &targetBuffer = targetFrame ? hybridFrameBuffer : hybridOverlayBuffer;
+	if ( overlayDescriptorSet == VK_NULL_HANDLE ||
+		 hybridOverlayTriBuffer.buffer == VK_NULL_HANDLE ||
+		 hybridDepthBuffer.buffer == VK_NULL_HANDLE ||
+		 targetBuffer.buffer == VK_NULL_HANDLE ||
+		 hybridTextureInfoBuffer.buffer == VK_NULL_HANDLE ||
+		 hybridTextureTexelBuffer.buffer == VK_NULL_HANDLE ) {
+		return;
+	}
+
+	VkDescriptorBufferInfo infos[5];
+	memset( infos, 0, sizeof( infos ) );
+	infos[0].buffer = hybridOverlayTriBuffer.buffer;
+	infos[0].range = hybridOverlayTriBuffer.size;
+	infos[1].buffer = hybridDepthBuffer.buffer;
+	infos[1].range = hybridDepthBuffer.size;
+	infos[2].buffer = targetBuffer.buffer;
+	infos[2].range = targetBuffer.size;
+	infos[3].buffer = hybridTextureInfoBuffer.buffer;
+	infos[3].range = hybridTextureInfoBuffer.size;
+	infos[4].buffer = hybridTextureTexelBuffer.buffer;
+	infos[4].range = hybridTextureTexelBuffer.size;
+
+	VkWriteDescriptorSet writes[5];
+	memset( writes, 0, sizeof( writes ) );
+	for ( uint32_t i = 0; i < 5; i++ ) {
+		writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[i].dstSet = overlayDescriptorSet;
+		writes[i].dstBinding = i;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		writes[i].pBufferInfo = &infos[i];
+	}
+	vkUpdateDescriptorSets( device, 5, writes, 0, NULL );
 }
 
 void idSoftwareVulkanBridge::UpdateHybridDescriptorSet() {
@@ -2282,11 +2478,19 @@ void idSoftwareVulkanBridge::BeginFrame() {
 	frameDirty = false;
 	hybridFrameDirty = false;
 	hybridOverlayDirty = false;
+	hybridOverlayOnly = false;
 }
 
 void idSoftwareVulkanBridge::Clear2DJobs() {
 	hybrid2DSourcePixels.SetNum( 0, false );
 	hybrid2DJobs.SetNum( 0, false );
+	hybridOverlayTris.SetNum( 0, false );
+	hybridOverlaySourceWidth = 0;
+	hybridOverlaySourceHeight = 0;
+	hybridOverlayPresentWidth = 0;
+	hybridOverlayPresentHeight = 0;
+	hybridOverlayViewportX = 0;
+	hybridOverlayViewportY = 0;
 }
 
 bool idSoftwareVulkanBridge::Queue2DOverlayBlit( const viewDef_t *viewDef, const unsigned int *bgra, int srcWidth, int srcHeight, int dstWidth, int dstHeight ) {
@@ -2308,6 +2512,62 @@ bool idSoftwareVulkanBridge::Queue2DOverlayBlit( const viewDef_t *viewDef, const
 	job.presentWidth = dstWidth;
 	job.presentHeight = dstHeight;
 
+	hybridOverlayDirty = true;
+	frameDirty = true;
+	return true;
+}
+
+bool idSoftwareVulkanBridge::QueueHybridOverlayTriangles( const viewDef_t *viewDef, const swHybridOverlayTri_t *tris, int triCount, int srcWidth, int srcHeight, int dstWidth, int dstHeight ) {
+	if ( !viewDef || !tris || triCount <= 0 || srcWidth <= 0 || srcHeight <= 0 || dstWidth <= 0 || dstHeight <= 0 ) {
+		return false;
+	}
+	if ( !EnsureInitialized() || overlayPipeline == VK_NULL_HANDLE ) {
+		return false;
+	}
+	if ( !hybridFrameDirty ) {
+		if ( !EnsureFrameBuffer() || frameBegun ) {
+			return false;
+		}
+		BeginFrame();
+		hybridWidth = srcWidth;
+		hybridHeight = srcHeight;
+		hybridPresentWidth = dstWidth;
+		hybridPresentHeight = dstHeight;
+		hybridViewportX = viewDef->viewport.x1;
+		hybridViewportY = viewDef->viewport.y1;
+		hybridDebugView = 0;
+		hybridTextureCount = Max( 1, hybridTextureCount );
+		hybridTextureTexelCount = Max( 1, hybridTextureTexelCount );
+		hybridLightCount = 0;
+		hybridShadowEnabled = false;
+		hybridViewOrigin[0] = 0.0f;
+		hybridViewOrigin[1] = 0.0f;
+		hybridViewOrigin[2] = 0.0f;
+		hybridOverlayOnly = true;
+		hybridFrameDirty = true;
+	}
+
+	const int oldCount = hybridOverlayTris.Num();
+	hybridOverlayTris.SetNum( oldCount + triCount, false );
+	for ( int i = 0; i < triCount; i++ ) {
+		swHybridOverlayTri_t &dst = hybridOverlayTris[oldCount + i];
+		dst = tris[i];
+		dst.source[0] = srcWidth;
+		dst.source[1] = srcHeight;
+		dst.source[2] = 0;
+		dst.source[3] = 0;
+		dst.viewport[0] = viewDef->viewport.x1;
+		dst.viewport[1] = viewDef->viewport.y1;
+		dst.viewport[2] = dstWidth;
+		dst.viewport[3] = dstHeight;
+	}
+
+	hybridOverlaySourceWidth = srcWidth;
+	hybridOverlaySourceHeight = srcHeight;
+	hybridOverlayPresentWidth = dstWidth;
+	hybridOverlayPresentHeight = dstHeight;
+	hybridOverlayViewportX = viewDef->viewport.x1;
+	hybridOverlayViewportY = viewDef->viewport.y1;
 	hybridOverlayDirty = true;
 	frameDirty = true;
 	return true;
@@ -2426,8 +2686,56 @@ bool idSoftwareVulkanBridge::CompositeHybridGBuffer( const viewDef_t *viewDef, c
 	hybridViewOrigin[0] = viewDef->renderView.vieworg[0];
 	hybridViewOrigin[1] = viewDef->renderView.vieworg[1];
 	hybridViewOrigin[2] = viewDef->renderView.vieworg[2];
+	hybridOverlayOnly = false;
 	hybridFrameDirty = true;
 	frameDirty = true;
+	return true;
+}
+
+bool idSoftwareVulkanBridge::UpdateHybridTextures( const swHybridTextureInfo_t *textureInfos, int textureInfoCount, const unsigned int *textureTexels, int textureTexelCount, unsigned int textureGeneration ) {
+	if ( !textureInfos || textureInfoCount <= 0 || !textureTexels || textureTexelCount <= 0 ) {
+		return false;
+	}
+	if ( !EnsureInitialized() ) {
+		return false;
+	}
+	if ( hybridFrameDirty && ( hybridWidth <= 0 || hybridHeight <= 0 ||
+		 !EnsureHybridBuffers( hybridWidth, hybridHeight, textureInfoCount, textureTexelCount, Max( 1, hybridLightCount ) ) ) ) {
+		return false;
+	}
+	if ( hybridUploadedTextureGeneration == textureGeneration &&
+		 hybridTextureCount == textureInfoCount &&
+		 hybridTextureTexelCount == textureTexelCount ) {
+		if ( hybridFrameDirty ) {
+			UpdateHybridDescriptorSet();
+		}
+		return true;
+	}
+
+	const VkDeviceSize textureInfoSize = static_cast<VkDeviceSize>( textureInfoCount ) * sizeof( swHybridTextureInfo_t );
+	const VkDeviceSize textureTexelSize = static_cast<VkDeviceSize>( textureTexelCount ) * sizeof( uint32_t );
+	const VkMemoryPropertyFlags hostMemory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	if ( hybridTextureInfoBuffer.buffer == VK_NULL_HANDLE || hybridTextureInfoBuffer.size < textureInfoSize ) {
+		if ( !CreateBuffer( textureInfoSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridTextureInfoBuffer ) ) {
+			return false;
+		}
+	}
+	if ( hybridTextureTexelBuffer.buffer == VK_NULL_HANDLE || hybridTextureTexelBuffer.size < textureTexelSize ) {
+		if ( !CreateBuffer( textureTexelSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridTextureTexelBuffer ) ) {
+			return false;
+		}
+	}
+	if ( !UploadBuffer( hybridTextureInfoBuffer, textureInfos, textureInfoSize, "vkMapMemory hybrid texture infos failed" ) ||
+		 !UploadBuffer( hybridTextureTexelBuffer, textureTexels, textureTexelSize, "vkMapMemory hybrid texture texels failed" ) ) {
+		return false;
+	}
+
+	hybridTextureCount = textureInfoCount;
+	hybridTextureTexelCount = textureTexelCount;
+	hybridUploadedTextureGeneration = textureGeneration;
+	if ( hybridFrameDirty ) {
+		UpdateHybridDescriptorSet();
+	}
 	return true;
 }
 
@@ -2436,6 +2744,9 @@ bool idSoftwareVulkanBridge::ReadView( const viewDef_t *viewDef, unsigned int *b
 		return false;
 	}
 	if ( initialized && hybridFrameDirty ) {
+		if ( hybridOverlayOnly && !frameDirty ) {
+			return false;
+		}
 		memset( bgra, 0, width * height * sizeof( bgra[0] ) );
 		return true;
 	}
@@ -2465,22 +2776,22 @@ bool idSoftwareVulkanBridge::ReadView( const viewDef_t *viewDef, unsigned int *b
 	return true;
 }
 
-bool idSoftwareVulkanBridge::Record2DCompositeCommands() {
+bool idSoftwareVulkanBridge::Record2DCompositeCommands( bool targetFrame ) {
 	if ( hybrid2DJobs.Num() <= 0 ) {
 		return true;
 	}
 	if ( twoDDescriptorSet == VK_NULL_HANDLE || twoDPipeline == VK_NULL_HANDLE || twoDPipelineLayout == VK_NULL_HANDLE ||
-		 hybrid2DSourceBuffer.buffer == VK_NULL_HANDLE || hybridOverlayBuffer.buffer == VK_NULL_HANDLE ) {
+		 hybrid2DSourceBuffer.buffer == VK_NULL_HANDLE || ( targetFrame ? hybridFrameBuffer.buffer : hybridOverlayBuffer.buffer ) == VK_NULL_HANDLE ) {
 		return false;
 	}
 
 	VkMemoryBarrier inputBarrier;
 	memset( &inputBarrier, 0, sizeof( inputBarrier ) );
 	inputBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-	inputBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+	inputBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
 	inputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
 	vkCmdPipelineBarrier( commandBuffer,
-		VK_PIPELINE_STAGE_HOST_BIT,
+		VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		0, 1, &inputBarrier, 0, NULL, 0, NULL );
 
@@ -2494,13 +2805,14 @@ bool idSoftwareVulkanBridge::Record2DCompositeCommands() {
 		push.src[0] = static_cast<uint32_t>( job.sourceOffset );
 		push.src[1] = static_cast<uint32_t>( job.sourceWidth );
 		push.src[2] = static_cast<uint32_t>( job.sourceHeight );
-		push.src[3] = ( i == 0 ) ? 1u : 0u;
+		push.src[3] = 0u;
 		push.frame[0] = static_cast<uint32_t>( frameWidth );
 		push.frame[1] = static_cast<uint32_t>( frameHeight );
 		push.viewport[0] = job.viewportX;
 		push.viewport[1] = job.viewportY;
 		push.viewport[2] = job.presentWidth;
 		push.viewport[3] = job.presentHeight;
+		push.targetFrame = targetFrame ? 1u : 0u;
 
 		vkCmdPushConstants( commandBuffer, twoDPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
 		const uint32_t dispatchWidth = ( i == 0 ) ? static_cast<uint32_t>( frameWidth ) : static_cast<uint32_t>( job.presentWidth );
@@ -2520,7 +2832,119 @@ bool idSoftwareVulkanBridge::Record2DCompositeCommands() {
 	return true;
 }
 
-bool idSoftwareVulkanBridge::RecordHybridCompositeCommands() {
+bool idSoftwareVulkanBridge::RecordOverlayRasterCommands( bool targetFrame ) {
+	if ( !hybridOverlayDirty ) {
+		return true;
+	}
+	if ( hybridOverlayTris.Num() <= 0 ) {
+		return true;
+	}
+	if ( overlayDescriptorSet == VK_NULL_HANDLE || overlayPipeline == VK_NULL_HANDLE || overlayPipelineLayout == VK_NULL_HANDLE ||
+		 hybridOverlayTriBuffer.buffer == VK_NULL_HANDLE || ( targetFrame ? hybridFrameBuffer.buffer : hybridOverlayBuffer.buffer ) == VK_NULL_HANDLE ) {
+		return false;
+	}
+
+	VkMemoryBarrier inputBarrier;
+	memset( &inputBarrier, 0, sizeof( inputBarrier ) );
+	inputBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	inputBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+	inputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+	vkCmdPipelineBarrier( commandBuffer,
+		VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		0, 1, &inputBarrier, 0, NULL, 0, NULL );
+
+	vkCmdBindPipeline( commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, overlayPipeline );
+	vkCmdBindDescriptorSets( commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, overlayPipelineLayout, 0, 1, &overlayDescriptorSet, 0, NULL );
+
+	swVkOverlayPushConstants_t push;
+	if ( !targetFrame ) {
+		memset( &push, 0, sizeof( push ) );
+		push.tri[0] = 0;
+		push.tri[1] = 1;
+		push.tri[2] = static_cast<uint32_t>( Max( 1, frameWidth ) );
+		push.tri[3] = static_cast<uint32_t>( Max( 1, frameHeight ) );
+		push.dims[0] = static_cast<uint32_t>( Max( 1, hybridOverlaySourceWidth ) );
+		push.dims[1] = static_cast<uint32_t>( Max( 1, hybridOverlaySourceHeight ) );
+		push.dims[2] = static_cast<uint32_t>( Max( 1, frameWidth ) );
+		push.dims[3] = static_cast<uint32_t>( Max( 1, frameHeight ) );
+		push.dispatch[0] = 0;
+		push.dispatch[1] = 0;
+		push.dispatch[2] = frameWidth;
+		push.dispatch[3] = frameHeight;
+		push.textureCount = static_cast<uint32_t>( Max( 0, hybridTextureCount ) );
+		push.targetFrame = 0u;
+		vkCmdPushConstants( commandBuffer, overlayPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+		vkCmdDispatch( commandBuffer, ( static_cast<uint32_t>( frameWidth ) + 7u ) / 8u, ( static_cast<uint32_t>( frameHeight ) + 7u ) / 8u, 1 );
+
+		VkMemoryBarrier clearBarrier;
+		memset( &clearBarrier, 0, sizeof( clearBarrier ) );
+		clearBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+		clearBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		clearBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+		vkCmdPipelineBarrier( commandBuffer,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			0, 1, &clearBarrier, 0, NULL, 0, NULL );
+	}
+
+	for ( int i = 0; i < hybridOverlayTris.Num(); i++ ) {
+		const swHybridOverlayTri_t &tri = hybridOverlayTris[i];
+		const int sourceWidth = Max( 1, tri.source[0] );
+		const int sourceHeight = Max( 1, tri.source[1] );
+		const int viewportX = tri.viewport[0];
+		const int viewportY = tri.viewport[1];
+		const int presentW = Max( 1, tri.viewport[2] );
+		const int presentH = Max( 1, tri.viewport[3] );
+		const int minFrameX = viewportX + ( tri.bounds[0] * presentW ) / sourceWidth;
+		const int minFrameY = viewportY + ( tri.bounds[1] * presentH ) / sourceHeight;
+		const int maxFrameX = viewportX + ( ( tri.bounds[2] + 1 ) * presentW + sourceWidth - 1 ) / sourceWidth;
+		const int maxFrameY = viewportY + ( ( tri.bounds[3] + 1 ) * presentH + sourceHeight - 1 ) / sourceHeight;
+		const int x0 = Max( 0, Min( frameWidth - 1, minFrameX ) );
+		const int y0 = Max( 0, Min( frameHeight - 1, minFrameY ) );
+		const int x1 = Max( 0, Min( frameWidth, maxFrameX ) );
+		const int y1 = Max( 0, Min( frameHeight, maxFrameY ) );
+		if ( x1 <= x0 || y1 <= y0 ) {
+			continue;
+		}
+
+		memset( &push, 0, sizeof( push ) );
+		push.tri[0] = static_cast<uint32_t>( i );
+		push.tri[1] = 0;
+		push.tri[2] = static_cast<uint32_t>( x1 - x0 );
+		push.tri[3] = static_cast<uint32_t>( y1 - y0 );
+		push.dims[0] = static_cast<uint32_t>( sourceWidth );
+		push.dims[1] = static_cast<uint32_t>( sourceHeight );
+		push.dims[2] = static_cast<uint32_t>( Max( 1, frameWidth ) );
+		push.dims[3] = static_cast<uint32_t>( Max( 1, frameHeight ) );
+		push.viewport[0] = viewportX;
+		push.viewport[1] = viewportY;
+		push.viewport[2] = presentW;
+		push.viewport[3] = presentH;
+		push.dispatch[0] = x0;
+		push.dispatch[1] = y0;
+		push.dispatch[2] = x1 - x0;
+		push.dispatch[3] = y1 - y0;
+		push.textureCount = static_cast<uint32_t>( Max( 0, hybridTextureCount ) );
+		push.targetFrame = targetFrame ? 1u : 0u;
+
+		vkCmdPushConstants( commandBuffer, overlayPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+		vkCmdDispatch( commandBuffer, ( static_cast<uint32_t>( x1 - x0 ) + 7u ) / 8u, ( static_cast<uint32_t>( y1 - y0 ) + 7u ) / 8u, 1 );
+
+		VkMemoryBarrier triBarrier;
+		memset( &triBarrier, 0, sizeof( triBarrier ) );
+		triBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+		triBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		triBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+		vkCmdPipelineBarrier( commandBuffer,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			0, 1, &triBarrier, 0, NULL, 0, NULL );
+	}
+	return true;
+}
+
+bool idSoftwareVulkanBridge::RecordHybridCompositeCommands( bool outputForCompute ) {
 	if ( !hybridFrameDirty || hybridDescriptorSet == VK_NULL_HANDLE || hybridPipeline == VK_NULL_HANDLE || hybridFrameBuffer.buffer == VK_NULL_HANDLE ) {
 		return false;
 	}
@@ -2547,9 +2971,10 @@ bool idSoftwareVulkanBridge::RecordHybridCompositeCommands() {
 	push.viewport[3] = hybridPresentHeight;
 	push.debugView = static_cast<uint32_t>( hybridDebugView );
 	push.textureCount = static_cast<uint32_t>( Max( 0, hybridTextureCount ) );
-	push.overlayEnabled = hybridOverlayDirty ? 1u : 0u;
+	push.overlayEnabled = outputForCompute ? 0u : ( hybridOverlayDirty ? 1u : 0u );
 	push.lightCount = static_cast<uint32_t>( Max( 0, hybridLightCount ) );
 	push.shadowEnabled = hybridShadowEnabled ? 1u : 0u;
+	push.overlayOnly = hybridOverlayOnly ? 1u : 0u;
 	push.viewOrigin[0] = hybridViewOrigin[0];
 	push.viewOrigin[1] = hybridViewOrigin[1];
 	push.viewOrigin[2] = hybridViewOrigin[2];
@@ -2564,12 +2989,24 @@ bool idSoftwareVulkanBridge::RecordHybridCompositeCommands() {
 	memset( &outputBarrier, 0, sizeof( outputBarrier ) );
 	outputBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
 	outputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	outputBarrier.dstAccessMask = outputForCompute ? ( VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT ) : VK_ACCESS_TRANSFER_READ_BIT;
+	vkCmdPipelineBarrier( commandBuffer,
+		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		outputForCompute ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT,
+		0, 1, &outputBarrier, 0, NULL, 0, NULL );
+	return true;
+}
+
+void idSoftwareVulkanBridge::RecordHybridFrameTransferBarrier() {
+	VkMemoryBarrier outputBarrier;
+	memset( &outputBarrier, 0, sizeof( outputBarrier ) );
+	outputBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	outputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
 	outputBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 	vkCmdPipelineBarrier( commandBuffer,
 		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		VK_PIPELINE_STAGE_TRANSFER_BIT,
 		0, 1, &outputBarrier, 0, NULL, 0, NULL );
-	return true;
 }
 
 bool idSoftwareVulkanBridge::PresentFrame() {
@@ -2584,8 +3021,12 @@ bool idSoftwareVulkanBridge::PresentFrame() {
 		if ( !EnsureHybridBuffers( hybridWidth, hybridHeight, hybridTextureCount, hybridTextureTexelCount, Max( 1, hybridLightCount ) ) ) {
 			return false;
 		}
+		UpdateHybridDescriptorSet();
 		if ( hybridOverlayDirty ) {
-			if ( !Ensure2DBuffers( hybrid2DSourcePixels.Num() ) ) {
+			if ( !EnsureOverlayBuffers( hybridOverlayTris.Num() ) ) {
+				return false;
+			}
+			if ( hybrid2DSourcePixels.Num() > 0 && !Ensure2DBuffers( hybrid2DSourcePixels.Num() ) ) {
 				return false;
 			}
 		}
@@ -2597,9 +3038,17 @@ bool idSoftwareVulkanBridge::PresentFrame() {
 	vkResetFences( device, 1, &inFlightFence );
 
 	if ( useHybridFrame && hybridOverlayDirty ) {
-		const VkDeviceSize sourceSize = static_cast<VkDeviceSize>( hybrid2DSourcePixels.Num() ) * sizeof( uint32_t );
-		if ( sourceSize <= 0 || !UploadBuffer( hybrid2DSourceBuffer, hybrid2DSourcePixels.Ptr(), sourceSize, "vkMapMemory 2D source failed" ) ) {
+		const swHybridOverlayTri_t dummyTri = {};
+		const VkDeviceSize triSize = static_cast<VkDeviceSize>( Max( 1, hybridOverlayTris.Num() ) ) * sizeof( swHybridOverlayTri_t );
+		const void *triData = hybridOverlayTris.Num() > 0 ? hybridOverlayTris.Ptr() : &dummyTri;
+		if ( !UploadBuffer( hybridOverlayTriBuffer, triData, triSize, "vkMapMemory overlay tris failed" ) ) {
 			return false;
+		}
+		if ( hybrid2DSourcePixels.Num() > 0 ) {
+			const VkDeviceSize sourceSize = static_cast<VkDeviceSize>( hybrid2DSourcePixels.Num() ) * sizeof( uint32_t );
+			if ( !UploadBuffer( hybrid2DSourceBuffer, hybrid2DSourcePixels.Ptr(), sourceSize, "vkMapMemory 2D source failed" ) ) {
+				return false;
+			}
 		}
 	} else if ( !useHybridFrame ) {
 		void *mapped = NULL;
@@ -2629,6 +3078,7 @@ bool idSoftwareVulkanBridge::PresentFrame() {
 		frameDirty = false;
 		hybridFrameDirty = false;
 		hybridOverlayDirty = false;
+		hybridOverlayOnly = false;
 		Clear2DJobs();
 		return false;
 	}
@@ -2648,14 +3098,24 @@ bool idSoftwareVulkanBridge::PresentFrame() {
 		return false;
 	}
 
-	if ( useHybridFrame && hybridOverlayDirty ) {
-		Update2DDescriptorSet();
-		if ( !Record2DCompositeCommands() ) {
-			return false;
-		}
-	}
-	if ( useHybridFrame && !RecordHybridCompositeCommands() ) {
+	const bool directHybridOverlay = useHybridFrame && hybridOverlayDirty;
+	if ( useHybridFrame && !RecordHybridCompositeCommands( directHybridOverlay ) ) {
 		return false;
+	}
+	if ( directHybridOverlay ) {
+		if ( hybridOverlayTris.Num() > 0 ) {
+			UpdateOverlayDescriptorSet( true );
+			if ( !RecordOverlayRasterCommands( true ) ) {
+				return false;
+			}
+		}
+		if ( hybrid2DSourcePixels.Num() > 0 ) {
+			Update2DDescriptorSet( true );
+			if ( !Record2DCompositeCommands( true ) ) {
+				return false;
+			}
+		}
+		RecordHybridFrameTransferBarrier();
 	}
 
 	VkImageMemoryBarrier toTransfer;
@@ -2749,6 +3209,7 @@ bool idSoftwareVulkanBridge::PresentFrame() {
 	frameDirty = false;
 	hybridFrameDirty = false;
 	hybridOverlayDirty = false;
+	hybridOverlayOnly = false;
 	Clear2DJobs();
 
 	if ( presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR ) {
@@ -2955,6 +3416,7 @@ void idSoftwareVulkanBridge::DestroyHybridBuffers() {
 	DestroyBuffer( hybridWorldPositionBuffer );
 	DestroyBuffer( hybridTextureTexelBuffer );
 	DestroyBuffer( hybridTextureInfoBuffer );
+	DestroyBuffer( hybridOverlayTriBuffer );
 	DestroyBuffer( hybrid2DSourceBuffer );
 	DestroyBuffer( hybridOverlayBuffer );
 	DestroyBuffer( hybridFrameBuffer );
@@ -2981,6 +3443,7 @@ void idSoftwareVulkanBridge::DestroyHybridBuffers() {
 	hybridShadowEnabled = false;
 	hybridFrameDirty = false;
 	hybridOverlayDirty = false;
+	hybridOverlayOnly = false;
 	Clear2DJobs();
 }
 
@@ -3008,6 +3471,31 @@ void idSoftwareVulkanBridge::Destroy2DPipeline() {
 	if ( twoDDescriptorSetLayout != VK_NULL_HANDLE ) {
 		vkDestroyDescriptorSetLayout( device, twoDDescriptorSetLayout, NULL );
 		twoDDescriptorSetLayout = VK_NULL_HANDLE;
+	}
+}
+
+void idSoftwareVulkanBridge::DestroyOverlayPipeline() {
+	DestroyBuffer( hybridOverlayTriBuffer );
+	if ( overlayPipeline != VK_NULL_HANDLE ) {
+		vkDestroyPipeline( device, overlayPipeline, NULL );
+		overlayPipeline = VK_NULL_HANDLE;
+	}
+	if ( overlayShaderModule != VK_NULL_HANDLE ) {
+		vkDestroyShaderModule( device, overlayShaderModule, NULL );
+		overlayShaderModule = VK_NULL_HANDLE;
+	}
+	if ( overlayPipelineLayout != VK_NULL_HANDLE ) {
+		vkDestroyPipelineLayout( device, overlayPipelineLayout, NULL );
+		overlayPipelineLayout = VK_NULL_HANDLE;
+	}
+	if ( overlayDescriptorPool != VK_NULL_HANDLE ) {
+		vkDestroyDescriptorPool( device, overlayDescriptorPool, NULL );
+		overlayDescriptorPool = VK_NULL_HANDLE;
+		overlayDescriptorSet = VK_NULL_HANDLE;
+	}
+	if ( overlayDescriptorSetLayout != VK_NULL_HANDLE ) {
+		vkDestroyDescriptorSetLayout( device, overlayDescriptorSetLayout, NULL );
+		overlayDescriptorSetLayout = VK_NULL_HANDLE;
 	}
 }
 
@@ -3087,6 +3575,7 @@ void idSoftwareVulkanBridge::Shutdown() {
 	DestroyUploadBuffer();
 	DestroyHybridPipeline();
 	Destroy2DPipeline();
+	DestroyOverlayPipeline();
 	DestroyShadowPipeline();
 	framePixels.Clear();
 	hybrid2DSourcePixels.Clear();
@@ -3095,6 +3584,7 @@ void idSoftwareVulkanBridge::Shutdown() {
 	frameDirty = false;
 	hybridFrameDirty = false;
 	hybridOverlayDirty = false;
+	hybridOverlayOnly = false;
 
 	if ( inFlightFence != VK_NULL_HANDLE ) {
 		vkDestroyFence( device, inFlightFence, NULL );
@@ -3153,6 +3643,7 @@ void idSoftwareVulkanBridge::Shutdown() {
 	hybridLightCount = 0;
 	hybridShadowEnabled = false;
 	hybridOverlayDirty = false;
+	hybridOverlayOnly = false;
 	twoDDescriptorSet = VK_NULL_HANDLE;
 
 	vkGetPhysicalDeviceFeatures2Local = NULL;
@@ -3170,6 +3661,14 @@ bool SWVulkan_BlitView( const viewDef_t *viewDef, const unsigned int *bgra, int 
 
 bool SWVulkan_CompositeHybridGBuffer( const viewDef_t *viewDef, const swHybridGBufferUpload_t &gbuffer, int width, int height, int presentWidth, int presentHeight ) {
 	return swVulkanBridge.CompositeHybridGBuffer( viewDef, gbuffer, width, height, presentWidth, presentHeight );
+}
+
+bool SWVulkan_UpdateHybridTextures( const swHybridTextureInfo_t *textureInfos, int textureInfoCount, const unsigned int *textureTexels, int textureTexelCount, unsigned int textureGeneration ) {
+	return swVulkanBridge.UpdateHybridTextures( textureInfos, textureInfoCount, textureTexels, textureTexelCount, textureGeneration );
+}
+
+bool SWVulkan_QueueHybridOverlayTriangles( const viewDef_t *viewDef, const swHybridOverlayTri_t *tris, int triCount, int width, int height, int presentWidth, int presentHeight ) {
+	return swVulkanBridge.QueueHybridOverlayTriangles( viewDef, tris, triCount, width, height, presentWidth, presentHeight );
 }
 
 bool SWVulkan_ReadView( const viewDef_t *viewDef, unsigned int *bgra, int width, int height ) {

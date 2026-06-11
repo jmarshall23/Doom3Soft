@@ -50,6 +50,11 @@ static const int SW_WRITE_COLOR = SW_WRITE_RED | SW_WRITE_GREEN | SW_WRITE_BLUE 
 static const int SW_WRITE_DYNAMIC = -1;
 static const long long SW_INT32_MIN = -2147483647LL - 1LL;
 static const long long SW_INT32_MAX = 2147483647LL;
+static const unsigned int SW_OVERLAY_FLAG_TEXTURE = BIT(0);
+static const unsigned int SW_OVERLAY_FLAG_COLOR_MOD = BIT(1);
+static const unsigned int SW_OVERLAY_FLAG_ALPHA_TEST = BIT(2);
+static const unsigned int SW_OVERLAY_FLAG_DEPTH_TEST = BIT(3);
+static const unsigned int SW_OVERLAY_FLAG_DEPTH_EQUAL = BIT(4);
 
 enum swBlendMode_t {
 	SW_BLEND_REPLACE,
@@ -366,6 +371,7 @@ private:
 	void WriteHybridDebugView();
 	void BuildHybridTextureUpload( swHybridGBufferUpload_t &gbuffer );
 	void BuildHybridLightUpload( const viewDef_t *viewDef, swHybridGBufferUpload_t &gbuffer );
+	void BuildHybridOverlayTriangles( idList<swHybridOverlayTri_t> &overlayTris ) const;
 	void RasterizeTiles();
 	void RasterizeTileRange( int firstTile, int endTile );
 	void RasterizeTile( int tileX, int tileY );
@@ -595,6 +601,9 @@ void idSoftwareRasterizer::ReadCurrentFramebuffer( const viewDef_t *viewDef ) {
 	qglReadPixels( viewDef->viewport.x1, viewDef->viewport.y1, width, height, GL_BGRA_EXT, GL_UNSIGNED_BYTE, colorBuffer.Ptr() );
 }
 
+#if defined( _MSC_VER )
+#pragma optimize( "", off )
+#endif
 void idSoftwareRasterizer::DrawView( const viewDef_t *viewDef ) {
 	if ( !viewDef ) {
 		return;
@@ -609,11 +618,14 @@ void idSoftwareRasterizer::DrawView( const viewDef_t *viewDef ) {
 	const float renderScale = is3DView ? idMath::ClampFloat( 0.01f, 1.0f, r_softwareRenderScale.GetFloat() ) : 1.0f;
 	const int renderWidth = Max( 1, idMath::Ftoi( static_cast<float>( presentWidth ) * renderScale + 0.5f ) );
 	const int renderHeight = Max( 1, idMath::Ftoi( static_cast<float>( presentHeight ) * renderScale + 0.5f ) );
+	const bool tryCompute2DOverlay = !is3DView && r_softwareHybridComputeLighting.GetBool() && r_softwareVulkanPresent.GetBool();
 	Resize( renderWidth, renderHeight );
 	if ( viewDef->viewEntitys ) {
 		Clear( true );
 	} else {
-		ReadCurrentFramebuffer( viewDef );
+		if ( !tryCompute2DOverlay ) {
+			ReadCurrentFramebuffer( viewDef );
+		}
 		Clear( false );
 	}
 
@@ -637,15 +649,26 @@ void idSoftwareRasterizer::DrawView( const viewDef_t *viewDef ) {
 			gbuffer.surfaceId = hybridGBuffer.surfaceId.Ptr();
 			gbuffer.worldPositions = worldPositionBuffer.Ptr();
 			gbuffer.debugView = r_softwareHybridDebugView.GetInteger();
+
+			idList<swHybridOverlayTri_t> overlayTris;
+			if ( gbuffer.debugView == 0 ) {
+				BeginSurfacePass();
+				SetupTranslucentTriangles( viewDef );
+				BuildHybridOverlayTriangles( overlayTris );
+			}
+
 			BuildHybridLightUpload( viewDef, gbuffer );
 			BuildHybridTextureUpload( gbuffer );
 			if ( SWVulkan_CompositeHybridGBuffer( viewDef, gbuffer, width, height, presentWidth, presentHeight ) ) {
 				if ( r_softwareHybridDebugView.GetInteger() == 0 ) {
+					if ( overlayTris.Num() <= 0 ||
+						 SWVulkan_QueueHybridOverlayTriangles( viewDef, overlayTris.Ptr(), overlayTris.Num(), width, height, presentWidth, presentHeight ) ) {
+						return;
+					}
+
 					for ( int i = 0; i < colorBuffer.Num(); i++ ) {
 						colorBuffer[i] = 0;
 					}
-					BeginSurfacePass();
-					SetupTranslucentTriangles( viewDef );
 					RasterizeTiles();
 					Present();
 				}
@@ -667,10 +690,29 @@ void idSoftwareRasterizer::DrawView( const viewDef_t *viewDef ) {
 	} else {
 		BeginSurfacePass();
 		SetupTriangles( viewDef );
+		if ( tryCompute2DOverlay ) {
+			idList<swHybridOverlayTri_t> overlayTris;
+			BuildHybridOverlayTriangles( overlayTris );
+			if ( overlayTris.Num() > 0 ) {
+				swHybridGBufferUpload_t textureUpload;
+				BuildHybridTextureUpload( textureUpload );
+				if ( SWVulkan_UpdateHybridTextures( textureUpload.textureInfos, textureUpload.textureInfoCount,
+					 textureUpload.textureTexels, textureUpload.textureTexelCount, textureUpload.textureGeneration ) &&
+					 SWVulkan_QueueHybridOverlayTriangles( viewDef, overlayTris.Ptr(), overlayTris.Num(), width, height, presentWidth, presentHeight ) ) {
+					return;
+				}
+			}
+		}
+		if ( tryCompute2DOverlay ) {
+			ReadCurrentFramebuffer( viewDef );
+		}
 		RasterizeTiles();
 	}
 	Present();
 }
+#if defined( _MSC_VER )
+#pragma optimize( "", on )
+#endif
 
 void idSoftwareRasterizer::SetupTriangles( const viewDef_t *viewDef ) {
 	const bool is2DView = viewDef->viewEntitys == NULL;
@@ -885,10 +927,12 @@ void idSoftwareRasterizer::SetupDepthDrawSurf( const viewDef_t *viewDef, const d
 
 void idSoftwareRasterizer::ConfigureStageForView( const viewDef_t *viewDef, const drawSurf_t *surf, swSurfaceStage_t &stage ) const {
 	const bool is2DView = viewDef->viewEntitys == NULL;
-	const bool translucent = is2DView || surf->material->Coverage() == MC_TRANSLUCENT || surf->material->GetSort() > SS_OPAQUE;
+	const bool materialTranslucent = surf->material->Coverage() == MC_TRANSLUCENT;
+	const bool sortedAfterOpaque = surf->material->GetSort() > SS_OPAQUE;
+	const bool translucent = is2DView || materialTranslucent || sortedAfterOpaque;
 	stage.depthTest = viewDef->viewEntitys != NULL;
 	stage.depthWrite = viewDef->viewEntitys != NULL && !translucent;
-	stage.depthEqual = false;
+	stage.depthEqual = viewDef->viewEntitys != NULL && sortedAfterOpaque && !materialTranslucent;
 	if ( is2DView && ( stage.writeMask & ( SW_WRITE_RED | SW_WRITE_GREEN | SW_WRITE_BLUE ) ) &&
 		 stage.srcBlend == GLS_SRCBLEND_ONE && stage.dstBlend == GLS_DSTBLEND_ZERO ) {
 		stage.srcBlend = GLS_SRCBLEND_SRC_ALPHA;
@@ -979,6 +1023,19 @@ void idSoftwareRasterizer::SetupDrawSurfStage( const viewDef_t *viewDef, const d
 	backEnd.pc.c_drawIndexes += numIndexes;
 	backEnd.pc.c_drawVertexes += geo->numVerts;
 
+	float projectionMatrix[16];
+	const float *stageProjectionMatrix = viewDef->projectionMatrix;
+	const bool useWeaponDepthRange = surf->space->weaponDepthHack && surf->space->modelDepthHack == 0.0f;
+	if ( surf->space->weaponDepthHack || surf->space->modelDepthHack != 0.0f ) {
+		memcpy( projectionMatrix, viewDef->projectionMatrix, sizeof( projectionMatrix ) );
+		if ( surf->space->modelDepthHack != 0.0f ) {
+			projectionMatrix[14] -= surf->space->modelDepthHack;
+		} else if ( surf->space->weaponDepthHack ) {
+			projectionMatrix[14] *= 0.25f;
+		}
+		stageProjectionMatrix = projectionMatrix;
+	}
+
 	for ( int i = 0; i + 2 < numIndexes; i += 3 ) {
 		const int index0 = geo->indexes[i + 0];
 		const int index1 = geo->indexes[i + 1];
@@ -994,9 +1051,9 @@ void idSoftwareRasterizer::SetupDrawSurfStage( const viewDef_t *viewDef, const d
 		const idDrawVert &dv2 = verts[index2];
 
 		swClipVert_t cv0, cv1, cv2;
-		if ( !BuildClipVertex( dv0, surf->space->modelMatrix, surf->space->modelViewMatrix, viewDef->projectionMatrix, stage, cv0 ) ||
-			 !BuildClipVertex( dv1, surf->space->modelMatrix, surf->space->modelViewMatrix, viewDef->projectionMatrix, stage, cv1 ) ||
-			 !BuildClipVertex( dv2, surf->space->modelMatrix, surf->space->modelViewMatrix, viewDef->projectionMatrix, stage, cv2 ) ) {
+		if ( !BuildClipVertex( dv0, surf->space->modelMatrix, surf->space->modelViewMatrix, stageProjectionMatrix, stage, cv0 ) ||
+			 !BuildClipVertex( dv1, surf->space->modelMatrix, surf->space->modelViewMatrix, stageProjectionMatrix, stage, cv1 ) ||
+			 !BuildClipVertex( dv2, surf->space->modelMatrix, surf->space->modelViewMatrix, stageProjectionMatrix, stage, cv2 ) ) {
 			continue;
 		}
 
@@ -1008,6 +1065,11 @@ void idSoftwareRasterizer::SetupDrawSurfStage( const viewDef_t *viewDef, const d
 				 !ProjectClipVertex( clipped[clippedTri], v1 ) ||
 				 !ProjectClipVertex( clipped[clippedTri + 1], v2 ) ) {
 				continue;
+			}
+			if ( useWeaponDepthRange ) {
+				v0.z *= 0.5f;
+				v1.z *= 0.5f;
+				v2.z *= 0.5f;
 			}
 
 			swTriSetup_t tri;
@@ -1907,6 +1969,97 @@ void idSoftwareRasterizer::BuildHybridLightUpload( const viewDef_t *viewDef, swH
 #if defined( _MSC_VER )
 #pragma optimize( "", on )
 #endif
+
+void idSoftwareRasterizer::BuildHybridOverlayTriangles( idList<swHybridOverlayTri_t> &overlayTris ) const {
+	overlayTris.SetNum( 0, false );
+
+	for ( int i = 0; i < triangles.Num(); i++ ) {
+		const swTriSetup_t &tri = triangles[i];
+		if ( tri.writeGBuffer || tri.writeMask == 0 ) {
+			continue;
+		}
+
+		swHybridOverlayTri_t &dst = overlayTris.Alloc();
+		memset( &dst, 0, sizeof( dst ) );
+
+		dst.p0[0] = static_cast<float>( tri.x[0] ) * ( 1.0f / static_cast<float>( SW_FP_ONE ) );
+		dst.p0[1] = static_cast<float>( tri.y[0] ) * ( 1.0f / static_cast<float>( SW_FP_ONE ) );
+		dst.p0[2] = tri.z[0];
+		dst.p0[3] = tri.invW[0];
+		dst.p1[0] = static_cast<float>( tri.x[1] ) * ( 1.0f / static_cast<float>( SW_FP_ONE ) );
+		dst.p1[1] = static_cast<float>( tri.y[1] ) * ( 1.0f / static_cast<float>( SW_FP_ONE ) );
+		dst.p1[2] = tri.z[1];
+		dst.p1[3] = tri.invW[1];
+		dst.p2[0] = static_cast<float>( tri.x[2] ) * ( 1.0f / static_cast<float>( SW_FP_ONE ) );
+		dst.p2[1] = static_cast<float>( tri.y[2] ) * ( 1.0f / static_cast<float>( SW_FP_ONE ) );
+		dst.p2[2] = tri.z[2];
+		dst.p2[3] = tri.invW[2];
+
+		if ( tri.needsColorModulation ) {
+			for ( int channel = 0; channel < 4; channel++ ) {
+				dst.color0[channel] = tri.colorOverW[0][channel];
+				dst.color1[channel] = tri.colorOverW[1][channel];
+				dst.color2[channel] = tri.colorOverW[2][channel];
+			}
+		}
+
+		dst.uv0uv1[0] = tri.sOverW[0];
+		dst.uv0uv1[1] = tri.tOverW[0];
+		dst.uv0uv1[2] = tri.sOverW[1];
+		dst.uv0uv1[3] = tri.tOverW[1];
+		dst.uv2pad[0] = tri.sOverW[2];
+		dst.uv2pad[1] = tri.tOverW[2];
+		dst.zPlane[0] = tri.z0;
+		dst.zPlane[1] = tri.dzdx;
+		dst.zPlane[2] = tri.dzdy;
+		dst.invWPlane[0] = tri.invW0;
+		dst.invWPlane[1] = tri.dinvWdx;
+		dst.invWPlane[2] = tri.dinvWdy;
+		dst.sPlane[0] = tri.sOverW0;
+		dst.sPlane[1] = tri.dsOverWdx;
+		dst.sPlane[2] = tri.dsOverWdy;
+		dst.tPlane[0] = tri.tOverW0;
+		dst.tPlane[1] = tri.dtOverWdx;
+		dst.tPlane[2] = tri.dtOverWdy;
+		if ( tri.needsColorModulation ) {
+			for ( int channel = 0; channel < 4; channel++ ) {
+				dst.colorPlane0[channel] = tri.colorOverW0[channel];
+				dst.colorPlane1[channel] = tri.dColorOverWdx[channel];
+				dst.colorPlane2[channel] = tri.dColorOverWdy[channel];
+			}
+		}
+
+		unsigned int flags = 0;
+		if ( tri.textureIndex >= 0 ) {
+			flags |= SW_OVERLAY_FLAG_TEXTURE;
+		}
+		if ( tri.needsColorModulation ) {
+			flags |= SW_OVERLAY_FLAG_COLOR_MOD;
+		}
+		if ( tri.alphaTest ) {
+			flags |= SW_OVERLAY_FLAG_ALPHA_TEST;
+		}
+		if ( tri.depthTest ) {
+			flags |= SW_OVERLAY_FLAG_DEPTH_TEST;
+		}
+		if ( tri.depthEqual ) {
+			flags |= SW_OVERLAY_FLAG_DEPTH_EQUAL;
+		}
+
+		dst.params0[0] = tri.textureIndex >= 0 ? static_cast<unsigned int>( tri.textureIndex ) : 0xffffffffu;
+		dst.params0[1] = tri.fallbackColor;
+		dst.params0[2] = flags;
+		dst.params0[3] = static_cast<unsigned int>( Max( 0, Min( 255, tri.alphaTestByte ) ) );
+		dst.params1[0] = tri.alphaBlend ? tri.blendMode : SW_BLEND_REPLACE;
+		dst.params1[1] = tri.writeMask;
+		dst.params1[2] = tri.srcBlend;
+		dst.params1[3] = tri.dstBlend;
+		dst.bounds[0] = tri.minX;
+		dst.bounds[1] = tri.minY;
+		dst.bounds[2] = tri.maxX;
+		dst.bounds[3] = tri.maxY;
+	}
+}
 
 void idSoftwareRasterizer::DrawInteraction( const drawInteraction_t *interaction ) {
 	if ( !interaction || !interaction->surf || !interaction->surf->geo || !interaction->surf->space ) {

@@ -14,6 +14,10 @@ layout( push_constant ) uniform PushConstants {
 	uvec4 src;       // offset, width, height, clear overlay
 	uvec4 frame;     // width, height, unused, unused
 	ivec4 viewport;  // x, y, presentWidth, presentHeight in Doom's bottom-left frame space
+	uint targetFrame;
+	uint pad0;
+	uint pad1;
+	uint pad2;
 } pc;
 
 void main() {
@@ -27,6 +31,7 @@ void main() {
 
 		uint logicalY = pc.frame.y - 1u - idY;
 		uint overlayIndex = logicalY * pc.frame.x + idX;
+		uint targetIndex = pc.targetFrame != 0u ? idY * pc.frame.x + idX : overlayIndex;
 		uint outColor = 0u;
 
 		if ( int( idX ) >= pc.viewport.x &&
@@ -40,7 +45,7 @@ void main() {
 			outColor = sourcePixels[pc.src.x + srcY * pc.src.y + srcX];
 		}
 
-		overlayPixels[overlayIndex] = outColor;
+		overlayPixels[targetIndex] = outColor;
 		return;
 	}
 
@@ -56,5 +61,6 @@ void main() {
 
 	uint srcX = min( pc.src.y - 1u, ( idX * pc.src.y ) / uint( pc.viewport.z ) );
 	uint srcY = min( pc.src.z - 1u, ( idY * pc.src.z ) / uint( pc.viewport.w ) );
-	overlayPixels[logicalY * pc.frame.x + frameX] = sourcePixels[pc.src.x + srcY * pc.src.y + srcX];
+	uint targetIndex = pc.targetFrame != 0u ? ( pc.frame.y - 1u - logicalY ) * pc.frame.x + frameX : logicalY * pc.frame.x + frameX;
+	overlayPixels[targetIndex] = sourcePixels[pc.src.x + srcY * pc.src.y + srcX];
 }

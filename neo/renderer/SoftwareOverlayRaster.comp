@@ -1,0 +1,390 @@
+#version 460
+
+layout( local_size_x = 8, local_size_y = 8 ) in;
+
+struct OverlayTri {
+	vec4 p0;
+	vec4 p1;
+	vec4 p2;
+	vec4 color0;
+	vec4 color1;
+	vec4 color2;
+	vec4 uv0uv1;
+	vec4 uv2pad;
+	vec4 zPlane;
+	vec4 invWPlane;
+	vec4 sPlane;
+	vec4 tPlane;
+	vec4 colorPlane0;
+	vec4 colorPlane1;
+	vec4 colorPlane2;
+	vec4 colorPlane3;
+	uvec4 params0;
+	ivec4 params1;
+	ivec4 bounds;
+	ivec4 source;
+	ivec4 viewport;
+};
+
+struct TextureInfo {
+	uint offset;
+	uint width;
+	uint height;
+	uint repeat;
+};
+
+layout( set = 0, binding = 0, std430 ) readonly buffer TriBuffer {
+	OverlayTri tris[];
+};
+layout( set = 0, binding = 1, std430 ) readonly buffer DepthBuffer {
+	float depth[];
+};
+layout( set = 0, binding = 2, std430 ) buffer OverlayBuffer {
+	uint overlayPixels[];
+};
+layout( set = 0, binding = 3, std430 ) readonly buffer TextureInfoBuffer {
+	TextureInfo textureInfos[];
+};
+layout( set = 0, binding = 4, std430 ) readonly buffer TextureTexelBuffer {
+	uint textureTexels[];
+};
+
+layout( push_constant ) uniform PushConstants {
+	uvec4 tri;       // index, clear, dispatch width, dispatch height
+	uvec4 dims;      // source width, source height, frame width, frame height
+	ivec4 viewport;  // x, y, present width, present height
+	ivec4 dispatch;  // frame/logical x, y, width, height
+	uint textureCount;
+	uint targetFrame;
+	uint pad2;
+	uint pad3;
+} pc;
+
+const uint FLAG_TEXTURE = 1u;
+const uint FLAG_COLOR_MOD = 2u;
+const uint FLAG_ALPHA_TEST = 4u;
+const uint FLAG_DEPTH_TEST = 8u;
+const uint FLAG_DEPTH_EQUAL = 16u;
+
+const int SW_BLEND_REPLACE = 0;
+const int SW_BLEND_ALPHA = 1;
+const int SW_BLEND_ADD = 2;
+const int SW_BLEND_FILTER = 3;
+const int SW_BLEND_DST_ALPHA = 4;
+const int SW_BLEND_GENERIC = 5;
+
+const int GLS_SRCBLEND_ZERO = 0x00000001;
+const int GLS_SRCBLEND_ONE = 0x0;
+const int GLS_SRCBLEND_DST_COLOR = 0x00000003;
+const int GLS_SRCBLEND_ONE_MINUS_DST_COLOR = 0x00000004;
+const int GLS_SRCBLEND_SRC_ALPHA = 0x00000005;
+const int GLS_SRCBLEND_ONE_MINUS_SRC_ALPHA = 0x00000006;
+const int GLS_SRCBLEND_DST_ALPHA = 0x00000007;
+const int GLS_SRCBLEND_ONE_MINUS_DST_ALPHA = 0x00000008;
+const int GLS_SRCBLEND_ALPHA_SATURATE = 0x00000009;
+
+const int GLS_DSTBLEND_ZERO = 0x0;
+const int GLS_DSTBLEND_ONE = 0x00000020;
+const int GLS_DSTBLEND_SRC_COLOR = 0x00000030;
+const int GLS_DSTBLEND_ONE_MINUS_SRC_COLOR = 0x00000040;
+const int GLS_DSTBLEND_SRC_ALPHA = 0x00000050;
+const int GLS_DSTBLEND_ONE_MINUS_SRC_ALPHA = 0x00000060;
+const int GLS_DSTBLEND_DST_ALPHA = 0x00000070;
+const int GLS_DSTBLEND_ONE_MINUS_DST_ALPHA = 0x00000080;
+
+const int SW_WRITE_RED = 1;
+const int SW_WRITE_GREEN = 2;
+const int SW_WRITE_BLUE = 4;
+const int SW_WRITE_ALPHA = 8;
+const int SW_WRITE_COLOR = 15;
+
+uint PackColor( uint r, uint g, uint b, uint a ) {
+	return ( a << 24 ) | ( r << 16 ) | ( g << 8 ) | b;
+}
+
+uint ByteFromFloat( float value ) {
+	return uint( clamp( value, 0.0, 1.0 ) * 255.0 + 0.5 );
+}
+
+vec4 UnpackColor( uint color ) {
+	return vec4( float( ( color >> 16 ) & 255u ),
+		float( ( color >> 8 ) & 255u ),
+		float( color & 255u ),
+		float( ( color >> 24 ) & 255u ) ) * ( 1.0 / 255.0 );
+}
+
+float EvalPlane( vec4 plane, float x, float y ) {
+	return plane.x + plane.y * x + plane.z * y;
+}
+
+uint PackColorVec( vec4 color ) {
+	return PackColor( ByteFromFloat( color.r ), ByteFromFloat( color.g ), ByteFromFloat( color.b ), ByteFromFloat( color.a ) );
+}
+
+uint SampleTextureNearest( uint textureId, float s, float t, uint fallbackColor ) {
+	if ( textureId == 0xffffffffu || textureId >= pc.textureCount ) {
+		return fallbackColor;
+	}
+
+	TextureInfo info = textureInfos[textureId];
+	if ( info.width == 0u || info.height == 0u ) {
+		return fallbackColor;
+	}
+
+	bool outside = s < 0.0 || s > 1.0 || t < 0.0 || t > 1.0;
+	if ( outside && ( info.repeat == 3u || info.repeat == 4u ) ) {
+		return info.repeat == 4u ? PackColor( 0u, 0u, 0u, 0u ) : PackColor( 0u, 0u, 0u, 255u );
+	}
+	if ( info.repeat == 0u ) {
+		s = fract( s );
+		t = fract( t );
+		s += s < 0.0 ? 1.0 : 0.0;
+		t += t < 0.0 ? 1.0 : 0.0;
+	} else {
+		s = clamp( s, 0.0, 1.0 );
+		t = clamp( t, 0.0, 1.0 );
+	}
+
+	uint x = min( info.width - 1u, uint( s * float( info.width ) ) );
+	uint y = min( info.height - 1u, uint( t * float( info.height ) ) );
+	return textureTexels[info.offset + y * info.width + x];
+}
+
+uint BlendSourceOver( uint src, uint dst ) {
+	uint srcA = ( src >> 24 ) & 255u;
+	if ( srcA == 0u ) {
+		return dst;
+	}
+	if ( srcA == 255u ) {
+		return src;
+	}
+
+	uint invA = 255u - srcA;
+	uint srcR = ( src >> 16 ) & 255u;
+	uint srcG = ( src >> 8 ) & 255u;
+	uint srcB = src & 255u;
+	uint dstA = ( dst >> 24 ) & 255u;
+	uint dstR = ( dst >> 16 ) & 255u;
+	uint dstG = ( dst >> 8 ) & 255u;
+	uint dstB = dst & 255u;
+
+	uint outA = srcA + ( dstA * invA + 127u ) / 255u;
+	uint outR = ( srcR * srcA + dstR * invA + 127u ) / 255u;
+	uint outG = ( srcG * srcA + dstG * invA + 127u ) / 255u;
+	uint outB = ( srcB * srcA + dstB * invA + 127u ) / 255u;
+	return PackColor( outR, outG, outB, outA );
+}
+
+uint BlendFactor( int blend, uint src, uint dst, int channel, bool sourceBlend ) {
+	uint srcA = ( src >> 24 ) & 255u;
+	uint dstA = ( dst >> 24 ) & 255u;
+	uint srcC = ( src >> channel ) & 255u;
+	uint dstC = ( dst >> channel ) & 255u;
+
+	if ( sourceBlend ) {
+		if ( blend == GLS_SRCBLEND_ZERO ) {
+			return 0u;
+		}
+		if ( blend == GLS_SRCBLEND_ONE ) {
+			return 255u;
+		}
+		if ( blend == GLS_SRCBLEND_DST_COLOR ) {
+			return dstC;
+		}
+		if ( blend == GLS_SRCBLEND_ONE_MINUS_DST_COLOR ) {
+			return 255u - dstC;
+		}
+		if ( blend == GLS_SRCBLEND_SRC_ALPHA ) {
+			return srcA;
+		}
+		if ( blend == GLS_SRCBLEND_ONE_MINUS_SRC_ALPHA ) {
+			return 255u - srcA;
+		}
+		if ( blend == GLS_SRCBLEND_DST_ALPHA ) {
+			return dstA;
+		}
+		if ( blend == GLS_SRCBLEND_ONE_MINUS_DST_ALPHA ) {
+			return 255u - dstA;
+		}
+		if ( blend == GLS_SRCBLEND_ALPHA_SATURATE ) {
+			return channel == 24 ? 255u : min( srcA, 255u - dstA );
+		}
+		return 255u;
+	}
+
+	if ( blend == GLS_DSTBLEND_ZERO ) {
+		return 0u;
+	}
+	if ( blend == GLS_DSTBLEND_ONE ) {
+		return 255u;
+	}
+	if ( blend == GLS_DSTBLEND_SRC_COLOR ) {
+		return srcC;
+	}
+	if ( blend == GLS_DSTBLEND_ONE_MINUS_SRC_COLOR ) {
+		return 255u - srcC;
+	}
+	if ( blend == GLS_DSTBLEND_SRC_ALPHA ) {
+		return srcA;
+	}
+	if ( blend == GLS_DSTBLEND_ONE_MINUS_SRC_ALPHA ) {
+		return 255u - srcA;
+	}
+	if ( blend == GLS_DSTBLEND_DST_ALPHA ) {
+		return dstA;
+	}
+	if ( blend == GLS_DSTBLEND_ONE_MINUS_DST_ALPHA ) {
+		return 255u - dstA;
+	}
+	return 255u;
+}
+
+uint BlendColor( uint src, uint dst, int blendMode, int srcBlend, int dstBlend ) {
+	if ( blendMode == SW_BLEND_REPLACE ) {
+		return src;
+	}
+	if ( blendMode == SW_BLEND_ALPHA ) {
+		return BlendSourceOver( src, dst );
+	}
+	if ( blendMode == SW_BLEND_ADD ) {
+		return PackColor(
+			min( 255u, ( ( src >> 16 ) & 255u ) + ( ( dst >> 16 ) & 255u ) ),
+			min( 255u, ( ( src >> 8 ) & 255u ) + ( ( dst >> 8 ) & 255u ) ),
+			min( 255u, ( src & 255u ) + ( dst & 255u ) ),
+			( dst >> 24 ) & 255u );
+	}
+	if ( blendMode == SW_BLEND_FILTER ) {
+		return PackColor(
+			( ( ( src >> 16 ) & 255u ) * ( ( dst >> 16 ) & 255u ) + 127u ) / 255u,
+			( ( ( src >> 8 ) & 255u ) * ( ( dst >> 8 ) & 255u ) + 127u ) / 255u,
+			( ( src & 255u ) * ( dst & 255u ) + 127u ) / 255u,
+			( ( ( src >> 24 ) & 255u ) * ( ( dst >> 24 ) & 255u ) + 127u ) / 255u );
+	}
+	if ( blendMode == SW_BLEND_DST_ALPHA ) {
+		uint dstA = ( dst >> 24 ) & 255u;
+		uint invA = 255u - dstA;
+		return PackColor(
+			( ( ( src >> 16 ) & 255u ) * dstA + ( ( dst >> 16 ) & 255u ) * invA + 127u ) / 255u,
+			( ( ( src >> 8 ) & 255u ) * dstA + ( ( dst >> 8 ) & 255u ) * invA + 127u ) / 255u,
+			( ( src & 255u ) * dstA + ( dst & 255u ) * invA + 127u ) / 255u,
+			( ( ( src >> 24 ) & 255u ) * dstA + ( ( dst >> 24 ) & 255u ) * invA + 127u ) / 255u );
+	}
+
+	uint outChannels[4];
+	for ( int i = 0; i < 4; i++ ) {
+		int shift = i == 0 ? 16 : ( i == 1 ? 8 : ( i == 2 ? 0 : 24 ) );
+		uint srcC = ( src >> shift ) & 255u;
+		uint dstC = ( dst >> shift ) & 255u;
+		uint sf = BlendFactor( srcBlend, src, dst, shift, true );
+		uint df = BlendFactor( dstBlend, src, dst, shift, false );
+		outChannels[i] = min( 255u, ( srcC * sf + dstC * df + 127u ) / 255u );
+	}
+	return PackColor( outChannels[0], outChannels[1], outChannels[2], outChannels[3] );
+}
+
+uint ApplyWriteMask( uint src, uint dst, int writeMask ) {
+	if ( writeMask == SW_WRITE_COLOR ) {
+		return src;
+	}
+	uint outColor = dst;
+	if ( ( writeMask & SW_WRITE_RED ) != 0 ) {
+		outColor = ( outColor & 0xff00ffffu ) | ( src & 0x00ff0000u );
+	}
+	if ( ( writeMask & SW_WRITE_GREEN ) != 0 ) {
+		outColor = ( outColor & 0xffff00ffu ) | ( src & 0x0000ff00u );
+	}
+	if ( ( writeMask & SW_WRITE_BLUE ) != 0 ) {
+		outColor = ( outColor & 0xffffff00u ) | ( src & 0x000000ffu );
+	}
+	if ( ( writeMask & SW_WRITE_ALPHA ) != 0 ) {
+		outColor = ( outColor & 0x00ffffffu ) | ( src & 0xff000000u );
+	}
+	return outColor;
+}
+
+void main() {
+	uint idX = gl_GlobalInvocationID.x;
+	uint idY = gl_GlobalInvocationID.y;
+	if ( idX >= pc.tri.z || idY >= pc.tri.w ) {
+		return;
+	}
+
+	uint frameX = uint( pc.dispatch.x ) + idX;
+	uint logicalY = uint( pc.dispatch.y ) + idY;
+	if ( frameX >= pc.dims.z || logicalY >= pc.dims.w ) {
+		return;
+	}
+	uint logicalIndex = logicalY * pc.dims.z + frameX;
+	uint targetIndex = pc.targetFrame != 0u ? ( pc.dims.w - 1u - logicalY ) * pc.dims.z + frameX : logicalIndex;
+
+	if ( pc.tri.y != 0u ) {
+		if ( pc.targetFrame == 0u ) {
+			overlayPixels[targetIndex] = 0u;
+		}
+		return;
+	}
+
+	OverlayTri tri = tris[pc.tri.x];
+	float viewX = float( int( frameX ) - pc.viewport.x ) + 0.5;
+	float viewY = float( int( logicalY ) - pc.viewport.y ) + 0.5;
+	if ( viewX < 0.0 || viewY < 0.0 || viewX >= float( pc.viewport.z ) || viewY >= float( pc.viewport.w ) ) {
+		return;
+	}
+
+	float srcX = viewX * float( pc.dims.x ) / float( pc.viewport.z );
+	float srcY = viewY * float( pc.dims.y ) / float( pc.viewport.w );
+
+	float denom = ( tri.p1.y - tri.p2.y ) * ( tri.p0.x - tri.p2.x ) +
+		( tri.p2.x - tri.p1.x ) * ( tri.p0.y - tri.p2.y );
+	if ( abs( denom ) <= 0.000001 ) {
+		return;
+	}
+
+	float b0 = ( ( tri.p1.y - tri.p2.y ) * ( srcX - tri.p2.x ) +
+		( tri.p2.x - tri.p1.x ) * ( srcY - tri.p2.y ) ) / denom;
+	float b1 = ( ( tri.p2.y - tri.p0.y ) * ( srcX - tri.p2.x ) +
+		( tri.p0.x - tri.p2.x ) * ( srcY - tri.p2.y ) ) / denom;
+	float b2 = 1.0 - b0 - b1;
+	if ( b0 < 0.0 || b1 < 0.0 || b2 < 0.0 ) {
+		return;
+	}
+
+	float z = EvalPlane( tri.zPlane, srcX, srcY );
+	if ( ( tri.params0.z & FLAG_DEPTH_TEST ) != 0u ) {
+		uint depthX = min( pc.dims.x - 1u, uint( clamp( srcX, 0.0, float( pc.dims.x - 1u ) ) ) );
+		uint depthY = min( pc.dims.y - 1u, uint( clamp( srcY, 0.0, float( pc.dims.y - 1u ) ) ) );
+		float dstDepth = depth[depthY * pc.dims.x + depthX];
+		bool depthPass = ( tri.params0.z & FLAG_DEPTH_EQUAL ) != 0u ? abs( z - dstDepth ) <= 0.0001 : z < dstDepth;
+		if ( !depthPass ) {
+			return;
+		}
+	}
+
+	float invW = EvalPlane( tri.invWPlane, srcX, srcY );
+	if ( abs( invW ) <= 0.000001 ) {
+		return;
+	}
+	float invPerspective = 1.0 / invW;
+	float s = EvalPlane( tri.sPlane, srcX, srcY ) * invPerspective;
+	float t = EvalPlane( tri.tPlane, srcX, srcY ) * invPerspective;
+
+	uint srcColor = ( tri.params0.z & FLAG_TEXTURE ) != 0u ?
+		SampleTextureNearest( tri.params0.x, s, t, tri.params0.y ) : tri.params0.y;
+	if ( ( tri.params0.z & FLAG_COLOR_MOD ) != 0u ) {
+		vec4 colorScale = ( tri.colorPlane0 + tri.colorPlane1 * srcX + tri.colorPlane2 * srcY ) * invPerspective;
+		srcColor = PackColorVec( UnpackColor( srcColor ) * clamp( colorScale, vec4( 0.0 ), vec4( 1.0 ) ) );
+	}
+	if ( ( tri.params0.z & FLAG_ALPHA_TEST ) != 0u && ( ( srcColor >> 24 ) & 255u ) < tri.params0.w ) {
+		return;
+	}
+
+	uint dst = overlayPixels[targetIndex];
+	if ( tri.params1.x == SW_BLEND_ALPHA && ( ( srcColor >> 24 ) & 255u ) == 0u ) {
+		return;
+	}
+	if ( tri.params1.x == SW_BLEND_ADD && ( srcColor & 0x00ffffffu ) == 0u ) {
+		return;
+	}
+	uint blended = BlendColor( srcColor, dst, tri.params1.x, tri.params1.z, tri.params1.w );
+	overlayPixels[targetIndex] = ApplyWriteMask( blended, dst, tri.params1.y );
+}

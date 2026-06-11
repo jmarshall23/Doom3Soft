@@ -36,14 +36,19 @@ If you have questions concerning this license or the applicable additional terms
 =================
 R_FinishDeform
 
-The ambientCache is on the stack, so we don't want to leave a reference
-to it that would try to be freed later.  Create the ambientCache immediately.
+	The generated vertices are stack temporary.  Keep a frame-memory copy so
+	software render paths can read the same deformed geometry that GL draws
+	from the ambient cache.
 =================
 */
 static void R_FinishDeform( drawSurf_t *drawSurf, srfTriangles_t *newTri, idDrawVert *ac ) {
 	if ( !newTri ) {
 		return;
 	}
+
+	idDrawVert *frameVerts = (idDrawVert *)R_FrameAlloc( newTri->numVerts * sizeof( idDrawVert ) );
+	SIMDProcessor->Memcpy( frameVerts, ac, newTri->numVerts * sizeof( idDrawVert ) );
+	newTri->verts = frameVerts;
 
 	// generate current normals, tangents, and bitangents
 	// We might want to support the possibility of deform functions generating
@@ -52,12 +57,10 @@ static void R_FinishDeform( drawSurf_t *drawSurf, srfTriangles_t *newTri, idDraw
 	// FIXME: this doesn't work, because the deformed surface is just the
 	// ambient one, and there isn't an opportunity to generate light interactions
 	if ( drawSurf->material->ReceivesLighting() ) {
-		newTri->verts = ac;
 		R_DeriveTangents( newTri, false );
-		newTri->verts = NULL;
 	}
 
-	newTri->ambientCache = vertexCache.AllocFrameTemp( ac, newTri->numVerts * sizeof( idDrawVert ) );
+	newTri->ambientCache = vertexCache.AllocFrameTemp( frameVerts, newTri->numVerts * sizeof( idDrawVert ) );
 	// if we are out of vertex cache, leave it the way it is
 	if ( newTri->ambientCache ) {
 		drawSurf->geo = newTri;
