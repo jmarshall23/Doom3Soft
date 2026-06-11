@@ -398,6 +398,11 @@ private:
 	void Present() const;
 
 	void SelectSurfaceStage( int surfIndex, const drawSurf_t *surf, swSurfaceStage_t &stage, int stageIndex );
+	void PrimeHybridTextureCacheFromImageManager();
+	bool ShouldPrimeHybridTexture( const idImage *image ) const;
+	bool IsHybridGeneratedTexture( const idImage *image ) const;
+	int FindTextureCacheIndex( const idImage *image ) const;
+	int AddHybridTextureToCache( const idImage *image, bool printDefaulted );
 	int TextureIndexForImage( const idImage *image );
 	bool LoadSoftwareTexture( swTexture_t &texture, const idImage *image ) const;
 	bool LoadBoundTexture( swTexture_t &texture, const idImage *image ) const;
@@ -428,6 +433,7 @@ private:
 	static unsigned int ModulateColor( unsigned int color, const float scale[4] );
 	static unsigned int AdditiveColor( unsigned int src, unsigned int dst );
 	static float ColorChannel( unsigned int color, int shift );
+	static int TextureImageHashKey( const idImage *image );
 	static idVec3 DecodeNormal( unsigned int color );
 	static float DotPlanePoint( const idVec4 &plane, const idVec3 &point );
 	static int ByteFromFloat( float value );
@@ -460,11 +466,14 @@ private:
 	idList<swInteractionTri_t> interactionTriangles;
 	idList<swTileBin_t> tileBins;
 	idList<swTexture_t> textureCache;
+	idHashIndex textureCacheHash;
 	idList<swHybridTextureInfo_t> hybridTextureInfos;
 	idList<unsigned int> hybridTextureTexels;
 	idList<swHybridLight_t> hybridLights;
 	unsigned int textureCacheGeneration;
 	unsigned int hybridTextureAtlasGeneration;
+	int hybridImageManagerCount;
+	bool hybridTextureCachePrimed;
 	swRasterPass_t rasterPass;
 	bool shadowMaskActive;
 	unsigned int hybridSurfaceSerial;
@@ -495,6 +504,8 @@ idSoftwareRasterizer::idSoftwareRasterizer() {
 	hybridSurfaceSerial = 1;
 	textureCacheGeneration = 1;
 	hybridTextureAtlasGeneration = 0;
+	hybridImageManagerCount = 0;
+	hybridTextureCachePrimed = false;
 
 #if defined( _WIN32 ) && !defined( _D3SDK )
 	workersStarted = false;
@@ -627,6 +638,9 @@ void idSoftwareRasterizer::DrawView( const viewDef_t *viewDef ) {
 
 	if ( viewDef->viewEntitys ) {
 		RB_DetermineLightScale();
+		if ( r_softwareHybridComputeLighting.GetBool() ) {
+			PrimeHybridTextureCacheFromImageManager();
+		}
 
 		BeginSurfacePass();
 		SetupDepthPrepass( viewDef );
@@ -684,6 +698,9 @@ void idSoftwareRasterizer::DrawView( const viewDef_t *viewDef ) {
 		SetupAmbientTriangles( viewDef );
 		RasterizeTiles();
 	} else {
+		if ( tryCompute2DOverlay ) {
+			PrimeHybridTextureCacheFromImageManager();
+		}
 		BeginSurfacePass();
 		SetupTriangles( viewDef );
 		if ( tryCompute2DOverlay ) {
@@ -1787,6 +1804,8 @@ void idSoftwareRasterizer::WriteHybridDebugView() {
 }
 
 void idSoftwareRasterizer::BuildHybridTextureUpload( swHybridGBufferUpload_t &gbuffer ) {
+	PrimeHybridTextureCacheFromImageManager();
+
 	if ( hybridTextureAtlasGeneration != textureCacheGeneration ||
 		 hybridTextureInfos.Num() == 0 ||
 		 hybridTextureTexels.Num() == 0 ) {
@@ -3333,30 +3352,139 @@ void idSoftwareRasterizer::SelectSurfaceStage( int surfIndex, const drawSurf_t *
 	}
 }
 
-int idSoftwareRasterizer::TextureIndexForImage( const idImage *image ) {
+void idSoftwareRasterizer::PrimeHybridTextureCacheFromImageManager() {
+	if ( !globalImages ) {
+		return;
+	}
+
+	const int imageCount = globalImages->images.Num();
+	if ( hybridTextureCachePrimed && hybridImageManagerCount == imageCount ) {
+		return;
+	}
+
+	const int oldTextureCount = textureCache.Num();
+	for ( int i = 0; i < imageCount; i++ ) {
+		const idImage *image = globalImages->images[i];
+		if ( ShouldPrimeHybridTexture( image ) ) {
+			AddHybridTextureToCache( image, false );
+		}
+	}
+
+	hybridImageManagerCount = globalImages->images.Num();
+	hybridTextureCachePrimed = true;
+	if ( textureCache.Num() != oldTextureCount ) {
+		common->DPrintf( "software renderer: primed hybrid texture cache with %d images (%d total)\n",
+			textureCache.Num() - oldTextureCount, textureCache.Num() );
+	}
+}
+
+bool idSoftwareRasterizer::ShouldPrimeHybridTexture( const idImage *image ) const {
+	if ( !image ) {
+		return false;
+	}
+	if ( IsHybridGeneratedTexture( image ) ) {
+		return true;
+	}
+	if ( image->isPartialImage || image->backgroundLoadInProgress ) {
+		return false;
+	}
+	if ( image->generatorFunction ) {
+		return false;
+	}
+	if ( image->type != TT_2D || image->cubeFiles != CF_2D ) {
+		return false;
+	}
+	if ( image->imgName[0] == '\0' ) {
+		return false;
+	}
+	if ( !globalImages ) {
+		return true;
+	}
+
+	return image != globalImages->cinematicImage &&
+		image != globalImages->scratchImage &&
+		image != globalImages->scratchImage2 &&
+		image != globalImages->accumImage &&
+		image != globalImages->currentRenderImage &&
+		image != globalImages->scratchCubeMapImage;
+}
+
+bool idSoftwareRasterizer::IsHybridGeneratedTexture( const idImage *image ) const {
+	if ( !globalImages || !image ) {
+		return false;
+	}
+
+	return image == globalImages->whiteImage ||
+		image == globalImages->noFalloffImage ||
+		image == globalImages->blackImage ||
+		image == globalImages->flatNormalMap ||
+		image == globalImages->ambientNormalMap ||
+		image == globalImages->defaultImage;
+}
+
+int idSoftwareRasterizer::TextureImageHashKey( const idImage *image ) {
+	const size_t value = reinterpret_cast<size_t>( image );
+	return static_cast<int>( ( value >> 4 ) ^ ( value >> 12 ) );
+}
+
+int idSoftwareRasterizer::FindTextureCacheIndex( const idImage *image ) const {
 	if ( !image ) {
 		return -1;
 	}
 
-	for ( int i = 0; i < textureCache.Num(); i++ ) {
-		if ( textureCache[i].image == image ) {
+	const int hashKey = TextureImageHashKey( image );
+	for ( int i = textureCacheHash.First( hashKey ); i != -1; i = textureCacheHash.Next( i ) ) {
+		if ( i >= 0 && i < textureCache.Num() && textureCache[i].image == image ) {
 			return i;
 		}
 	}
 
+	return -1;
+}
+
+int idSoftwareRasterizer::AddHybridTextureToCache( const idImage *image, bool printDefaulted ) {
+	if ( !image ) {
+		return -1;
+	}
+
+	const int existingIndex = FindTextureCacheIndex( image );
+	if ( existingIndex >= 0 ) {
+		return existingIndex;
+	}
+
 	swTexture_t &texture = textureCache.Alloc();
 	if ( !LoadSoftwareTexture( texture, image ) ) {
+		if ( !printDefaulted ) {
+			textureCache.RemoveIndex( textureCache.Num() - 1 );
+			return -1;
+		}
 		common->Printf( "software renderer: using default texture for '%s'\n", image->imgName.c_str() );
 		texture.image = image;
 		texture.name = image->imgName;
 		LoadDefaultTexture( texture );
 	}
+
 	textureCacheGeneration++;
 	if ( textureCacheGeneration == 0 ) {
 		textureCacheGeneration = 1;
 		hybridTextureAtlasGeneration = 0;
 	}
-	return textureCache.Num() - 1;
+	const int textureIndex = textureCache.Num() - 1;
+	textureCacheHash.Add( TextureImageHashKey( image ), textureIndex );
+	return textureIndex;
+}
+
+int idSoftwareRasterizer::TextureIndexForImage( const idImage *image ) {
+	if ( !image ) {
+		return -1;
+	}
+
+	const int existingIndex = FindTextureCacheIndex( image );
+	if ( existingIndex >= 0 ) {
+		return existingIndex;
+	}
+
+	return AddHybridTextureToCache( image, true );
 }
 
 bool idSoftwareRasterizer::LoadSoftwareTexture( swTexture_t &texture, const idImage *image ) const {

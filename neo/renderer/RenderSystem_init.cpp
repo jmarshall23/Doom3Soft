@@ -158,7 +158,7 @@ idCVar r_softwareRayQueryShadows( "r_softwareRayQueryShadows", "1", CVAR_RENDERE
 idCVar r_softwareRayQueryShadowSamples( "r_softwareRayQueryShadowSamples", "5", CVAR_RENDERER | CVAR_INTEGER, "number of soft-shadow ray-query taps for software shadows", 1, 9, idCmdSystem::ArgCompletion_Integer<1,9> );
 idCVar r_softwareRayQueryShadowRadius( "r_softwareRayQueryShadowRadius", "8", CVAR_RENDERER | CVAR_FLOAT, "world-space radius for software ray-query soft shadows", 0.0f, 64.0f );
 idCVar r_softwareHybridRayQueryShadows( "r_softwareHybridRayQueryShadows", "1", CVAR_RENDERER | CVAR_BOOL, "enable expensive per-pixel ray-query shadows in the hybrid compute lighting pass" );
-idCVar r_softwareHybridComputeLighting( "r_softwareHybridComputeLighting", "0", CVAR_RENDERER | CVAR_BOOL, "route software rendering through the G-buffer / Vulkan compute lighting path" );
+idCVar r_softwareHybridComputeLighting( "r_softwareHybridComputeLighting", "1", CVAR_RENDERER | CVAR_BOOL, "route software rendering through the G-buffer / Vulkan compute lighting path" );
 idCVar r_softwareHybridDebugView( "r_softwareHybridDebugView", "0", CVAR_RENDERER | CVAR_INTEGER, "hybrid renderer debug view: 0 final lit frame, 1 depth, 2 normal, 3 uv, 4 material, 5 texture, 6 surface", 0, 6, idCmdSystem::ArgCompletion_Integer<0,6> );
 idCVar r_useCombinerDisplayLists( "r_useCombinerDisplayLists", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "put all nvidia register combiner programming in display lists" );
 idCVar r_useDepthBoundsTest( "r_useDepthBoundsTest", "1", CVAR_RENDERER | CVAR_BOOL, "use depth bounds test to reduce shadow fill" );
