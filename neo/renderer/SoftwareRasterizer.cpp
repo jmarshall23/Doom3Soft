@@ -15,6 +15,13 @@ This file is part of the idTech 4 software renderer source code
 #include "tr_local.h"
 #include "SoftwareRasterizer.h"
 
+#if defined( SW_COMPILE_AVX2 ) || defined( __AVX2__ ) || defined( _M_AVX2 )
+#include <immintrin.h>
+#define SW_AVX2_DEPTH_PATH 1
+#else
+#define SW_AVX2_DEPTH_PATH 0
+#endif
+
 /*
 ===============================================================================
 
@@ -40,6 +47,8 @@ static const int SW_WRITE_BLUE = BIT(2);
 static const int SW_WRITE_ALPHA = BIT(3);
 static const int SW_WRITE_COLOR = SW_WRITE_RED | SW_WRITE_GREEN | SW_WRITE_BLUE | SW_WRITE_ALPHA;
 static const int SW_WRITE_DYNAMIC = -1;
+static const long long SW_INT32_MIN = -2147483647LL - 1LL;
+static const long long SW_INT32_MAX = 2147483647LL;
 
 enum swBlendMode_t {
 	SW_BLEND_REPLACE,
@@ -308,6 +317,7 @@ private:
 	void RasterizeTileRange( int firstTile, int endTile );
 	void RasterizeTile( int tileX, int tileY );
 	void RasterizeTriangleInTile( const swTriSetup_t &tri, int tileX, int tileY );
+	void RasterizeDepthTriangleInTile( const swTriSetup_t &tri, int tileX, int tileY );
 	template<int TEXTURE_MODE>
 	void RasterizeTriangleInTileTexture( const swTriSetup_t &tri, int tileX, int tileY );
 	template<bool HAS_TEXTURE, int TEXTURE_MODE>
@@ -356,6 +366,8 @@ private:
 	static float ClipPlaneDistance( const swClipVert_t &v, int plane );
 	static void LerpClipVertex( const swClipVert_t &a, const swClipVert_t &b, float fraction, swClipVert_t &out );
 	static float WrapTextureCoordinate( float value, textureRepeat_t repeat );
+	static bool FitsInt32( long long value );
+	static bool FitsEdgePacket32( long long start, long long step, int lanes );
 	static long long EdgeValue( int ax, int ay, int bx, int by, int px, int py );
 	static int TopLeftBias( int ax, int ay, int bx, int by );
 #if defined( _WIN32 ) && !defined( _D3SDK )
@@ -366,6 +378,8 @@ private:
 
 	int width;
 	int height;
+	int presentWidth;
+	int presentHeight;
 	int tileCountX;
 	int tileCountY;
 
@@ -394,6 +408,8 @@ static void RB_SW_DrawInteractionCallback( const drawInteraction_t *interaction 
 idSoftwareRasterizer::idSoftwareRasterizer() {
 	width = 0;
 	height = 0;
+	presentWidth = 0;
+	presentHeight = 0;
 	tileCountX = 0;
 	tileCountY = 0;
 	rasterPass = SW_RASTER_SURFACE;
@@ -474,7 +490,14 @@ void idSoftwareRasterizer::DrawView( const viewDef_t *viewDef ) {
 
 	const int viewportWidth = viewDef->viewport.x2 - viewDef->viewport.x1 + 1;
 	const int viewportHeight = viewDef->viewport.y2 - viewDef->viewport.y1 + 1;
-	Resize( viewportWidth, viewportHeight );
+	presentWidth = Max( viewportWidth, 1 );
+	presentHeight = Max( viewportHeight, 1 );
+
+	const bool is3DView = viewDef->viewEntitys != NULL;
+	const float renderScale = is3DView ? idMath::ClampFloat( 0.01f, 1.0f, r_softwareRenderScale.GetFloat() ) : 1.0f;
+	const int renderWidth = Max( 1, idMath::Ftoi( static_cast<float>( presentWidth ) * renderScale + 0.5f ) );
+	const int renderHeight = Max( 1, idMath::Ftoi( static_cast<float>( presentHeight ) * renderScale + 0.5f ) );
+	Resize( renderWidth, renderHeight );
 	if ( viewDef->viewEntitys ) {
 		Clear( true );
 	} else {
@@ -1491,6 +1514,11 @@ void idSoftwareRasterizer::RasterizeTile( int tileX, int tileY ) {
 }
 
 void idSoftwareRasterizer::RasterizeTriangleInTile( const swTriSetup_t &tri, int tileX, int tileY ) {
+	if ( tri.writeMask == 0 && tri.depthTest && tri.depthWrite && !tri.depthEqual && !tri.alphaTest ) {
+		RasterizeDepthTriangleInTile( tri, tileX, tileY );
+		return;
+	}
+
 	const int textureMode = r_softwareTextureMode.GetInteger();
 	if ( textureMode == 1 ) {
 		RasterizeTriangleInTileTexture<1>( tri, tileX, tileY );
@@ -1498,6 +1526,94 @@ void idSoftwareRasterizer::RasterizeTriangleInTile( const swTriSetup_t &tri, int
 		RasterizeTriangleInTileTexture<2>( tri, tileX, tileY );
 	} else {
 		RasterizeTriangleInTileTexture<0>( tri, tileX, tileY );
+	}
+}
+
+void idSoftwareRasterizer::RasterizeDepthTriangleInTile( const swTriSetup_t &tri, int tileX, int tileY ) {
+	const int x0 = Max( tri.minX, tileX * SW_TILE_SIZE );
+	const int y0 = Max( tri.minY, tileY * SW_TILE_SIZE );
+	const int x1 = Min( tri.maxX, ( tileX + 1 ) * SW_TILE_SIZE - 1 );
+	const int y1 = Min( tri.maxY, ( tileY + 1 ) * SW_TILE_SIZE - 1 );
+
+	const int basePx = ( x0 << SW_FP_SHIFT ) + SW_FP_HALF;
+	const int basePy = ( y0 << SW_FP_SHIFT ) + SW_FP_HALF;
+
+	long long rowE0 = tri.A[0] * basePx + tri.B[0] * basePy + tri.C[0];
+	long long rowE1 = tri.A[1] * basePx + tri.B[1] * basePy + tri.C[1];
+	long long rowE2 = tri.A[2] * basePx + tri.B[2] * basePy + tri.C[2];
+	float rowZ = tri.z0 + tri.dzdx * ( static_cast<float>( x0 ) + 0.5f ) + tri.dzdy * ( static_cast<float>( y0 ) + 0.5f );
+
+	const long long stepX0 = tri.A[0] * SW_FP_ONE;
+	const long long stepX1 = tri.A[1] * SW_FP_ONE;
+	const long long stepX2 = tri.A[2] * SW_FP_ONE;
+	const long long stepY0 = tri.B[0] * SW_FP_ONE;
+	const long long stepY1 = tri.B[1] * SW_FP_ONE;
+	const long long stepY2 = tri.B[2] * SW_FP_ONE;
+
+#if SW_AVX2_DEPTH_PATH
+	const bool useAVX2 = r_softwareDepthSIMD.GetBool();
+	const __m256i laneI = _mm256_setr_epi32( 0, 1, 2, 3, 4, 5, 6, 7 );
+	const __m256 laneF = _mm256_cvtepi32_ps( laneI );
+	const __m256i minusOne = _mm256_set1_epi32( -1 );
+	const __m256 dzdx8 = _mm256_set1_ps( tri.dzdx );
+#endif
+
+	for ( int y = y0; y <= y1; y++ ) {
+		long long e0 = rowE0;
+		long long e1 = rowE1;
+		long long e2 = rowE2;
+		float z = rowZ;
+		float *depth = depthBuffer.Ptr() + y * width + x0;
+		int x = x0;
+
+#if SW_AVX2_DEPTH_PATH
+		if ( useAVX2 ) {
+			while ( x + 7 <= x1 &&
+					FitsEdgePacket32( e0, stepX0, 8 ) &&
+					FitsEdgePacket32( e1, stepX1, 8 ) &&
+					FitsEdgePacket32( e2, stepX2, 8 ) ) {
+				const __m256i e0v = _mm256_add_epi32( _mm256_set1_epi32( static_cast<int>( e0 ) ), _mm256_mullo_epi32( _mm256_set1_epi32( static_cast<int>( stepX0 ) ), laneI ) );
+				const __m256i e1v = _mm256_add_epi32( _mm256_set1_epi32( static_cast<int>( e1 ) ), _mm256_mullo_epi32( _mm256_set1_epi32( static_cast<int>( stepX1 ) ), laneI ) );
+				const __m256i e2v = _mm256_add_epi32( _mm256_set1_epi32( static_cast<int>( e2 ) ), _mm256_mullo_epi32( _mm256_set1_epi32( static_cast<int>( stepX2 ) ), laneI ) );
+
+				const __m256i c0 = _mm256_cmpgt_epi32( e0v, minusOne );
+				const __m256i c1 = _mm256_cmpgt_epi32( e1v, minusOne );
+				const __m256i c2 = _mm256_cmpgt_epi32( e2v, minusOne );
+				const __m256 coverage = _mm256_castsi256_ps( _mm256_and_si256( _mm256_and_si256( c0, c1 ), c2 ) );
+
+				const __m256 zv = _mm256_add_ps( _mm256_set1_ps( z ), _mm256_mul_ps( dzdx8, laneF ) );
+				const __m256 oldDepth = _mm256_loadu_ps( depth );
+				const __m256 depthPass = _mm256_cmp_ps( zv, oldDepth, _CMP_LT_OQ );
+				const __m256 mask = _mm256_and_ps( coverage, depthPass );
+				const __m256 newDepth = _mm256_blendv_ps( oldDepth, zv, mask );
+				_mm256_storeu_ps( depth, newDepth );
+
+				e0 += stepX0 * 8;
+				e1 += stepX1 * 8;
+				e2 += stepX2 * 8;
+				z += tri.dzdx * 8.0f;
+				depth += 8;
+				x += 8;
+			}
+		}
+#endif
+
+		for ( ; x <= x1; x++ ) {
+			if ( ( e0 | e1 | e2 ) >= 0 && z < *depth ) {
+				*depth = z;
+			}
+
+			e0 += stepX0;
+			e1 += stepX1;
+			e2 += stepX2;
+			z += tri.dzdx;
+			depth++;
+		}
+
+		rowE0 += stepY0;
+		rowE1 += stepY1;
+		rowE2 += stepY2;
+		rowZ += tri.dzdy;
 	}
 }
 
@@ -2008,16 +2124,18 @@ void idSoftwareRasterizer::Present() const {
 	qglDisable( GL_DEPTH_TEST );
 	qglDisable( GL_STENCIL_TEST );
 
-	qglViewport( backEnd.viewDef->viewport.x1, backEnd.viewDef->viewport.y1, width, height );
-	qglScissor( backEnd.viewDef->viewport.x1, backEnd.viewDef->viewport.y1, width, height );
+	qglViewport( backEnd.viewDef->viewport.x1, backEnd.viewDef->viewport.y1, presentWidth, presentHeight );
+	qglScissor( backEnd.viewDef->viewport.x1, backEnd.viewDef->viewport.y1, presentWidth, presentHeight );
 
 	qglMatrixMode( GL_PROJECTION );
 	qglLoadIdentity();
-	qglOrtho( 0, width, 0, height, -1, 1 );
+	qglOrtho( 0, presentWidth, 0, presentHeight, -1, 1 );
 	qglMatrixMode( GL_MODELVIEW );
 	qglLoadIdentity();
 	qglRasterPos2i( 0, 0 );
+	qglPixelZoom( static_cast<float>( presentWidth ) / static_cast<float>( width ), static_cast<float>( presentHeight ) / static_cast<float>( height ) );
 	qglDrawPixels( width, height, GL_BGRA_EXT, GL_UNSIGNED_BYTE, colorBuffer.Ptr() );
+	qglPixelZoom( 1.0f, 1.0f );
 	GL_SelectTexture( 0 );
 	qglEnable( GL_TEXTURE_2D );
 }
@@ -2586,6 +2704,17 @@ float idSoftwareRasterizer::WrapTextureCoordinate( float value, textureRepeat_t 
 		return value;
 	}
 	return idMath::ClampFloat( 0.0f, 1.0f, value );
+}
+
+bool idSoftwareRasterizer::FitsInt32( long long value ) {
+	return value >= SW_INT32_MIN && value <= SW_INT32_MAX;
+}
+
+bool idSoftwareRasterizer::FitsEdgePacket32( long long start, long long step, int lanes ) {
+	if ( !FitsInt32( step ) ) {
+		return false;
+	}
+	return FitsInt32( start ) && FitsInt32( start + step * ( lanes - 1 ) );
 }
 
 long long idSoftwareRasterizer::EdgeValue( int ax, int ay, int bx, int by, int px, int py ) {

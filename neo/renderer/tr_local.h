@@ -879,6 +879,8 @@ extern idCVar r_useInfiniteFarZ;		// 1 = use the no-far-clip-plane trick
 extern idCVar r_useScissor;				// 1 = scissor clip as portals and lights are processed
 extern idCVar r_useSoftwareRenderer;		// 1 = route 3D views through the CPU tiled rasterizer
 extern idCVar r_softwareTextureMode;		// 0 = material textures, 1 = UV gradient, 2 = UV checker
+extern idCVar r_softwareRenderScale;		// scales the 3D software render buffer before presentation
+extern idCVar r_softwareDepthSIMD;		// 1 = use AVX2 packet depth rasterization when available
 extern idCVar r_usePortals;				// 1 = use portals to perform area culling, otherwise draw everything
 extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
 extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists
