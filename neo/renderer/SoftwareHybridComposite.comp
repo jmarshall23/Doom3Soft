@@ -1,7 +1,7 @@
 #version 460
 #extension GL_EXT_ray_query : require
 
-layout( local_size_x = 8, local_size_y = 8 ) in;
+layout( local_size_x = 16, local_size_y = 8 ) in;
 
 layout( set = 0, binding = 0, std430 ) readonly buffer DepthBuffer {
 	float depth[];
@@ -71,14 +71,15 @@ layout( set = 0, binding = 15, std430 ) readonly buffer BitangentBuffer {
 layout( push_constant ) uniform PushConstants {
 	uvec4 dims;      // gbufferWidth, gbufferHeight, frameWidth, frameHeight
 	ivec4 viewport;  // x, y, presentWidth, presentHeight in Doom's bottom-left frame space
+	ivec4 dispatch;  // x, y, width, height in frame/logical space
 	uint debugView;
 	uint textureCount;
 	uint overlayEnabled;
 	uint lightCount;
 	uint shadowEnabled;
 	uint overlayOnly;
-	uint pad1;
-	uint pad2;
+	uint shadowSamples;
+	float shadowRadius;
 	vec4 viewOrigin;
 } pc;
 
@@ -216,11 +217,50 @@ vec3 DecodeNormalMapTexel( uint texel ) {
 	return n * inversesqrt( len2 );
 }
 
-float TraceShadow( vec3 worldPos, vec3 normal, vec3 lightDir, float distanceToLight ) {
-	if ( pc.shadowEnabled == 0u || distanceToLight <= 4.0 ) {
+const uint MAX_SHADOW_SAMPLES = 9u;
+
+vec2 ShadowDiskOffset( uint sampleIndex ) {
+	if ( sampleIndex == 1u ) {
+		return vec2( 0.55, 0.0 );
+	}
+	if ( sampleIndex == 2u ) {
+		return vec2( -0.55, 0.0 );
+	}
+	if ( sampleIndex == 3u ) {
+		return vec2( 0.0, 0.55 );
+	}
+	if ( sampleIndex == 4u ) {
+		return vec2( 0.0, -0.55 );
+	}
+	if ( sampleIndex == 5u ) {
+		return vec2( 0.38, 0.38 );
+	}
+	if ( sampleIndex == 6u ) {
+		return vec2( -0.38, 0.38 );
+	}
+	if ( sampleIndex == 7u ) {
+		return vec2( 0.38, -0.38 );
+	}
+	if ( sampleIndex == 8u ) {
+		return vec2( -0.38, -0.38 );
+	}
+	return vec2( 0.0 );
+}
+
+void BuildShadowBasis( vec3 direction, out vec3 right, out vec3 up ) {
+	vec3 helper = abs( direction.z ) < 0.999 ? vec3( 0.0, 0.0, 1.0 ) : vec3( 0.0, 1.0, 0.0 );
+	right = normalize( cross( helper, direction ) );
+	up = cross( direction, right );
+}
+
+float TraceShadowRay( vec3 worldPos, vec3 normal, vec3 lightPosition ) {
+	vec3 toLight = lightPosition - worldPos;
+	float distanceToLight = length( toLight );
+	if ( distanceToLight <= 4.0 ) {
 		return 1.0;
 	}
 
+	vec3 lightDir = toLight / distanceToLight;
 	vec3 origin = worldPos + normal * 2.0;
 	float tMax = max( 0.0, distanceToLight - 4.0 );
 	rayQueryEXT rayQuery;
@@ -235,6 +275,25 @@ float TraceShadow( vec3 worldPos, vec3 normal, vec3 lightDir, float distanceToLi
 		tMax );
 	rayQueryProceedEXT( rayQuery );
 	return rayQueryGetIntersectionTypeEXT( rayQuery, true ) == gl_RayQueryCommittedIntersectionNoneEXT ? 1.0 : 0.0;
+}
+
+float TraceShadow( vec3 worldPos, vec3 normal, vec3 lightPosition, vec3 lightDir, float distanceToLight ) {
+	if ( pc.shadowEnabled == 0u || distanceToLight <= 4.0 ) {
+		return 1.0;
+	}
+
+	uint samples = pc.shadowRadius > 0.0 ? clamp( pc.shadowSamples, 1u, MAX_SHADOW_SAMPLES ) : 1u;
+	vec3 right;
+	vec3 up;
+	BuildShadowBasis( lightDir, right, up );
+
+	float visible = 0.0;
+	for ( uint sampleIndex = 0u; sampleIndex < samples; sampleIndex++ ) {
+		vec2 disk = ShadowDiskOffset( sampleIndex ) * pc.shadowRadius;
+		vec3 samplePosition = lightPosition + right * disk.x + up * disk.y;
+		visible += TraceShadowRay( worldPos, normal, samplePosition );
+	}
+	return visible / float( samples );
 }
 
 uint ShadeTexturedPixel( uint srcIndex, uint viewX, uint viewY ) {
@@ -300,7 +359,7 @@ uint ShadeTexturedPixel( uint srcIndex, uint viewX, uint viewY ) {
 				lightTS = normalize( lightTS );
 			}
 			float nDotL = max( dot( bumpNormal, lightTS ), 0.0 );
-			float shadow = light.flags.z != 0u ? TraceShadow( world.xyz, normal, lightDir, dist ) : 1.0;
+			float shadow = light.flags.z != 0u ? TraceShadow( world.xyz, normal, light.originRadius.xyz, lightDir, dist ) : 1.0;
 			float lightAmount = nDotL * attenuation * falloff * shadow;
 			vec3 projectedLightColor = lightColor * lightTexel.rgb;
 			lit += albedo.rgb * projectedLightColor * lightAmount;
@@ -346,21 +405,19 @@ uint BlendOverlay( uint baseColor, uint overlayColor ) {
 }
 
 void main() {
-	uint frameX = gl_GlobalInvocationID.x;
-	uint uploadY = gl_GlobalInvocationID.y;
-	if ( frameX >= pc.dims.z || uploadY >= pc.dims.w ) {
+	uint idX = gl_GlobalInvocationID.x;
+	uint idY = gl_GlobalInvocationID.y;
+	if ( idX >= uint( pc.dispatch.z ) || idY >= uint( pc.dispatch.w ) ) {
 		return;
 	}
 
+	uint frameX = uint( pc.dispatch.x ) + idX;
+	uint logicalY = uint( pc.dispatch.y ) + idY;
+	uint uploadY = pc.dims.w - 1u - logicalY;
 	uint outIndex = uploadY * pc.dims.z + frameX;
-	uint logicalY = pc.dims.w - 1u - uploadY;
 	uint color = PackColor( 0u, 0u, 0u, 255u );
 
-	if ( pc.overlayOnly == 0u &&
-		 int( frameX ) >= pc.viewport.x &&
-		 int( logicalY ) >= pc.viewport.y &&
-		 int( frameX ) < pc.viewport.x + pc.viewport.z &&
-		 int( logicalY ) < pc.viewport.y + pc.viewport.w ) {
+	if ( pc.overlayOnly == 0u ) {
 		uint viewX = uint( int( frameX ) - pc.viewport.x );
 		uint viewY = uint( int( logicalY ) - pc.viewport.y );
 		uint srcX = min( pc.dims.x - 1u, ( viewX * pc.dims.x ) / uint( pc.viewport.z ) );

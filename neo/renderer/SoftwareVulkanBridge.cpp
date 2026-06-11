@@ -93,20 +93,23 @@ struct swVkRayInstance_t {
 struct swVkShadowPushConstants_t {
 	float lightOrigin[4];
 	uint32_t pixelCount;
+	uint32_t sampleCount;
 	float bias;
-	float pad[2];
+	float radius;
 };
 
 struct swVkHybridPushConstants_t {
 	uint32_t dims[4];
 	int32_t viewport[4];
+	int32_t dispatch[4];
 	uint32_t debugView;
 	uint32_t textureCount;
 	uint32_t overlayEnabled;
 	uint32_t lightCount;
 	uint32_t shadowEnabled;
 	uint32_t overlayOnly;
-	uint32_t pad[2];
+	uint32_t shadowSamples;
+	float shadowRadius;
 	float viewOrigin[4];
 };
 
@@ -149,6 +152,24 @@ struct swVk2DJob_t {
 };
 
 static const int SW_VK_MAX_SHADOW_JOBS = 64;
+static const uint32_t SW_VK_COMPUTE_GROUP_SIZE_X = 16;
+static const uint32_t SW_VK_COMPUTE_GROUP_SIZE_Y = 8;
+static const uint32_t SW_VK_SHADOW_GROUP_SIZE_X = 128;
+static const VkDeviceSize SW_VK_MIN_TEXTURE_INFO_BYTES = 4096 * sizeof( swHybridTextureInfo_t );
+static const VkDeviceSize SW_VK_MIN_TEXTURE_TEXEL_BYTES = 32 * 1024 * 1024 * sizeof( uint32_t );
+
+static uint32_t SWVkDispatchGroups( uint32_t size, uint32_t groupSize ) {
+	return ( size + groupSize - 1u ) / groupSize;
+}
+
+static VkDeviceSize SWVkGrowBufferSize( VkDeviceSize required, VkDeviceSize minimum ) {
+	VkDeviceSize size = Max( required, minimum );
+	VkDeviceSize grown = minimum;
+	while ( grown < size && grown <= ( ~static_cast<VkDeviceSize>( 0 ) >> 1 ) ) {
+		grown <<= 1;
+	}
+	return Max( size, grown );
+}
 
 static uint64_t SWVkHashU32( uint64_t hash, uint32_t value ) {
 	hash ^= value;
@@ -220,9 +241,12 @@ private:
 	bool Ensure2DBuffers( int sourcePixelCount );
 	bool EnsureOverlayBuffers( int triCount );
 	bool EnsureHybridBuffers( int requiredWidth, int requiredHeight, int textureInfoCount, int textureTexelCount, int lightCount );
+	bool EnsureHybridTextureBuffers( int textureInfoCount, int textureTexelCount, bool &texelBufferPreserved );
 	bool EnsureShadowBuffers( int width, int height );
 	bool EnsureFrameBuffer();
 	bool UploadBuffer( swVkBuffer_t &buffer, const void *data, VkDeviceSize size, const char *failureText );
+	bool UploadBufferRange( swVkBuffer_t &buffer, VkDeviceSize offset, const void *data, VkDeviceSize size, const char *failureText );
+	bool UploadHybridTextures( const swHybridTextureInfo_t *textureInfos, int textureInfoCount, const unsigned int *textureTexels, int textureTexelCount, unsigned int textureGeneration, bool texelBufferPreserved );
 	bool CreateBuffer( VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, bool deviceAddress, swVkBuffer_t &buffer );
 	void DestroyBuffer( swVkBuffer_t &buffer );
 	VkDeviceAddress GetBufferAddress( VkBuffer buffer ) const;
@@ -1528,6 +1552,24 @@ bool idSoftwareVulkanBridge::UploadBuffer( swVkBuffer_t &buffer, const void *dat
 	return true;
 }
 
+bool idSoftwareVulkanBridge::UploadBufferRange( swVkBuffer_t &buffer, VkDeviceSize offset, const void *data, VkDeviceSize size, const char *failureText ) {
+	if ( size == 0 ) {
+		return true;
+	}
+	if ( !data || buffer.memory == VK_NULL_HANDLE || offset > buffer.size || size > buffer.size - offset ) {
+		return false;
+	}
+
+	void *mapped = NULL;
+	if ( vkMapMemory( device, buffer.memory, offset, size, 0, &mapped ) != VK_SUCCESS ) {
+		LogFailure( failureText );
+		return false;
+	}
+	memcpy( mapped, data, static_cast<size_t>( size ) );
+	vkUnmapMemory( device, buffer.memory );
+	return true;
+}
+
 bool idSoftwareVulkanBridge::Ensure2DBuffers( int sourcePixelCount ) {
 	if ( sourcePixelCount <= 0 ) {
 		return false;
@@ -1554,6 +1596,31 @@ bool idSoftwareVulkanBridge::EnsureOverlayBuffers( int triCount ) {
 	return true;
 }
 
+bool idSoftwareVulkanBridge::EnsureHybridTextureBuffers( int textureInfoCount, int textureTexelCount, bool &texelBufferPreserved ) {
+	textureInfoCount = Max( 1, textureInfoCount );
+	textureTexelCount = Max( 1, textureTexelCount );
+	texelBufferPreserved = true;
+
+	const VkDeviceSize textureInfoSize = static_cast<VkDeviceSize>( textureInfoCount ) * sizeof( swHybridTextureInfo_t );
+	const VkDeviceSize textureTexelSize = static_cast<VkDeviceSize>( textureTexelCount ) * sizeof( uint32_t );
+	const VkDeviceSize textureInfoCapacity = SWVkGrowBufferSize( textureInfoSize, SW_VK_MIN_TEXTURE_INFO_BYTES );
+	const VkDeviceSize textureTexelCapacity = SWVkGrowBufferSize( textureTexelSize, SW_VK_MIN_TEXTURE_TEXEL_BYTES );
+	const VkMemoryPropertyFlags hostMemory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+	if ( hybridTextureInfoBuffer.buffer == VK_NULL_HANDLE || hybridTextureInfoBuffer.size < textureInfoSize ) {
+		if ( !CreateBuffer( textureInfoCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridTextureInfoBuffer ) ) {
+			return false;
+		}
+	}
+	if ( hybridTextureTexelBuffer.buffer == VK_NULL_HANDLE || hybridTextureTexelBuffer.size < textureTexelSize ) {
+		texelBufferPreserved = false;
+		if ( !CreateBuffer( textureTexelCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridTextureTexelBuffer ) ) {
+			return false;
+		}
+	}
+	return true;
+}
+
 bool idSoftwareVulkanBridge::EnsureHybridBuffers( int requiredWidth, int requiredHeight, int textureInfoCount, int textureTexelCount, int lightCount ) {
 	if ( requiredWidth <= 0 || requiredHeight <= 0 || frameWidth <= 0 || frameHeight <= 0 ) {
 		return false;
@@ -1568,8 +1635,6 @@ bool idSoftwareVulkanBridge::EnsureHybridBuffers( int requiredWidth, int require
 	const VkDeviceSize uintSize = pixelCount * sizeof( uint32_t );
 	const VkDeviceSize worldPositionSize = pixelCount * sizeof( idVec4 );
 	const VkDeviceSize frameSize = static_cast<VkDeviceSize>( frameWidth ) * static_cast<VkDeviceSize>( frameHeight ) * sizeof( uint32_t );
-	const VkDeviceSize textureInfoSize = static_cast<VkDeviceSize>( textureInfoCount ) * sizeof( swHybridTextureInfo_t );
-	const VkDeviceSize textureTexelSize = static_cast<VkDeviceSize>( textureTexelCount ) * sizeof( uint32_t );
 	const VkDeviceSize lightSize = static_cast<VkDeviceSize>( lightCount ) * sizeof( swHybridLight_t );
 	const VkMemoryPropertyFlags hostMemory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
@@ -1624,7 +1689,7 @@ bool idSoftwareVulkanBridge::EnsureHybridBuffers( int requiredWidth, int require
 		}
 	}
 	if ( hybridFrameBuffer.buffer == VK_NULL_HANDLE || hybridFrameBuffer.size < frameSize ) {
-		if ( !CreateBuffer( frameSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false, hybridFrameBuffer ) ) {
+		if ( !CreateBuffer( frameSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false, hybridFrameBuffer ) ) {
 			return false;
 		}
 	}
@@ -1633,15 +1698,9 @@ bool idSoftwareVulkanBridge::EnsureHybridBuffers( int requiredWidth, int require
 			return false;
 		}
 	}
-	if ( hybridTextureInfoBuffer.buffer == VK_NULL_HANDLE || hybridTextureInfoBuffer.size < textureInfoSize ) {
-		if ( !CreateBuffer( textureInfoSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridTextureInfoBuffer ) ) {
-			return false;
-		}
-	}
-	if ( hybridTextureTexelBuffer.buffer == VK_NULL_HANDLE || hybridTextureTexelBuffer.size < textureTexelSize ) {
-		if ( !CreateBuffer( textureTexelSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridTextureTexelBuffer ) ) {
-			return false;
-		}
+	bool texelBufferPreserved = true;
+	if ( !EnsureHybridTextureBuffers( textureInfoCount, textureTexelCount, texelBufferPreserved ) ) {
+		return false;
 	}
 	if ( hybridLightBuffer.buffer == VK_NULL_HANDLE || hybridLightBuffer.size < lightSize ) {
 		if ( !CreateBuffer( lightSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridLightBuffer ) ) {
@@ -1980,7 +2039,9 @@ bool idSoftwareVulkanBridge::RecordShadowJob( swVkShadowJob_t &job, const viewLi
 	push.lightOrigin[2] = vLight->globalLightOrigin[2];
 	push.lightOrigin[3] = 1.0f;
 	push.pixelCount = pixelCount;
+	push.sampleCount = static_cast<uint32_t>( idMath::ClampInt( 1, 9, r_softwareRayQueryShadowSamples.GetInteger() ) );
 	push.bias = 2.0f;
+	push.radius = Max( 0.0f, r_softwareRayQueryShadowRadius.GetFloat() );
 
 	vkResetCommandBuffer( job.commandBuffer, 0 );
 
@@ -1996,7 +2057,7 @@ bool idSoftwareVulkanBridge::RecordShadowJob( swVkShadowJob_t &job, const viewLi
 	vkCmdBindPipeline( job.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, shadowPipeline );
 	vkCmdBindDescriptorSets( job.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, shadowPipelineLayout, 0, 1, &job.descriptorSet, 0, NULL );
 	vkCmdPushConstants( job.commandBuffer, shadowPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
-	vkCmdDispatch( job.commandBuffer, ( pixelCount + 63 ) / 64, 1, 1 );
+	vkCmdDispatch( job.commandBuffer, SWVkDispatchGroups( static_cast<uint32_t>( pixelCount ), SW_VK_SHADOW_GROUP_SIZE_X ), 1, 1 );
 
 	VkMemoryBarrier readbackBarrier;
 	memset( &readbackBarrier, 0, sizeof( readbackBarrier ) );
@@ -2634,6 +2695,7 @@ bool idSoftwareVulkanBridge::CompositeHybridGBuffer( const viewDef_t *viewDef, c
 	const swHybridLight_t emptyLight = {};
 	const swHybridLight_t *lights = ( gbuffer.lights && gbuffer.lightCount > 0 ) ? gbuffer.lights : &emptyLight;
 	const int uploadLightCount = Max( 1, gbuffer.lightCount );
+	const VkBuffer oldTextureTexelBuffer = hybridTextureTexelBuffer.buffer;
 	if ( !EnsureInitialized() || !EnsureFrameBuffer() || !EnsureHybridBuffers( width, height, gbuffer.textureInfoCount, gbuffer.textureTexelCount, uploadLightCount ) ) {
 		return false;
 	}
@@ -2642,8 +2704,6 @@ bool idSoftwareVulkanBridge::CompositeHybridGBuffer( const viewDef_t *viewDef, c
 	const VkDeviceSize depthSize = pixelCount * sizeof( float );
 	const VkDeviceSize uintSize = pixelCount * sizeof( uint32_t );
 	const VkDeviceSize worldPositionSize = pixelCount * sizeof( idVec4 );
-	const VkDeviceSize textureInfoSize = static_cast<VkDeviceSize>( gbuffer.textureInfoCount ) * sizeof( swHybridTextureInfo_t );
-	const VkDeviceSize textureTexelSize = static_cast<VkDeviceSize>( gbuffer.textureTexelCount ) * sizeof( uint32_t );
 	const VkDeviceSize lightSize = static_cast<VkDeviceSize>( uploadLightCount ) * sizeof( swHybridLight_t );
 	if ( !UploadBuffer( hybridDepthBuffer, gbuffer.depth, depthSize, "vkMapMemory hybrid depth failed" ) ||
 		 !UploadBuffer( hybridNormalBuffer, gbuffer.normalPacked, uintSize, "vkMapMemory hybrid normals failed" ) ||
@@ -2658,12 +2718,9 @@ bool idSoftwareVulkanBridge::CompositeHybridGBuffer( const viewDef_t *viewDef, c
 		 !UploadBuffer( hybridLightBuffer, lights, lightSize, "vkMapMemory hybrid lights failed" ) ) {
 		return false;
 	}
-	if ( hybridUploadedTextureGeneration != gbuffer.textureGeneration ) {
-		if ( !UploadBuffer( hybridTextureInfoBuffer, gbuffer.textureInfos, textureInfoSize, "vkMapMemory hybrid texture infos failed" ) ||
-			 !UploadBuffer( hybridTextureTexelBuffer, gbuffer.textureTexels, textureTexelSize, "vkMapMemory hybrid texture texels failed" ) ) {
-			return false;
-		}
-		hybridUploadedTextureGeneration = gbuffer.textureGeneration;
+	if ( !UploadHybridTextures( gbuffer.textureInfos, gbuffer.textureInfoCount, gbuffer.textureTexels, gbuffer.textureTexelCount,
+		 gbuffer.textureGeneration, oldTextureTexelBuffer == hybridTextureTexelBuffer.buffer ) ) {
+		return false;
 	}
 
 	hybridShadowEnabled = false;
@@ -2692,6 +2749,43 @@ bool idSoftwareVulkanBridge::CompositeHybridGBuffer( const viewDef_t *viewDef, c
 	return true;
 }
 
+bool idSoftwareVulkanBridge::UploadHybridTextures( const swHybridTextureInfo_t *textureInfos, int textureInfoCount, const unsigned int *textureTexels, int textureTexelCount, unsigned int textureGeneration, bool texelBufferPreserved ) {
+	if ( hybridUploadedTextureGeneration == textureGeneration &&
+		 hybridTextureCount == textureInfoCount &&
+		 hybridTextureTexelCount == textureTexelCount ) {
+		return true;
+	}
+
+	const VkDeviceSize textureInfoSize = static_cast<VkDeviceSize>( textureInfoCount ) * sizeof( swHybridTextureInfo_t );
+	const VkDeviceSize textureTexelSize = static_cast<VkDeviceSize>( textureTexelCount ) * sizeof( uint32_t );
+	const int oldTextureTexelCount = hybridTextureTexelCount;
+	const bool appendOnly = texelBufferPreserved &&
+		hybridUploadedTextureGeneration != 0 &&
+		oldTextureTexelCount > 0 &&
+		textureTexelCount >= oldTextureTexelCount;
+
+	if ( !UploadBuffer( hybridTextureInfoBuffer, textureInfos, textureInfoSize, "vkMapMemory hybrid texture infos failed" ) ) {
+		return false;
+	}
+
+	if ( appendOnly ) {
+		const int appendedTexels = textureTexelCount - oldTextureTexelCount;
+		const VkDeviceSize appendedSize = static_cast<VkDeviceSize>( appendedTexels ) * sizeof( uint32_t );
+		const VkDeviceSize appendedOffset = static_cast<VkDeviceSize>( oldTextureTexelCount ) * sizeof( uint32_t );
+		if ( !UploadBufferRange( hybridTextureTexelBuffer, appendedOffset, textureTexels + oldTextureTexelCount,
+			 appendedSize, "vkMapMemory hybrid texture append failed" ) ) {
+			return false;
+		}
+	} else if ( !UploadBuffer( hybridTextureTexelBuffer, textureTexels, textureTexelSize, "vkMapMemory hybrid texture texels failed" ) ) {
+		return false;
+	}
+
+	hybridTextureCount = textureInfoCount;
+	hybridTextureTexelCount = textureTexelCount;
+	hybridUploadedTextureGeneration = textureGeneration;
+	return true;
+}
+
 bool idSoftwareVulkanBridge::UpdateHybridTextures( const swHybridTextureInfo_t *textureInfos, int textureInfoCount, const unsigned int *textureTexels, int textureTexelCount, unsigned int textureGeneration ) {
 	if ( !textureInfos || textureInfoCount <= 0 || !textureTexels || textureTexelCount <= 0 ) {
 		return false;
@@ -2712,27 +2806,12 @@ bool idSoftwareVulkanBridge::UpdateHybridTextures( const swHybridTextureInfo_t *
 		return true;
 	}
 
-	const VkDeviceSize textureInfoSize = static_cast<VkDeviceSize>( textureInfoCount ) * sizeof( swHybridTextureInfo_t );
-	const VkDeviceSize textureTexelSize = static_cast<VkDeviceSize>( textureTexelCount ) * sizeof( uint32_t );
-	const VkMemoryPropertyFlags hostMemory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-	if ( hybridTextureInfoBuffer.buffer == VK_NULL_HANDLE || hybridTextureInfoBuffer.size < textureInfoSize ) {
-		if ( !CreateBuffer( textureInfoSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridTextureInfoBuffer ) ) {
-			return false;
-		}
-	}
-	if ( hybridTextureTexelBuffer.buffer == VK_NULL_HANDLE || hybridTextureTexelBuffer.size < textureTexelSize ) {
-		if ( !CreateBuffer( textureTexelSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridTextureTexelBuffer ) ) {
-			return false;
-		}
-	}
-	if ( !UploadBuffer( hybridTextureInfoBuffer, textureInfos, textureInfoSize, "vkMapMemory hybrid texture infos failed" ) ||
-		 !UploadBuffer( hybridTextureTexelBuffer, textureTexels, textureTexelSize, "vkMapMemory hybrid texture texels failed" ) ) {
+	bool texelBufferPreserved = true;
+	if ( !EnsureHybridTextureBuffers( textureInfoCount, textureTexelCount, texelBufferPreserved ) ||
+		 !UploadHybridTextures( textureInfos, textureInfoCount, textureTexels, textureTexelCount, textureGeneration, texelBufferPreserved ) ) {
 		return false;
 	}
 
-	hybridTextureCount = textureInfoCount;
-	hybridTextureTexelCount = textureTexelCount;
-	hybridUploadedTextureGeneration = textureGeneration;
 	if ( hybridFrameDirty ) {
 		UpdateHybridDescriptorSet();
 	}
@@ -2817,7 +2896,9 @@ bool idSoftwareVulkanBridge::Record2DCompositeCommands( bool targetFrame ) {
 		vkCmdPushConstants( commandBuffer, twoDPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
 		const uint32_t dispatchWidth = ( i == 0 ) ? static_cast<uint32_t>( frameWidth ) : static_cast<uint32_t>( job.presentWidth );
 		const uint32_t dispatchHeight = ( i == 0 ) ? static_cast<uint32_t>( frameHeight ) : static_cast<uint32_t>( job.presentHeight );
-		vkCmdDispatch( commandBuffer, ( dispatchWidth + 7u ) / 8u, ( dispatchHeight + 7u ) / 8u, 1 );
+		vkCmdDispatch( commandBuffer,
+			SWVkDispatchGroups( dispatchWidth, SW_VK_COMPUTE_GROUP_SIZE_X ),
+			SWVkDispatchGroups( dispatchHeight, SW_VK_COMPUTE_GROUP_SIZE_Y ), 1 );
 
 		VkMemoryBarrier jobBarrier;
 		memset( &jobBarrier, 0, sizeof( jobBarrier ) );
@@ -2875,7 +2956,9 @@ bool idSoftwareVulkanBridge::RecordOverlayRasterCommands( bool targetFrame ) {
 		push.textureCount = static_cast<uint32_t>( Max( 0, hybridTextureCount ) );
 		push.targetFrame = 0u;
 		vkCmdPushConstants( commandBuffer, overlayPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
-		vkCmdDispatch( commandBuffer, ( static_cast<uint32_t>( frameWidth ) + 7u ) / 8u, ( static_cast<uint32_t>( frameHeight ) + 7u ) / 8u, 1 );
+		vkCmdDispatch( commandBuffer,
+			SWVkDispatchGroups( static_cast<uint32_t>( frameWidth ), SW_VK_COMPUTE_GROUP_SIZE_X ),
+			SWVkDispatchGroups( static_cast<uint32_t>( frameHeight ), SW_VK_COMPUTE_GROUP_SIZE_Y ), 1 );
 
 		VkMemoryBarrier clearBarrier;
 		memset( &clearBarrier, 0, sizeof( clearBarrier ) );
@@ -2929,7 +3012,9 @@ bool idSoftwareVulkanBridge::RecordOverlayRasterCommands( bool targetFrame ) {
 		push.targetFrame = targetFrame ? 1u : 0u;
 
 		vkCmdPushConstants( commandBuffer, overlayPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
-		vkCmdDispatch( commandBuffer, ( static_cast<uint32_t>( x1 - x0 ) + 7u ) / 8u, ( static_cast<uint32_t>( y1 - y0 ) + 7u ) / 8u, 1 );
+		vkCmdDispatch( commandBuffer,
+			SWVkDispatchGroups( static_cast<uint32_t>( x1 - x0 ), SW_VK_COMPUTE_GROUP_SIZE_X ),
+			SWVkDispatchGroups( static_cast<uint32_t>( y1 - y0 ), SW_VK_COMPUTE_GROUP_SIZE_Y ), 1 );
 
 		VkMemoryBarrier triBarrier;
 		memset( &triBarrier, 0, sizeof( triBarrier ) );
@@ -2959,6 +3044,34 @@ bool idSoftwareVulkanBridge::RecordHybridCompositeCommands( bool outputForComput
 		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		0, 1, &inputBarrier, 0, NULL, 0, NULL );
 
+	const VkDeviceSize frameSize = static_cast<VkDeviceSize>( frameWidth ) * static_cast<VkDeviceSize>( frameHeight ) * sizeof( uint32_t );
+	vkCmdFillBuffer( commandBuffer, hybridFrameBuffer.buffer, 0, frameSize, 0xff000000u );
+
+	const int dispatchX0 = Max( 0, hybridViewportX );
+	const int dispatchY0 = Max( 0, hybridViewportY );
+	const int dispatchX1 = Max( dispatchX0, Min( frameWidth, hybridViewportX + hybridPresentWidth ) );
+	const int dispatchY1 = Max( dispatchY0, Min( frameHeight, hybridViewportY + hybridPresentHeight ) );
+	const uint32_t dispatchWidth = hybridOverlayOnly ? 0u : static_cast<uint32_t>( dispatchX1 - dispatchX0 );
+	const uint32_t dispatchHeight = hybridOverlayOnly ? 0u : static_cast<uint32_t>( dispatchY1 - dispatchY0 );
+	const bool dispatchComposite = dispatchWidth != 0u && dispatchHeight != 0u;
+
+	VkMemoryBarrier clearBarrier;
+	memset( &clearBarrier, 0, sizeof( clearBarrier ) );
+	clearBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	clearBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	clearBarrier.dstAccessMask = !dispatchComposite ?
+		( outputForCompute ? ( VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT ) : VK_ACCESS_TRANSFER_READ_BIT ) :
+		VK_ACCESS_SHADER_WRITE_BIT;
+	const VkPipelineStageFlags clearDstStage = dispatchComposite || outputForCompute ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT;
+	vkCmdPipelineBarrier( commandBuffer,
+		VK_PIPELINE_STAGE_TRANSFER_BIT,
+		clearDstStage,
+		0, 1, &clearBarrier, 0, NULL, 0, NULL );
+
+	if ( !dispatchComposite ) {
+		return true;
+	}
+
 	swVkHybridPushConstants_t push;
 	memset( &push, 0, sizeof( push ) );
 	push.dims[0] = static_cast<uint32_t>( hybridWidth );
@@ -2969,12 +3082,18 @@ bool idSoftwareVulkanBridge::RecordHybridCompositeCommands( bool outputForComput
 	push.viewport[1] = hybridViewportY;
 	push.viewport[2] = hybridPresentWidth;
 	push.viewport[3] = hybridPresentHeight;
+	push.dispatch[0] = dispatchX0;
+	push.dispatch[1] = dispatchY0;
+	push.dispatch[2] = static_cast<int32_t>( dispatchWidth );
+	push.dispatch[3] = static_cast<int32_t>( dispatchHeight );
 	push.debugView = static_cast<uint32_t>( hybridDebugView );
 	push.textureCount = static_cast<uint32_t>( Max( 0, hybridTextureCount ) );
 	push.overlayEnabled = outputForCompute ? 0u : ( hybridOverlayDirty ? 1u : 0u );
 	push.lightCount = static_cast<uint32_t>( Max( 0, hybridLightCount ) );
 	push.shadowEnabled = hybridShadowEnabled ? 1u : 0u;
 	push.overlayOnly = hybridOverlayOnly ? 1u : 0u;
+	push.shadowSamples = static_cast<uint32_t>( idMath::ClampInt( 1, 9, r_softwareRayQueryShadowSamples.GetInteger() ) );
+	push.shadowRadius = Max( 0.0f, r_softwareRayQueryShadowRadius.GetFloat() );
 	push.viewOrigin[0] = hybridViewOrigin[0];
 	push.viewOrigin[1] = hybridViewOrigin[1];
 	push.viewOrigin[2] = hybridViewOrigin[2];
@@ -2983,7 +3102,9 @@ bool idSoftwareVulkanBridge::RecordHybridCompositeCommands( bool outputForComput
 	vkCmdBindPipeline( commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, hybridPipeline );
 	vkCmdBindDescriptorSets( commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, hybridPipelineLayout, 0, 1, &hybridDescriptorSet, 0, NULL );
 	vkCmdPushConstants( commandBuffer, hybridPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
-	vkCmdDispatch( commandBuffer, ( static_cast<uint32_t>( frameWidth ) + 7u ) / 8u, ( static_cast<uint32_t>( frameHeight ) + 7u ) / 8u, 1 );
+	vkCmdDispatch( commandBuffer,
+		SWVkDispatchGroups( dispatchWidth, SW_VK_COMPUTE_GROUP_SIZE_X ),
+		SWVkDispatchGroups( dispatchHeight, SW_VK_COMPUTE_GROUP_SIZE_Y ), 1 );
 
 	VkMemoryBarrier outputBarrier;
 	memset( &outputBarrier, 0, sizeof( outputBarrier ) );

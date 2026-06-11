@@ -600,10 +600,6 @@ void idSoftwareRasterizer::ReadCurrentFramebuffer( const viewDef_t *viewDef ) {
 	}
 	qglReadPixels( viewDef->viewport.x1, viewDef->viewport.y1, width, height, GL_BGRA_EXT, GL_UNSIGNED_BYTE, colorBuffer.Ptr() );
 }
-
-#if defined( _MSC_VER )
-#pragma optimize( "", off )
-#endif
 void idSoftwareRasterizer::DrawView( const viewDef_t *viewDef ) {
 	if ( !viewDef ) {
 		return;
@@ -710,9 +706,6 @@ void idSoftwareRasterizer::DrawView( const viewDef_t *viewDef ) {
 	}
 	Present();
 }
-#if defined( _MSC_VER )
-#pragma optimize( "", on )
-#endif
 
 void idSoftwareRasterizer::SetupTriangles( const viewDef_t *viewDef ) {
 	const bool is2DView = viewDef->viewEntitys == NULL;
@@ -821,9 +814,6 @@ void idSoftwareRasterizer::SetupDrawSurf( const viewDef_t *viewDef, const drawSu
 	SetupDrawSurfStage( viewDef, surf, stage );
 }
 
-#if defined( _MSC_VER )
-#pragma optimize( "", off )
-#endif
 void idSoftwareRasterizer::SetupDepthDrawSurf( const viewDef_t *viewDef, const drawSurf_t *surf ) {
 	const srfTriangles_t *geo = surf->geo;
 	if ( !geo->indexes || geo->numIndexes < 3 || !surf->space || !surf->material->IsDrawn() ) {
@@ -921,9 +911,6 @@ void idSoftwareRasterizer::SetupDepthDrawSurf( const viewDef_t *viewDef, const d
 		SetupDrawSurfStage( viewDef, surf, stage );
 	}
 }
-#if defined( _MSC_VER )
-#pragma optimize( "", on )
-#endif
 
 void idSoftwareRasterizer::ConfigureStageForView( const viewDef_t *viewDef, const drawSurf_t *surf, swSurfaceStage_t &stage ) const {
 	const bool is2DView = viewDef->viewEntitys == NULL;
@@ -1804,7 +1791,7 @@ void idSoftwareRasterizer::BuildHybridTextureUpload( swHybridGBufferUpload_t &gb
 		 hybridTextureInfos.Num() == 0 ||
 		 hybridTextureTexels.Num() == 0 ) {
 		const unsigned int whiteTexel = PackColor( 255, 255, 255, 255 );
-		const int maxHybridTextureTexels = 64 * 1024 * 1024;
+		const int maxHybridTextureTexels = 128 * 1024 * 1024;
 		const int textureCount = Max( 1, textureCache.Num() );
 
 		hybridTextureInfos.SetNum( textureCount, false );
@@ -1863,9 +1850,6 @@ void idSoftwareRasterizer::BuildHybridTextureUpload( swHybridGBufferUpload_t &gb
 	gbuffer.textureGeneration = hybridTextureAtlasGeneration;
 }
 
-#if defined( _MSC_VER )
-#pragma optimize( "", off )
-#endif
 void idSoftwareRasterizer::BuildHybridLightUpload( const viewDef_t *viewDef, swHybridGBufferUpload_t &gbuffer ) {
 	hybridLights.SetNum( 0, false );
 	if ( !viewDef ) {
@@ -1966,9 +1950,6 @@ void idSoftwareRasterizer::BuildHybridLightUpload( const viewDef_t *viewDef, swH
 	gbuffer.lights = hybridLights.Num() > 0 ? hybridLights.Ptr() : NULL;
 	gbuffer.lightCount = hybridLights.Num();
 }
-#if defined( _MSC_VER )
-#pragma optimize( "", on )
-#endif
 
 void idSoftwareRasterizer::BuildHybridOverlayTriangles( idList<swHybridOverlayTri_t> &overlayTris ) const {
 	overlayTris.SetNum( 0, false );

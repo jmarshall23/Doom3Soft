@@ -1,7 +1,7 @@
 #version 460
 #extension GL_EXT_ray_query : require
 
-layout( local_size_x = 64 ) in;
+layout( local_size_x = 128 ) in;
 
 layout( set = 0, binding = 0 ) uniform accelerationStructureEXT sceneAS;
 layout( set = 0, binding = 1, std430 ) readonly buffer WorldPositions {
@@ -14,8 +14,72 @@ layout( set = 0, binding = 2, std430 ) writeonly buffer ShadowMask {
 layout( push_constant ) uniform PushConstants {
 	vec4 lightOrigin;
 	uint pixelCount;
+	uint sampleCount;
 	float bias;
+	float radius;
 } pc;
+
+const uint MAX_SHADOW_SAMPLES = 9u;
+
+vec2 ShadowDiskOffset( uint sampleIndex ) {
+	if ( sampleIndex == 1u ) {
+		return vec2( 0.55, 0.0 );
+	}
+	if ( sampleIndex == 2u ) {
+		return vec2( -0.55, 0.0 );
+	}
+	if ( sampleIndex == 3u ) {
+		return vec2( 0.0, 0.55 );
+	}
+	if ( sampleIndex == 4u ) {
+		return vec2( 0.0, -0.55 );
+	}
+	if ( sampleIndex == 5u ) {
+		return vec2( 0.38, 0.38 );
+	}
+	if ( sampleIndex == 6u ) {
+		return vec2( -0.38, 0.38 );
+	}
+	if ( sampleIndex == 7u ) {
+		return vec2( 0.38, -0.38 );
+	}
+	if ( sampleIndex == 8u ) {
+		return vec2( -0.38, -0.38 );
+	}
+	return vec2( 0.0 );
+}
+
+void BuildShadowBasis( vec3 direction, out vec3 right, out vec3 up ) {
+	vec3 helper = abs( direction.z ) < 0.999 ? vec3( 0.0, 0.0, 1.0 ) : vec3( 0.0, 1.0, 0.0 );
+	right = normalize( cross( helper, direction ) );
+	up = cross( direction, right );
+}
+
+float TraceVisibility( vec3 worldPos, vec3 lightPosition ) {
+	vec3 toLight = lightPosition - worldPos;
+	float distanceToLight = length( toLight );
+	if ( distanceToLight <= pc.bias * 2.0 ) {
+		return 1.0;
+	}
+
+	vec3 direction = toLight / distanceToLight;
+	vec3 origin = worldPos + direction * pc.bias;
+	float tMax = max( 0.0, distanceToLight - pc.bias * 2.0 );
+
+	rayQueryEXT rayQuery;
+	rayQueryInitializeEXT(
+		rayQuery,
+		sceneAS,
+		gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
+		0xff,
+		origin,
+		0.0,
+		direction,
+		tMax );
+	rayQueryProceedEXT( rayQuery );
+
+	return rayQueryGetIntersectionTypeEXT( rayQuery, true ) == gl_RayQueryCommittedIntersectionNoneEXT ? 1.0 : 0.0;
+}
 
 void main() {
 	uint index = gl_GlobalInvocationID.x;
@@ -37,21 +101,17 @@ void main() {
 	}
 
 	vec3 direction = toLight / distanceToLight;
-	vec3 origin = pos.xyz + direction * pc.bias;
-	float tMax = max( 0.0, distanceToLight - pc.bias * 2.0 );
+	uint samples = pc.radius > 0.0 ? clamp( pc.sampleCount, 1u, MAX_SHADOW_SAMPLES ) : 1u;
+	vec3 right;
+	vec3 up;
+	BuildShadowBasis( direction, right, up );
 
-	rayQueryEXT rayQuery;
-	rayQueryInitializeEXT(
-		rayQuery,
-		sceneAS,
-		gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
-		0xff,
-		origin,
-		0.0,
-		direction,
-		tMax );
-	rayQueryProceedEXT( rayQuery );
+	float visible = 0.0;
+	for ( uint sampleIndex = 0u; sampleIndex < samples; sampleIndex++ ) {
+		vec2 disk = ShadowDiskOffset( sampleIndex ) * pc.radius;
+		vec3 lightPosition = pc.lightOrigin.xyz + right * disk.x + up * disk.y;
+		visible += TraceVisibility( pos.xyz, lightPosition );
+	}
 
-	bool blocked = rayQueryGetIntersectionTypeEXT( rayQuery, true ) != gl_RayQueryCommittedIntersectionNoneEXT;
-	visibility[index] = blocked ? 0u : 255u;
+	visibility[index] = uint( clamp( visible / float( samples ), 0.0, 1.0 ) * 255.0 + 0.5 );
 }

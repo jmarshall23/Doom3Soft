@@ -883,6 +883,8 @@ extern idCVar r_softwareRenderScale;		// scales the 3D software render buffer be
 extern idCVar r_softwareDepthSIMD;		// 1 = use AVX2 packet depth rasterization when available
 extern idCVar r_softwareVulkanPresent;	// 1 = present the software frame through Vulkan
 extern idCVar r_softwareRayQueryShadows;	// 1 = use Vulkan ray queries for software shadow visibility when available
+extern idCVar r_softwareRayQueryShadowSamples;	// soft-shadow ray-query tap count
+extern idCVar r_softwareRayQueryShadowRadius;	// soft-shadow ray-query radius in world units
 extern idCVar r_softwareHybridRayQueryShadows;	// 1 = use per-pixel ray queries in the hybrid compute lighting pass
 extern idCVar r_softwareHybridComputeLighting;	// 1 = use the software G-buffer / Vulkan compute lighting path
 extern idCVar r_softwareHybridDebugView;	// visualizes hybrid G-buffer channels before final compute composite
