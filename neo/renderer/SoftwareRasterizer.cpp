@@ -55,6 +55,12 @@ static const unsigned int SW_OVERLAY_FLAG_COLOR_MOD = BIT(1);
 static const unsigned int SW_OVERLAY_FLAG_ALPHA_TEST = BIT(2);
 static const unsigned int SW_OVERLAY_FLAG_DEPTH_TEST = BIT(3);
 static const unsigned int SW_OVERLAY_FLAG_DEPTH_EQUAL = BIT(4);
+static const unsigned int SW_HYBRID_LIGHT_NORMAL = 0;
+static const unsigned int SW_HYBRID_LIGHT_FOG = 1;
+static const unsigned int SW_HYBRID_LIGHT_BLEND = 2;
+static const int SW_FOG_SIZE = 128;
+static const float SW_FOG_RAMP_RANGE = 8.0f;
+static const float SW_FOG_DEEP_RANGE = -30.0f;
 
 static void SWFillPattern( void *dst, const void *pattern, int count, size_t elementSize ) {
 	if ( !dst || !pattern || count <= 0 || elementSize == 0 ) {
@@ -83,6 +89,58 @@ static void SWZeroList( idList<type> &list ) {
 	if ( list.Num() > 0 ) {
 		memset( list.Ptr(), 0, static_cast<size_t>( list.Num() ) * sizeof( type ) );
 	}
+}
+
+static float SWFogFraction( float viewHeight, float targetHeight ) {
+	const float total = idMath::Fabs( targetHeight - viewHeight );
+	if ( targetHeight > 0.0f && viewHeight > 0.0f ) {
+		return 0.0f;
+	}
+	if ( targetHeight < -SW_FOG_RAMP_RANGE && viewHeight < -SW_FOG_RAMP_RANGE ) {
+		return 1.0f;
+	}
+
+	float above;
+	if ( targetHeight > 0.0f ) {
+		above = targetHeight;
+	} else if ( viewHeight > 0.0f ) {
+		above = viewHeight;
+	} else {
+		above = 0.0f;
+	}
+
+	float rampTop;
+	float rampBottom;
+	if ( viewHeight > targetHeight ) {
+		rampTop = viewHeight;
+		rampBottom = targetHeight;
+	} else {
+		rampTop = targetHeight;
+		rampBottom = viewHeight;
+	}
+	if ( rampTop > 0.0f ) {
+		rampTop = 0.0f;
+	}
+	if ( rampBottom < -SW_FOG_RAMP_RANGE ) {
+		rampBottom = -SW_FOG_RAMP_RANGE;
+	}
+
+	const float rampSlope = 1.0f / SW_FOG_RAMP_RANGE;
+	if ( total == 0.0f ) {
+		return -viewHeight * rampSlope;
+	}
+
+	const float ramp = ( 1.0f - ( rampTop * rampSlope + rampBottom * rampSlope ) * -0.5f ) * ( rampTop - rampBottom );
+	float frac = ( total - above - ramp ) / total;
+
+	const float deepest = viewHeight < targetHeight ? viewHeight : targetHeight;
+	const float deepFrac = deepest / SW_FOG_DEEP_RANGE;
+	if ( deepFrac >= 1.0f ) {
+		return 1.0f;
+	}
+
+	frac = frac * ( 1.0f - deepFrac ) + deepFrac;
+	return idMath::ClampFloat( 0.0f, 1.0f, frac );
 }
 
 enum swBlendMode_t {
@@ -186,6 +244,28 @@ struct swTexture_t {
 	int height;
 	textureRepeat_t repeat;
 	idList<unsigned int> texels;
+};
+
+struct swFogLightState_t {
+	idVec4 color;
+	idVec4 fogPlane;
+	idVec4 enterPlane;
+	float enterS;
+	int fogTextureIndex;
+	int fogEnterTextureIndex;
+	idScreenRect scissorRect;
+};
+
+struct swBlendLightStage_t {
+	idVec4 color;
+	idVec4 lightProject[4];
+	int lightTextureIndex;
+	int falloffTextureIndex;
+	int srcBlend;
+	int dstBlend;
+	int blendMode;
+	int writeMask;
+	idScreenRect scissorRect;
 };
 
 struct swHybridGBuffer_t {
@@ -373,6 +453,7 @@ private:
 	void Clear( bool clearColor );
 	void ClearTileBins();
 	void ClearHybridGBuffer();
+	bool ViewNeedsWorldPosition( const viewDef_t *viewDef ) const;
 	void BeginSurfacePass();
 	void BeginInteractionPass();
 	void ReadCurrentFramebuffer( const viewDef_t *viewDef );
@@ -397,9 +478,16 @@ private:
 	void BinTriangle( int triIndex );
 	void BinInteractionTriangle( int triIndex );
 	void DrawLights( const viewDef_t *viewDef );
+	void ApplyFogLights( const viewDef_t *viewDef );
+	void ApplyFogLight( const swFogLightState_t &fog );
+	void ApplyBlendLight( const swBlendLightStage_t &blend );
 	void WriteHybridDebugView();
 	void BuildHybridTextureUpload( swHybridGBufferUpload_t &gbuffer );
 	void BuildHybridLightUpload( const viewDef_t *viewDef, swHybridGBufferUpload_t &gbuffer );
+	bool BuildFogLightState( const viewDef_t *viewDef, const viewLight_t *vLight, swFogLightState_t &fog );
+	bool BuildBlendLightStage( const viewLight_t *vLight, const shaderStage_t *stage, swBlendLightStage_t &blend );
+	void AddHybridFogLight( const swFogLightState_t &fog );
+	void AddHybridBlendLight( const swBlendLightStage_t &blend );
 	void BuildHybridOverlayTriangles( idList<swHybridOverlayTri_t> &overlayTris ) const;
 	void RasterizeTiles();
 	void RasterizeTileRange( int firstTile, int endTile );
@@ -438,6 +526,8 @@ private:
 	bool LoadGeneratedTexture( swTexture_t &texture, const idImage *image ) const;
 	void LoadDefaultTexture( swTexture_t &texture ) const;
 	unsigned int SampleTexture( int textureIndex, float s, float t ) const;
+	unsigned int SampleTextureLinear( int textureIndex, float s, float t ) const;
+	unsigned int TextureTexel( const swTexture_t &texture, int x, int y ) const;
 	unsigned int SurfaceColor( int surfIndex, const drawSurf_t *surf ) const;
 	static unsigned int DebugTextureColor( int mode, float s, float t );
 	static unsigned int BlendSourceOver( unsigned int src, unsigned int dst );
@@ -506,6 +596,7 @@ private:
 	swRasterPass_t rasterPass;
 	bool shadowMaskActive;
 	unsigned int hybridSurfaceSerial;
+	bool captureWorldPosition;
 
 #if defined( _WIN32 ) && !defined( _D3SDK )
 	bool workersStarted;
@@ -531,6 +622,7 @@ idSoftwareRasterizer::idSoftwareRasterizer() {
 	rasterPass = SW_RASTER_SURFACE;
 	shadowMaskActive = false;
 	hybridSurfaceSerial = 1;
+	captureWorldPosition = false;
 	textureCacheGeneration = 1;
 	hybridTextureAtlasGeneration = 0;
 	hybridImageManagerCount = 0;
@@ -620,6 +712,31 @@ void idSoftwareRasterizer::ClearHybridGBuffer() {
 	SWZeroList( hybridGBuffer.surfaceId );
 }
 
+bool idSoftwareRasterizer::ViewNeedsWorldPosition( const viewDef_t *viewDef ) const {
+	if ( !viewDef || !viewDef->viewEntitys ) {
+		return false;
+	}
+	if ( r_softwareRayQueryShadows.GetBool() || r_softwareHybridComputeLighting.GetBool() ) {
+		return true;
+	}
+	if ( r_skipFogLights.GetBool() || r_showOverDraw.GetInteger() != 0 || viewDef->isXraySubview ) {
+		return false;
+	}
+	for ( const viewLight_t *vLight = viewDef->viewLights; vLight; vLight = vLight->next ) {
+		if ( !vLight->lightShader || vLight->scissorRect.IsEmpty() ) {
+			continue;
+		}
+		if ( vLight->lightShader->IsFogLight() ) {
+			return true;
+		}
+		if ( !r_skipBlendLights.GetBool() && vLight->lightShader->IsBlendLight() &&
+			 ( vLight->localInteractions || vLight->globalInteractions ) ) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void idSoftwareRasterizer::ClearTileBins() {
 	for ( int i = 0; i < tileBins.Num(); i++ ) {
 		tileBins[i].tris.Clear();
@@ -662,6 +779,7 @@ void idSoftwareRasterizer::DrawView( const viewDef_t *viewDef ) {
 	const int renderWidth = Max( 1, idMath::Ftoi( static_cast<float>( presentWidth ) * renderScale + 0.5f ) );
 	const int renderHeight = Max( 1, idMath::Ftoi( static_cast<float>( presentHeight ) * renderScale + 0.5f ) );
 	const bool tryCompute2DOverlay = !is3DView && r_softwareHybridComputeLighting.GetBool() && r_softwareVulkanPresent.GetBool();
+	captureWorldPosition = is3DView && ViewNeedsWorldPosition( viewDef );
 	Resize( renderWidth, renderHeight );
 	if ( viewDef->viewEntitys ) {
 		Clear( true );
@@ -731,6 +849,7 @@ void idSoftwareRasterizer::DrawView( const viewDef_t *viewDef ) {
 		BeginSurfacePass();
 		SetupAmbientTriangles( viewDef );
 		RasterizeTiles();
+		ApplyFogLights( viewDef );
 	} else {
 		if ( tryCompute2DOverlay ) {
 			PrimeHybridTextureCacheFromImageManager();
@@ -1007,7 +1126,7 @@ void idSoftwareRasterizer::ConfigureDepthStage( const drawSurf_t *surf, swSurfac
 	stage.drawStage = true;
 	stage.needsColorModulation = false;
 	stage.alphaTest = false;
-	stage.writeWorldPosition = r_softwareRayQueryShadows.GetBool() || r_softwareHybridComputeLighting.GetBool();
+	stage.writeWorldPosition = captureWorldPosition;
 	stage.writeGBuffer = r_softwareHybridComputeLighting.GetBool();
 	stage.alphaTestValue = 0.0f;
 	stage.alphaTestByte = 0;
@@ -1757,6 +1876,203 @@ void idSoftwareRasterizer::DrawLights( const viewDef_t *viewDef ) {
 	backEnd.vLight = oldLight;
 }
 
+bool idSoftwareRasterizer::BuildFogLightState( const viewDef_t *viewDef, const viewLight_t *vLight, swFogLightState_t &fog ) {
+	if ( !viewDef || !vLight || !vLight->lightShader || !vLight->shaderRegisters || vLight->scissorRect.IsEmpty() || !globalImages ) {
+		return false;
+	}
+
+	const shaderStage_t *stage = vLight->lightShader->GetStage( 0 );
+	if ( !stage || vLight->shaderRegisters[stage->conditionRegister] == 0.0f ) {
+		return false;
+	}
+
+	fog.color[0] = vLight->shaderRegisters[stage->color.registers[0]];
+	fog.color[1] = vLight->shaderRegisters[stage->color.registers[1]];
+	fog.color[2] = vLight->shaderRegisters[stage->color.registers[2]];
+	fog.color[3] = vLight->shaderRegisters[stage->color.registers[3]];
+
+	const float densityDistance = fog.color[3] <= 1.0f ? DEFAULT_FOG_DISTANCE : fog.color[3];
+	const float a = -0.5f / densityDistance;
+	const float *modelView = viewDef->worldSpace.modelViewMatrix;
+	fog.fogPlane[0] = a * modelView[2];
+	fog.fogPlane[1] = a * modelView[6];
+	fog.fogPlane[2] = a * modelView[10];
+	fog.fogPlane[3] = a * modelView[14];
+
+	for ( int i = 0; i < 4; i++ ) {
+		fog.enterPlane[i] = 0.001f * vLight->fogPlane[i];
+	}
+	fog.enterS = FOG_ENTER + viewDef->renderView.vieworg * fog.enterPlane.ToVec3() + fog.enterPlane[3];
+	fog.fogTextureIndex = TextureIndexForImage( globalImages->fogImage );
+	fog.fogEnterTextureIndex = TextureIndexForImage( globalImages->fogEnterImage );
+	fog.scissorRect = vLight->scissorRect;
+	return true;
+}
+
+bool idSoftwareRasterizer::BuildBlendLightStage( const viewLight_t *vLight, const shaderStage_t *stage, swBlendLightStage_t &blend ) {
+	if ( !vLight || !stage || !stage->texture.image || !vLight->shaderRegisters || !vLight->falloffImage || vLight->scissorRect.IsEmpty() ) {
+		return false;
+	}
+	if ( vLight->shaderRegisters[stage->conditionRegister] == 0.0f ) {
+		return false;
+	}
+
+	blend.srcBlend = stage->drawStateBits & GLS_SRCBLEND_BITS;
+	blend.dstBlend = stage->drawStateBits & GLS_DSTBLEND_BITS;
+	if ( blend.srcBlend == GLS_SRCBLEND_ZERO && blend.dstBlend == GLS_DSTBLEND_ONE ) {
+		return false;
+	}
+	blend.blendMode = BlendModeForBits( blend.srcBlend, blend.dstBlend );
+	blend.writeMask = SW_WRITE_COLOR;
+	if ( stage->drawStateBits & GLS_REDMASK ) {
+		blend.writeMask &= ~SW_WRITE_RED;
+	}
+	if ( stage->drawStateBits & GLS_GREENMASK ) {
+		blend.writeMask &= ~SW_WRITE_GREEN;
+	}
+	if ( stage->drawStateBits & GLS_BLUEMASK ) {
+		blend.writeMask &= ~SW_WRITE_BLUE;
+	}
+	if ( stage->drawStateBits & GLS_ALPHAMASK ) {
+		blend.writeMask &= ~SW_WRITE_ALPHA;
+	}
+	if ( blend.writeMask == 0 ) {
+		return false;
+	}
+
+	for ( int i = 0; i < 4; i++ ) {
+		blend.color[i] = vLight->shaderRegisters[stage->color.registers[i]];
+	}
+
+	idPlane projectedLightProject[4];
+	for ( int i = 0; i < 4; i++ ) {
+		projectedLightProject[i] = vLight->lightProject[i];
+	}
+	if ( stage->texture.hasMatrix ) {
+		RB_GetShaderTextureMatrix( vLight->shaderRegisters, &stage->texture, backEnd.lightTextureMatrix );
+		RB_BakeTextureMatrixIntoTexgen( projectedLightProject, backEnd.lightTextureMatrix );
+	}
+	for ( int plane = 0; plane < 4; plane++ ) {
+		for ( int component = 0; component < 4; component++ ) {
+			blend.lightProject[plane][component] = projectedLightProject[plane][component];
+		}
+	}
+
+	blend.lightTextureIndex = TextureIndexForImage( stage->texture.image );
+	blend.falloffTextureIndex = TextureIndexForImage( vLight->falloffImage );
+	blend.scissorRect = vLight->scissorRect;
+	return true;
+}
+
+void idSoftwareRasterizer::ApplyFogLights( const viewDef_t *viewDef ) {
+	if ( !viewDef || !viewDef->viewLights || r_skipFogLights.GetBool() ||
+		 r_showOverDraw.GetInteger() != 0 || viewDef->isXraySubview ) {
+		return;
+	}
+	if ( worldPositionBuffer.Num() != width * height || depthBuffer.Num() != width * height || colorBuffer.Num() != width * height ) {
+		return;
+	}
+
+	for ( const viewLight_t *vLight = viewDef->viewLights; vLight; vLight = vLight->next ) {
+		if ( !vLight->lightShader ) {
+			continue;
+		}
+
+		if ( vLight->lightShader->IsFogLight() ) {
+			swFogLightState_t fog;
+			if ( BuildFogLightState( viewDef, vLight, fog ) ) {
+				ApplyFogLight( fog );
+			}
+			continue;
+		}
+
+		if ( r_skipBlendLights.GetBool() || !vLight->lightShader->IsBlendLight() ||
+			 ( !vLight->globalInteractions && !vLight->localInteractions ) ) {
+			continue;
+		}
+		for ( int stageIndex = 0; stageIndex < vLight->lightShader->GetNumStages(); stageIndex++ ) {
+			const shaderStage_t *stage = vLight->lightShader->GetStage( stageIndex );
+			swBlendLightStage_t blend;
+			if ( BuildBlendLightStage( vLight, stage, blend ) ) {
+				ApplyBlendLight( blend );
+			}
+		}
+	}
+}
+
+void idSoftwareRasterizer::ApplyFogLight( const swFogLightState_t &fog ) {
+	const int denomX = Max( 1, presentWidth );
+	const int denomY = Max( 1, presentHeight );
+	const int x0 = Max( 0, Min( width, ( static_cast<int>( fog.scissorRect.x1 ) * width ) / denomX ) );
+	const int y0 = Max( 0, Min( height, ( static_cast<int>( fog.scissorRect.y1 ) * height ) / denomY ) );
+	const int x1 = Max( x0, Min( width, ( ( static_cast<int>( fog.scissorRect.x2 ) + 1 ) * width + denomX - 1 ) / denomX ) );
+	const int y1 = Max( y0, Min( height, ( ( static_cast<int>( fog.scissorRect.y2 ) + 1 ) * height + denomY - 1 ) / denomY ) );
+
+	for ( int y = y0; y < y1; y++ ) {
+		for ( int x = x0; x < x1; x++ ) {
+			const int index = y * width + x;
+			if ( depthBuffer[index] >= 1.0f || worldPositionBuffer[index][3] <= 0.0f ) {
+				continue;
+			}
+
+			const idVec3 world = worldPositionBuffer[index].ToVec3();
+			const float fogS = DotPlanePoint( fog.fogPlane, world ) + 0.5f;
+			const float enterT = DotPlanePoint( fog.enterPlane, world ) + FOG_ENTER;
+			const unsigned int fogTexel = SampleTextureLinear( fog.fogTextureIndex, fogS, 0.5f );
+			const unsigned int enterTexel = SampleTextureLinear( fog.fogEnterTextureIndex, fog.enterS, enterT );
+			const float alpha = ColorChannel( fogTexel, 24 ) * ColorChannel( enterTexel, 24 );
+			if ( alpha <= 0.0f ) {
+				continue;
+			}
+
+			const unsigned int src = PackColor(
+				ByteFromFloat( fog.color[0] * ColorChannel( fogTexel, 16 ) * ColorChannel( enterTexel, 16 ) ),
+				ByteFromFloat( fog.color[1] * ColorChannel( fogTexel, 8 ) * ColorChannel( enterTexel, 8 ) ),
+				ByteFromFloat( fog.color[2] * ColorChannel( fogTexel, 0 ) * ColorChannel( enterTexel, 0 ) ),
+				ByteFromFloat( alpha ) );
+			colorBuffer[index] = BlendSourceOver( src, colorBuffer[index] );
+		}
+	}
+}
+
+void idSoftwareRasterizer::ApplyBlendLight( const swBlendLightStage_t &blend ) {
+	const int denomX = Max( 1, presentWidth );
+	const int denomY = Max( 1, presentHeight );
+	const int x0 = Max( 0, Min( width, ( static_cast<int>( blend.scissorRect.x1 ) * width ) / denomX ) );
+	const int y0 = Max( 0, Min( height, ( static_cast<int>( blend.scissorRect.y1 ) * height ) / denomY ) );
+	const int x1 = Max( x0, Min( width, ( ( static_cast<int>( blend.scissorRect.x2 ) + 1 ) * width + denomX - 1 ) / denomX ) );
+	const int y1 = Max( y0, Min( height, ( ( static_cast<int>( blend.scissorRect.y2 ) + 1 ) * height + denomY - 1 ) / denomY ) );
+
+	for ( int y = y0; y < y1; y++ ) {
+		for ( int x = x0; x < x1; x++ ) {
+			const int index = y * width + x;
+			if ( depthBuffer[index] >= 1.0f || worldPositionBuffer[index][3] <= 0.0f ) {
+				continue;
+			}
+
+			const idVec3 world = worldPositionBuffer[index].ToVec3();
+			const float lightQ = DotPlanePoint( blend.lightProject[2], world );
+			if ( lightQ <= 0.00001f ) {
+				continue;
+			}
+			const float lightS = DotPlanePoint( blend.lightProject[0], world ) / lightQ;
+			const float lightT = DotPlanePoint( blend.lightProject[1], world ) / lightQ;
+			const float falloffS = DotPlanePoint( blend.lightProject[3], world );
+			const unsigned int lightTexel = SampleTextureLinear( blend.lightTextureIndex, lightS, lightT );
+			const unsigned int falloffTexel = SampleTextureLinear( blend.falloffTextureIndex, falloffS, 0.5f );
+
+			const unsigned int src = PackColor(
+				ByteFromFloat( blend.color[0] * ColorChannel( lightTexel, 16 ) * ColorChannel( falloffTexel, 16 ) ),
+				ByteFromFloat( blend.color[1] * ColorChannel( lightTexel, 8 ) * ColorChannel( falloffTexel, 8 ) ),
+				ByteFromFloat( blend.color[2] * ColorChannel( lightTexel, 0 ) * ColorChannel( falloffTexel, 0 ) ),
+				ByteFromFloat( blend.color[3] * ColorChannel( lightTexel, 24 ) * ColorChannel( falloffTexel, 24 ) ) );
+			const unsigned int dst = colorBuffer[index];
+			const unsigned int blended = BlendColor( src, dst, blend.srcBlend, blend.dstBlend, blend.blendMode );
+			colorBuffer[index] = ApplyWriteMask( blended, dst, blend.writeMask );
+		}
+	}
+}
+
 void idSoftwareRasterizer::WriteHybridDebugView() {
 	const int pixelCount = width * height;
 	if ( colorBuffer.Num() != pixelCount || hybridGBuffer.depth.Num() != pixelCount ) {
@@ -1911,8 +2227,32 @@ void idSoftwareRasterizer::BuildHybridLightUpload( const viewDef_t *viewDef, swH
 	}
 
 	static const int MAX_HYBRID_LIGHTS = 64;
+	const bool skipFogSystem = r_skipFogLights.GetBool() || r_showOverDraw.GetInteger() != 0 || viewDef->isXraySubview;
 	for ( const viewLight_t *vLight = viewDef->viewLights; vLight && hybridLights.Num() < MAX_HYBRID_LIGHTS; vLight = vLight->next ) {
-		if ( !vLight->lightShader || vLight->lightShader->IsFogLight() || vLight->lightShader->IsBlendLight() ) {
+		if ( !vLight->lightShader ) {
+			continue;
+		}
+		if ( vLight->lightShader->IsFogLight() ) {
+			if ( skipFogSystem ) {
+				continue;
+			}
+			swFogLightState_t fog;
+			if ( BuildFogLightState( viewDef, vLight, fog ) ) {
+				AddHybridFogLight( fog );
+			}
+			continue;
+		}
+		if ( vLight->lightShader->IsBlendLight() ) {
+			if ( skipFogSystem || r_skipBlendLights.GetBool() || ( !vLight->globalInteractions && !vLight->localInteractions ) ) {
+				continue;
+			}
+			for ( int stageIndex = 0; stageIndex < vLight->lightShader->GetNumStages() && hybridLights.Num() < MAX_HYBRID_LIGHTS; stageIndex++ ) {
+				const shaderStage_t *stage = vLight->lightShader->GetStage( stageIndex );
+				swBlendLightStage_t blend;
+				if ( BuildBlendLightStage( vLight, stage, blend ) ) {
+					AddHybridBlendLight( blend );
+				}
+			}
 			continue;
 		}
 		if ( !vLight->localInteractions && !vLight->globalInteractions && !vLight->translucentInteractions ) {
@@ -1987,7 +2327,7 @@ void idSoftwareRasterizer::BuildHybridLightUpload( const viewDef_t *viewDef, swH
 		light.flags[0] = vLight->lightShader->IsAmbientLight() ? 1u : 0u;
 		light.flags[1] = parallel ? 1u : 0u;
 		light.flags[2] = ( !vLight->lightShader->IsAmbientLight() && r_softwareRayQueryShadows.GetBool() && r_softwareHybridRayQueryShadows.GetBool() ) ? 1u : 0u;
-		light.flags[3] = 0u;
+		light.flags[3] = SW_HYBRID_LIGHT_NORMAL;
 		for ( int plane = 0; plane < 4; plane++ ) {
 			for ( int component = 0; component < 4; component++ ) {
 				light.lightProject[plane][component] = projectedLightProject[plane][component];
@@ -2001,6 +2341,50 @@ void idSoftwareRasterizer::BuildHybridLightUpload( const viewDef_t *viewDef, swH
 
 	gbuffer.lights = hybridLights.Num() > 0 ? hybridLights.Ptr() : NULL;
 	gbuffer.lightCount = hybridLights.Num();
+}
+
+void idSoftwareRasterizer::AddHybridFogLight( const swFogLightState_t &fog ) {
+	swHybridLight_t &light = hybridLights.Alloc();
+	memset( &light, 0, sizeof( light ) );
+	light.originRadius[3] = fog.enterS;
+	for ( int i = 0; i < 4; i++ ) {
+		light.color[i] = fog.color[i];
+	}
+	light.scissor[0] = Max( 0, Min( presentWidth - 1, static_cast<int>( fog.scissorRect.x1 ) ) );
+	light.scissor[1] = Max( 0, Min( presentHeight - 1, static_cast<int>( fog.scissorRect.y1 ) ) );
+	light.scissor[2] = Max( 0, Min( presentWidth - 1, static_cast<int>( fog.scissorRect.x2 ) ) );
+	light.scissor[3] = Max( 0, Min( presentHeight - 1, static_cast<int>( fog.scissorRect.y2 ) ) );
+	light.flags[3] = SW_HYBRID_LIGHT_FOG;
+	for ( int i = 0; i < 4; i++ ) {
+		light.lightProject[0][i] = fog.fogPlane[i];
+		light.lightProject[1][i] = fog.enterPlane[i];
+	}
+	light.textureIds[0] = PackOptionalTextureId16( fog.fogTextureIndex );
+	light.textureIds[1] = PackOptionalTextureId16( fog.fogEnterTextureIndex );
+}
+
+void idSoftwareRasterizer::AddHybridBlendLight( const swBlendLightStage_t &blend ) {
+	swHybridLight_t &light = hybridLights.Alloc();
+	memset( &light, 0, sizeof( light ) );
+	for ( int i = 0; i < 4; i++ ) {
+		light.color[i] = blend.color[i];
+	}
+	light.scissor[0] = Max( 0, Min( presentWidth - 1, static_cast<int>( blend.scissorRect.x1 ) ) );
+	light.scissor[1] = Max( 0, Min( presentHeight - 1, static_cast<int>( blend.scissorRect.y1 ) ) );
+	light.scissor[2] = Max( 0, Min( presentWidth - 1, static_cast<int>( blend.scissorRect.x2 ) ) );
+	light.scissor[3] = Max( 0, Min( presentHeight - 1, static_cast<int>( blend.scissorRect.y2 ) ) );
+	light.flags[0] = static_cast<unsigned int>( blend.blendMode );
+	light.flags[1] = static_cast<unsigned int>( blend.srcBlend );
+	light.flags[2] = static_cast<unsigned int>( blend.dstBlend );
+	light.flags[3] = SW_HYBRID_LIGHT_BLEND;
+	for ( int plane = 0; plane < 4; plane++ ) {
+		for ( int component = 0; component < 4; component++ ) {
+			light.lightProject[plane][component] = blend.lightProject[plane][component];
+		}
+	}
+	light.textureIds[0] = PackOptionalTextureId16( blend.lightTextureIndex );
+	light.textureIds[1] = PackOptionalTextureId16( blend.falloffTextureIndex );
+	light.textureIds[2] = static_cast<unsigned int>( blend.writeMask );
 }
 
 void idSoftwareRasterizer::BuildHybridOverlayTriangles( idList<swHybridOverlayTri_t> &overlayTris ) const {
@@ -3011,8 +3395,8 @@ unsigned int idSoftwareRasterizer::ShadeInteractionPixel( const swInteractionTri
 	const float lightT = DotPlanePoint( tri.lightProjection[1], localPos ) / lightQ;
 	const float falloffS = DotPlanePoint( tri.lightProjection[3], localPos );
 
-	const unsigned int lightTexel = SampleTexture( tri.lightTextureIndex, lightS, lightT );
-	const unsigned int falloffTexel = SampleTexture( tri.falloffTextureIndex, falloffS, 0.5f );
+	const unsigned int lightTexel = SampleTextureLinear( tri.lightTextureIndex, lightS, lightT );
+	const unsigned int falloffTexel = SampleTextureLinear( tri.falloffTextureIndex, falloffS, 0.5f );
 	const float falloff = ColorChannel( falloffTexel, 16 );
 	if ( falloff <= 0.0f || ( lightTexel & 0x00ffffffu ) == 0 ) {
 		return 0;
@@ -3608,6 +3992,47 @@ bool idSoftwareRasterizer::LoadGeneratedTexture( swTexture_t &texture, const idI
 		texture.texels[0] = PackColor( 128, 128, 255, 255 );
 		return true;
 	}
+	if ( image == globalImages->fogImage ) {
+		texture.width = SW_FOG_SIZE;
+		texture.height = SW_FOG_SIZE;
+		texture.repeat = TR_CLAMP;
+		texture.texels.SetNum( texture.width * texture.height, false );
+
+		float step[256];
+		float remaining = 1.0f;
+		for ( int i = 0; i < 256; i++ ) {
+			step[i] = remaining;
+			remaining *= 0.982f;
+		}
+
+		for ( int y = 0; y < texture.height; y++ ) {
+			for ( int x = 0; x < texture.width; x++ ) {
+				float d = idMath::Sqrt( static_cast<float>( ( x - SW_FOG_SIZE / 2 ) * ( x - SW_FOG_SIZE / 2 ) +
+					( y - SW_FOG_SIZE / 2 ) * ( y - SW_FOG_SIZE / 2 ) ) );
+				d /= static_cast<float>( SW_FOG_SIZE / 2 - 1 );
+				int b = Max( 0, Min( 255, static_cast<int>( d * 255.0f ) ) );
+				b = ByteFromFloat( 1.0f - step[b] );
+				if ( x == 0 || x == texture.width - 1 || y == 0 || y == texture.height - 1 ) {
+					b = 255;
+				}
+				texture.texels[y * texture.width + x] = PackColor( 255, 255, 255, b );
+			}
+		}
+		return true;
+	}
+	if ( image == globalImages->fogEnterImage ) {
+		texture.width = FOG_ENTER_SIZE;
+		texture.height = FOG_ENTER_SIZE;
+		texture.repeat = TR_CLAMP;
+		texture.texels.SetNum( texture.width * texture.height, false );
+		for ( int y = 0; y < texture.height; y++ ) {
+			for ( int x = 0; x < texture.width; x++ ) {
+				const float d = SWFogFraction( static_cast<float>( x - FOG_ENTER_SIZE / 2 ), static_cast<float>( y - FOG_ENTER_SIZE / 2 ) );
+				texture.texels[y * texture.width + x] = PackColor( 255, 255, 255, ByteFromFloat( d ) );
+			}
+		}
+		return true;
+	}
 	if ( image != globalImages->defaultImage ) {
 		return false;
 	}
@@ -3652,6 +4077,70 @@ unsigned int idSoftwareRasterizer::SampleTexture( int textureIndex, float s, flo
 	x = Max( 0, Min( texture.width - 1, x ) );
 	y = Max( 0, Min( texture.height - 1, y ) );
 	return texture.texels[y * texture.width + x];
+}
+
+unsigned int idSoftwareRasterizer::TextureTexel( const swTexture_t &texture, int x, int y ) const {
+	if ( texture.width <= 0 || texture.height <= 0 || texture.texels.Num() <= 0 ) {
+		return PackColor( 255, 255, 255, 255 );
+	}
+	if ( texture.repeat == TR_REPEAT ) {
+		x %= texture.width;
+		y %= texture.height;
+		if ( x < 0 ) {
+			x += texture.width;
+		}
+		if ( y < 0 ) {
+			y += texture.height;
+		}
+	} else {
+		x = Max( 0, Min( texture.width - 1, x ) );
+		y = Max( 0, Min( texture.height - 1, y ) );
+	}
+	return texture.texels[y * texture.width + x];
+}
+
+unsigned int idSoftwareRasterizer::SampleTextureLinear( int textureIndex, float s, float t ) const {
+	if ( textureIndex < 0 || textureIndex >= textureCache.Num() ) {
+		return PackColor( 255, 255, 255, 255 );
+	}
+
+	const swTexture_t &texture = textureCache[textureIndex];
+	if ( texture.width <= 0 || texture.height <= 0 || texture.texels.Num() == 0 ) {
+		return PackColor( 255, 255, 255, 255 );
+	}
+
+	if ( ( texture.repeat == TR_CLAMP_TO_ZERO || texture.repeat == TR_CLAMP_TO_ZERO_ALPHA ) &&
+		 ( s < 0.0f || s > 1.0f || t < 0.0f || t > 1.0f ) ) {
+		return texture.repeat == TR_CLAMP_TO_ZERO_ALPHA ? PackColor( 0, 0, 0, 0 ) : PackColor( 0, 0, 0, 255 );
+	}
+
+	s = WrapTextureCoordinate( s, texture.repeat );
+	t = WrapTextureCoordinate( t, texture.repeat );
+
+	const float texelS = s * static_cast<float>( texture.width ) - 0.5f;
+	const float texelT = t * static_cast<float>( texture.height ) - 0.5f;
+	const int x0 = idMath::Ftoi( idMath::Floor( texelS ) );
+	const int y0 = idMath::Ftoi( idMath::Floor( texelT ) );
+	const float fracS = texelS - static_cast<float>( x0 );
+	const float fracT = texelT - static_cast<float>( y0 );
+
+	const unsigned int c00 = TextureTexel( texture, x0, y0 );
+	const unsigned int c10 = TextureTexel( texture, x0 + 1, y0 );
+	const unsigned int c01 = TextureTexel( texture, x0, y0 + 1 );
+	const unsigned int c11 = TextureTexel( texture, x0 + 1, y0 + 1 );
+	int out[4];
+	const int shifts[4] = { 16, 8, 0, 24 };
+	for ( int i = 0; i < 4; i++ ) {
+		const int shift = shifts[i];
+		const float v00 = static_cast<float>( ( c00 >> shift ) & 255 );
+		const float v10 = static_cast<float>( ( c10 >> shift ) & 255 );
+		const float v01 = static_cast<float>( ( c01 >> shift ) & 255 );
+		const float v11 = static_cast<float>( ( c11 >> shift ) & 255 );
+		const float v0 = v00 + ( v10 - v00 ) * fracS;
+		const float v1 = v01 + ( v11 - v01 ) * fracS;
+		out[i] = idMath::Ftoi( v0 + ( v1 - v0 ) * fracT + 0.5f );
+	}
+	return PackColor( out[0], out[1], out[2], out[3] );
 }
 
 unsigned int idSoftwareRasterizer::SurfaceColor( int surfIndex, const drawSurf_t *surf ) const {

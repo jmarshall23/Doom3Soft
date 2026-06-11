@@ -29,7 +29,7 @@ struct swHybridLight_t {
 	float originRadius[4];
 	float color[4];
 	int scissor[4];
-	unsigned int flags[4];
+	unsigned int flags[4];		// normal: ambient, parallel, shadow, type; blend: mode, src, dst, type
 	float lightProject[4][4];
 	unsigned int textureIds[4];
 };
