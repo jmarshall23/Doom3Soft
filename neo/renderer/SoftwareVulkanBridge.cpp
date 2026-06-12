@@ -401,6 +401,7 @@ static const swVkHybridCompositeShader_t swVkHybridCompositeShaders[SW_VK_HYBRID
 #undef SW_VK_HYBRID_SHADER
 
 static const int SW_VK_MAX_SHADOW_JOBS = 64;
+static const int SW_VK_FRAMES_IN_FLIGHT = 2;
 static const uint32_t SW_VK_LINEAR_GROUP_SIZE_X = 32;
 static const uint32_t SW_VK_LINEAR_GROUP_SIZE_Y = 4;
 static const uint32_t SW_VK_OVERLAY_GROUP_SIZE_X = 16;
@@ -497,6 +498,66 @@ struct swVkShadowJob_t {
 	bool submitted;
 };
 
+struct swVkFrameContext_t {
+	swVkFrameContext_t() {
+		commandBuffer = VK_NULL_HANDLE;
+		imageAvailableSemaphore = VK_NULL_HANDLE;
+		renderFinishedSemaphore = VK_NULL_HANDLE;
+		inFlightFence = VK_NULL_HANDLE;
+		submitted = false;
+		uploadBuffer = VK_NULL_HANDLE;
+		uploadMemory = VK_NULL_HANDLE;
+		uploadBufferSize = 0;
+		hybridDescriptorSet = VK_NULL_HANDLE;
+		twoDDescriptorSet = VK_NULL_HANDLE;
+		hybridUpscaleDescriptorSet = VK_NULL_HANDLE;
+		overlayDescriptorSet = VK_NULL_HANDLE;
+		overlayTileDescriptorSet = VK_NULL_HANDLE;
+		timestampQueryPending = false;
+		timestampFrame.Clear();
+	}
+
+	VkCommandBuffer commandBuffer;
+	VkSemaphore imageAvailableSemaphore;
+	VkSemaphore renderFinishedSemaphore;
+	VkFence inFlightFence;
+	bool submitted;
+
+	VkBuffer uploadBuffer;
+	VkDeviceMemory uploadMemory;
+	VkDeviceSize uploadBufferSize;
+
+	swVkBuffer_t hybridDepthBuffer;
+	swVkBuffer_t hybridNormalBuffer;
+	swVkBuffer_t hybridTangentBuffer;
+	swVkBuffer_t hybridBitangentBuffer;
+	swVkBuffer_t hybridUVBuffer;
+	swVkBuffer_t hybridMaterialBuffer;
+	swVkBuffer_t hybridAlbedoBuffer;
+	swVkBuffer_t hybridSpecularBuffer;
+	swVkBuffer_t hybridSurfaceBuffer;
+	swVkBuffer_t hybridLitBuffer;
+	swVkBuffer_t hybridFrameBuffer;
+	swVkBuffer_t hybridOverlayBuffer;
+	swVkBuffer_t hybrid2DSourceBuffer;
+	swVkBuffer_t hybridOverlayTriBuffer;
+	swVkBuffer_t hybridOverlayTileBuffer;
+	swVkBuffer_t hybridOverlayTileIndexBuffer;
+	swVkBuffer_t hybridWorldPositionBuffer;
+	swVkBuffer_t hybridLightBuffer;
+	swVkBuffer_t hybridLightTileBuffer;
+	swVkBuffer_t hybridLightIndexBuffer;
+
+	VkDescriptorSet hybridDescriptorSet;
+	VkDescriptorSet twoDDescriptorSet;
+	VkDescriptorSet hybridUpscaleDescriptorSet;
+	VkDescriptorSet overlayDescriptorSet;
+	VkDescriptorSet overlayTileDescriptorSet;
+
+	bool timestampQueryPending;
+	swVkGpuTimestampFrame_t timestampFrame;
+};
+
 class idSoftwareVulkanBridge {
 public:
 	idSoftwareVulkanBridge();
@@ -546,6 +607,11 @@ private:
 	bool CreateBuffer( VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, bool deviceAddress, swVkBuffer_t &buffer );
 	void DestroyBuffer( swVkBuffer_t &buffer );
 	VkDeviceAddress GetBufferAddress( VkBuffer buffer ) const;
+	void LoadFrameContext( int index );
+	void StoreFrameContext();
+	void WaitForFrameContext( int index );
+	void WaitForAllFrameContexts();
+	void DestroyFrameContextBuffers( swVkFrameContext_t &ctx );
 	bool ImmediateSubmit( const VkCommandBufferBeginInfo &beginInfo );
 	void WaitForSubmittedWork();
 	bool BuildSurfaceBlas( swVkSurfaceBlas_t &entry, srfTriangles_t *geo );
@@ -603,6 +669,8 @@ private:
 	bool failed;
 	bool printedFailure;
 	bool rayQuerySupported;
+	int activeFrameContext;
+	int nextFrameContext;
 	bool frameBegun;
 	bool frameDirty;
 	bool hybridFrameDirty;
@@ -660,6 +728,7 @@ private:
 	idList<VkImageLayout> swapchainLayouts;
 
 	VkCommandPool commandPool;
+	swVkFrameContext_t frameContexts[SW_VK_FRAMES_IN_FLIGHT];
 	VkCommandBuffer commandBuffer;
 	VkSemaphore imageAvailableSemaphore;
 	VkSemaphore renderFinishedSemaphore;
@@ -759,6 +828,8 @@ idSoftwareVulkanBridge::idSoftwareVulkanBridge() {
 	failed = false;
 	printedFailure = false;
 	rayQuerySupported = false;
+	activeFrameContext = 0;
+	nextFrameContext = 0;
 	frameBegun = false;
 	frameDirty = false;
 	hybridFrameDirty = false;
@@ -1331,32 +1402,39 @@ bool idSoftwareVulkanBridge::CreateCommandObjects() {
 	allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
 	allocInfo.commandPool = commandPool;
 	allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-	allocInfo.commandBufferCount = 1;
+	allocInfo.commandBufferCount = SW_VK_FRAMES_IN_FLIGHT;
 
-	if ( vkAllocateCommandBuffers( device, &allocInfo, &commandBuffer ) != VK_SUCCESS ) {
+	VkCommandBuffer commandBuffers[SW_VK_FRAMES_IN_FLIGHT];
+	memset( commandBuffers, 0, sizeof( commandBuffers ) );
+	if ( vkAllocateCommandBuffers( device, &allocInfo, commandBuffers ) != VK_SUCCESS ) {
 		LogFailure( "vkAllocateCommandBuffers failed" );
 		return false;
+	}
+	for ( int i = 0; i < SW_VK_FRAMES_IN_FLIGHT; i++ ) {
+		frameContexts[i].commandBuffer = commandBuffers[i];
 	}
 
 	VkSemaphoreCreateInfo semaphoreInfo;
 	memset( &semaphoreInfo, 0, sizeof( semaphoreInfo ) );
 	semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
 
-	if ( vkCreateSemaphore( device, &semaphoreInfo, NULL, &imageAvailableSemaphore ) != VK_SUCCESS ||
-		 vkCreateSemaphore( device, &semaphoreInfo, NULL, &renderFinishedSemaphore ) != VK_SUCCESS ) {
-		LogFailure( "vkCreateSemaphore failed" );
-		return false;
-	}
-
 	VkFenceCreateInfo fenceInfo;
 	memset( &fenceInfo, 0, sizeof( fenceInfo ) );
 	fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
 	fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
-	if ( vkCreateFence( device, &fenceInfo, NULL, &inFlightFence ) != VK_SUCCESS ) {
-		LogFailure( "vkCreateFence failed" );
-		return false;
+	for ( int i = 0; i < SW_VK_FRAMES_IN_FLIGHT; i++ ) {
+		if ( vkCreateSemaphore( device, &semaphoreInfo, NULL, &frameContexts[i].imageAvailableSemaphore ) != VK_SUCCESS ||
+			 vkCreateSemaphore( device, &semaphoreInfo, NULL, &frameContexts[i].renderFinishedSemaphore ) != VK_SUCCESS ) {
+			LogFailure( "vkCreateSemaphore failed" );
+			return false;
+		}
+		if ( vkCreateFence( device, &fenceInfo, NULL, &frameContexts[i].inFlightFence ) != VK_SUCCESS ) {
+			LogFailure( "vkCreateFence failed" );
+			return false;
+		}
 	}
+	LoadFrameContext( 0 );
 	if ( timestampQuerySupported && !CreateTimestampQueries() ) {
 		timestampQuerySupported = false;
 		common->Warning( "software vulkan: timestamp queries unavailable" );
@@ -1371,7 +1449,7 @@ bool idSoftwareVulkanBridge::CreateTimestampQueries() {
 	memset( &queryInfo, 0, sizeof( queryInfo ) );
 	queryInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
 	queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
-	queryInfo.queryCount = SW_VK_GPU_TIMESTAMP_COUNT;
+	queryInfo.queryCount = SW_VK_GPU_TIMESTAMP_COUNT * SW_VK_FRAMES_IN_FLIGHT;
 	if ( vkCreateQueryPool( device, &queryInfo, NULL, &timestampQueryPool ) != VK_SUCCESS ) {
 		timestampQueryPool = VK_NULL_HANDLE;
 		return false;
@@ -1382,6 +1460,7 @@ bool idSoftwareVulkanBridge::CreateTimestampQueries() {
 
 bool idSoftwareVulkanBridge::CreateBuffer( VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, bool deviceAddress, swVkBuffer_t &buffer ) {
 	DestroyBuffer( buffer );
+	StoreFrameContext();
 
 	VkBufferCreateInfo bufferInfo;
 	memset( &bufferInfo, 0, sizeof( bufferInfo ) );
@@ -1427,6 +1506,7 @@ bool idSoftwareVulkanBridge::CreateBuffer( VkDeviceSize size, VkBufferUsageFlags
 	}
 
 	buffer.size = size;
+	StoreFrameContext();
 	return true;
 }
 
@@ -1456,8 +1536,145 @@ VkDeviceAddress idSoftwareVulkanBridge::GetBufferAddress( VkBuffer buffer ) cons
 	return vkGetBufferDeviceAddressKHRLocal( device, &addressInfo );
 }
 
+void idSoftwareVulkanBridge::LoadFrameContext( int index ) {
+	index = idMath::ClampInt( 0, SW_VK_FRAMES_IN_FLIGHT - 1, index );
+	activeFrameContext = index;
+	swVkFrameContext_t &ctx = frameContexts[index];
+
+	commandBuffer = ctx.commandBuffer;
+	imageAvailableSemaphore = ctx.imageAvailableSemaphore;
+	renderFinishedSemaphore = ctx.renderFinishedSemaphore;
+	inFlightFence = ctx.inFlightFence;
+	uploadBuffer = ctx.uploadBuffer;
+	uploadMemory = ctx.uploadMemory;
+	uploadBufferSize = ctx.uploadBufferSize;
+
+	hybridDepthBuffer = ctx.hybridDepthBuffer;
+	hybridNormalBuffer = ctx.hybridNormalBuffer;
+	hybridTangentBuffer = ctx.hybridTangentBuffer;
+	hybridBitangentBuffer = ctx.hybridBitangentBuffer;
+	hybridUVBuffer = ctx.hybridUVBuffer;
+	hybridMaterialBuffer = ctx.hybridMaterialBuffer;
+	hybridAlbedoBuffer = ctx.hybridAlbedoBuffer;
+	hybridSpecularBuffer = ctx.hybridSpecularBuffer;
+	hybridSurfaceBuffer = ctx.hybridSurfaceBuffer;
+	hybridLitBuffer = ctx.hybridLitBuffer;
+	hybridFrameBuffer = ctx.hybridFrameBuffer;
+	hybridOverlayBuffer = ctx.hybridOverlayBuffer;
+	hybrid2DSourceBuffer = ctx.hybrid2DSourceBuffer;
+	hybridOverlayTriBuffer = ctx.hybridOverlayTriBuffer;
+	hybridOverlayTileBuffer = ctx.hybridOverlayTileBuffer;
+	hybridOverlayTileIndexBuffer = ctx.hybridOverlayTileIndexBuffer;
+	hybridWorldPositionBuffer = ctx.hybridWorldPositionBuffer;
+	hybridLightBuffer = ctx.hybridLightBuffer;
+	hybridLightTileBuffer = ctx.hybridLightTileBuffer;
+	hybridLightIndexBuffer = ctx.hybridLightIndexBuffer;
+
+	hybridDescriptorSet = ctx.hybridDescriptorSet;
+	twoDDescriptorSet = ctx.twoDDescriptorSet;
+	hybridUpscaleDescriptorSet = ctx.hybridUpscaleDescriptorSet;
+	overlayDescriptorSet = ctx.overlayDescriptorSet;
+	overlayTileDescriptorSet = ctx.overlayTileDescriptorSet;
+}
+
+void idSoftwareVulkanBridge::StoreFrameContext() {
+	swVkFrameContext_t &ctx = frameContexts[activeFrameContext];
+
+	ctx.commandBuffer = commandBuffer;
+	ctx.imageAvailableSemaphore = imageAvailableSemaphore;
+	ctx.renderFinishedSemaphore = renderFinishedSemaphore;
+	ctx.inFlightFence = inFlightFence;
+	ctx.uploadBuffer = uploadBuffer;
+	ctx.uploadMemory = uploadMemory;
+	ctx.uploadBufferSize = uploadBufferSize;
+
+	ctx.hybridDepthBuffer = hybridDepthBuffer;
+	ctx.hybridNormalBuffer = hybridNormalBuffer;
+	ctx.hybridTangentBuffer = hybridTangentBuffer;
+	ctx.hybridBitangentBuffer = hybridBitangentBuffer;
+	ctx.hybridUVBuffer = hybridUVBuffer;
+	ctx.hybridMaterialBuffer = hybridMaterialBuffer;
+	ctx.hybridAlbedoBuffer = hybridAlbedoBuffer;
+	ctx.hybridSpecularBuffer = hybridSpecularBuffer;
+	ctx.hybridSurfaceBuffer = hybridSurfaceBuffer;
+	ctx.hybridLitBuffer = hybridLitBuffer;
+	ctx.hybridFrameBuffer = hybridFrameBuffer;
+	ctx.hybridOverlayBuffer = hybridOverlayBuffer;
+	ctx.hybrid2DSourceBuffer = hybrid2DSourceBuffer;
+	ctx.hybridOverlayTriBuffer = hybridOverlayTriBuffer;
+	ctx.hybridOverlayTileBuffer = hybridOverlayTileBuffer;
+	ctx.hybridOverlayTileIndexBuffer = hybridOverlayTileIndexBuffer;
+	ctx.hybridWorldPositionBuffer = hybridWorldPositionBuffer;
+	ctx.hybridLightBuffer = hybridLightBuffer;
+	ctx.hybridLightTileBuffer = hybridLightTileBuffer;
+	ctx.hybridLightIndexBuffer = hybridLightIndexBuffer;
+
+	ctx.hybridDescriptorSet = hybridDescriptorSet;
+	ctx.twoDDescriptorSet = twoDDescriptorSet;
+	ctx.hybridUpscaleDescriptorSet = hybridUpscaleDescriptorSet;
+	ctx.overlayDescriptorSet = overlayDescriptorSet;
+	ctx.overlayTileDescriptorSet = overlayTileDescriptorSet;
+}
+
+void idSoftwareVulkanBridge::WaitForFrameContext( int index ) {
+	index = idMath::ClampInt( 0, SW_VK_FRAMES_IN_FLIGHT - 1, index );
+	swVkFrameContext_t &ctx = frameContexts[index];
+	if ( device == VK_NULL_HANDLE || ctx.inFlightFence == VK_NULL_HANDLE ) {
+		return;
+	}
+	if ( ctx.submitted ) {
+		vkWaitForFences( device, 1, &ctx.inFlightFence, VK_TRUE, UINT64_MAX );
+		ctx.submitted = false;
+	}
+	if ( ctx.timestampQueryPending ) {
+		ReadTimestampQueries();
+	}
+}
+
+void idSoftwareVulkanBridge::WaitForAllFrameContexts() {
+	for ( int i = 0; i < SW_VK_FRAMES_IN_FLIGHT; i++ ) {
+		WaitForFrameContext( i );
+	}
+}
+
+void idSoftwareVulkanBridge::DestroyFrameContextBuffers( swVkFrameContext_t &ctx ) {
+	DestroyBuffer( ctx.hybridLightBuffer );
+	DestroyBuffer( ctx.hybridLightIndexBuffer );
+	DestroyBuffer( ctx.hybridLightTileBuffer );
+	DestroyBuffer( ctx.hybridWorldPositionBuffer );
+	DestroyBuffer( ctx.hybridOverlayTileIndexBuffer );
+	DestroyBuffer( ctx.hybridOverlayTileBuffer );
+	DestroyBuffer( ctx.hybridOverlayTriBuffer );
+	DestroyBuffer( ctx.hybrid2DSourceBuffer );
+	DestroyBuffer( ctx.hybridOverlayBuffer );
+	DestroyBuffer( ctx.hybridFrameBuffer );
+	DestroyBuffer( ctx.hybridLitBuffer );
+	DestroyBuffer( ctx.hybridSurfaceBuffer );
+	DestroyBuffer( ctx.hybridSpecularBuffer );
+	DestroyBuffer( ctx.hybridAlbedoBuffer );
+	DestroyBuffer( ctx.hybridMaterialBuffer );
+	DestroyBuffer( ctx.hybridUVBuffer );
+	DestroyBuffer( ctx.hybridBitangentBuffer );
+	DestroyBuffer( ctx.hybridTangentBuffer );
+	DestroyBuffer( ctx.hybridNormalBuffer );
+	DestroyBuffer( ctx.hybridDepthBuffer );
+	if ( device != VK_NULL_HANDLE && ctx.uploadBuffer != VK_NULL_HANDLE ) {
+		vkDestroyBuffer( device, ctx.uploadBuffer, NULL );
+		ctx.uploadBuffer = VK_NULL_HANDLE;
+	} else if ( device == VK_NULL_HANDLE ) {
+		ctx.uploadBuffer = VK_NULL_HANDLE;
+	}
+	if ( device != VK_NULL_HANDLE && ctx.uploadMemory != VK_NULL_HANDLE ) {
+		vkFreeMemory( device, ctx.uploadMemory, NULL );
+		ctx.uploadMemory = VK_NULL_HANDLE;
+	} else if ( device == VK_NULL_HANDLE ) {
+		ctx.uploadMemory = VK_NULL_HANDLE;
+	}
+	ctx.uploadBufferSize = 0;
+}
+
 bool idSoftwareVulkanBridge::ImmediateSubmit( const VkCommandBufferBeginInfo &beginInfo ) {
-	vkWaitForFences( device, 1, &inFlightFence, VK_TRUE, UINT64_MAX );
+	WaitForFrameContext( activeFrameContext );
 	vkResetFences( device, 1, &inFlightFence );
 	vkResetCommandBuffer( commandBuffer, 0 );
 
@@ -1470,14 +1687,16 @@ bool idSoftwareVulkanBridge::ImmediateSubmit( const VkCommandBufferBeginInfo &be
 }
 
 void idSoftwareVulkanBridge::WaitForSubmittedWork() {
-	if ( device != VK_NULL_HANDLE && inFlightFence != VK_NULL_HANDLE ) {
-		vkWaitForFences( device, 1, &inFlightFence, VK_TRUE, UINT64_MAX );
-	}
+	WaitForAllFrameContexts();
 }
 
 void idSoftwareVulkanBridge::DestroyTimestampQueries() {
 	timestampQueryPending = false;
 	timestampFrame.Clear();
+	for ( int i = 0; i < SW_VK_FRAMES_IN_FLIGHT; i++ ) {
+		frameContexts[i].timestampQueryPending = false;
+		frameContexts[i].timestampFrame.Clear();
+	}
 	if ( device != VK_NULL_HANDLE && timestampQueryPool != VK_NULL_HANDLE ) {
 		vkDestroyQueryPool( device, timestampQueryPool, NULL );
 	}
@@ -1489,19 +1708,36 @@ void idSoftwareVulkanBridge::ReadTimestampQueries() {
 		return;
 	}
 
-	uint64_t timestamps[SW_VK_GPU_TIMESTAMP_COUNT];
-	memset( timestamps, 0, sizeof( timestamps ) );
-	const VkResult result = vkGetQueryPoolResults( device, timestampQueryPool, 0, SW_VK_GPU_TIMESTAMP_COUNT,
-		sizeof( timestamps ), timestamps, sizeof( timestamps[0] ), VK_QUERY_RESULT_64_BIT );
-	timestampQueryPending = false;
-	if ( result == VK_SUCCESS ) {
-		SWVkPrintGpuTimestampStats( timestampFrame, timestamps, timestampPeriod, timestampValidBits );
+	bool anyPending = false;
+	for ( int i = 0; i < SW_VK_FRAMES_IN_FLIGHT; i++ ) {
+		swVkFrameContext_t &ctx = frameContexts[i];
+		if ( !ctx.timestampQueryPending ) {
+			continue;
+		}
+		if ( ctx.submitted && ctx.inFlightFence != VK_NULL_HANDLE && vkGetFenceStatus( device, ctx.inFlightFence ) == VK_NOT_READY ) {
+			anyPending = true;
+			continue;
+		}
+
+		uint64_t timestamps[SW_VK_GPU_TIMESTAMP_COUNT];
+		memset( timestamps, 0, sizeof( timestamps ) );
+		const uint32_t firstQuery = static_cast<uint32_t>( i * SW_VK_GPU_TIMESTAMP_COUNT );
+		const VkResult result = vkGetQueryPoolResults( device, timestampQueryPool, firstQuery, SW_VK_GPU_TIMESTAMP_COUNT,
+			sizeof( timestamps ), timestamps, sizeof( timestamps[0] ), VK_QUERY_RESULT_64_BIT );
+		if ( result == VK_SUCCESS ) {
+			SWVkPrintGpuTimestampStats( ctx.timestampFrame, timestamps, timestampPeriod, timestampValidBits );
+			ctx.timestampQueryPending = false;
+		} else {
+			anyPending = true;
+		}
 	}
+	timestampQueryPending = anyPending;
 }
 
 void idSoftwareVulkanBridge::WriteTimestamp( VkPipelineStageFlagBits stage, swVkGpuTimestampQuery_t query ) {
 	if ( timestampQuerySupported && timestampQueryPool != VK_NULL_HANDLE && r_showSoftwarePerf.GetInteger() != 0 ) {
-		vkCmdWriteTimestamp( commandBuffer, stage, timestampQueryPool, static_cast<uint32_t>( query ) );
+		const uint32_t queryIndex = static_cast<uint32_t>( activeFrameContext * SW_VK_GPU_TIMESTAMP_COUNT + query );
+		vkCmdWriteTimestamp( commandBuffer, stage, timestampQueryPool, queryIndex );
 	}
 }
 
@@ -1573,12 +1809,12 @@ bool idSoftwareVulkanBridge::Create2DPipeline() {
 	VkDescriptorPoolSize poolSize;
 	memset( &poolSize, 0, sizeof( poolSize ) );
 	poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	poolSize.descriptorCount = 4;
+	poolSize.descriptorCount = 4 * SW_VK_FRAMES_IN_FLIGHT;
 
 	VkDescriptorPoolCreateInfo poolInfo;
 	memset( &poolInfo, 0, sizeof( poolInfo ) );
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-	poolInfo.maxSets = 2;
+	poolInfo.maxSets = 2 * SW_VK_FRAMES_IN_FLIGHT;
 	poolInfo.poolSizeCount = 1;
 	poolInfo.pPoolSizes = &poolSize;
 	if ( vkCreateDescriptorPool( device, &poolInfo, NULL, &twoDDescriptorPool ) != VK_SUCCESS ) {
@@ -1590,16 +1826,23 @@ bool idSoftwareVulkanBridge::Create2DPipeline() {
 	memset( &setInfo, 0, sizeof( setInfo ) );
 	setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
 	setInfo.descriptorPool = twoDDescriptorPool;
-	VkDescriptorSetLayout setLayouts[2] = { twoDDescriptorSetLayout, twoDDescriptorSetLayout };
-	VkDescriptorSet descriptorSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-	setInfo.descriptorSetCount = 2;
+	VkDescriptorSetLayout setLayouts[2 * SW_VK_FRAMES_IN_FLIGHT];
+	VkDescriptorSet descriptorSets[2 * SW_VK_FRAMES_IN_FLIGHT];
+	for ( int i = 0; i < 2 * SW_VK_FRAMES_IN_FLIGHT; i++ ) {
+		setLayouts[i] = twoDDescriptorSetLayout;
+		descriptorSets[i] = VK_NULL_HANDLE;
+	}
+	setInfo.descriptorSetCount = 2 * SW_VK_FRAMES_IN_FLIGHT;
 	setInfo.pSetLayouts = setLayouts;
 	if ( vkAllocateDescriptorSets( device, &setInfo, descriptorSets ) != VK_SUCCESS ) {
 		LogFailure( "vkAllocateDescriptorSets 2D failed" );
 		return false;
 	}
-	twoDDescriptorSet = descriptorSets[0];
-	hybridUpscaleDescriptorSet = descriptorSets[1];
+	for ( int i = 0; i < SW_VK_FRAMES_IN_FLIGHT; i++ ) {
+		frameContexts[i].twoDDescriptorSet = descriptorSets[i * 2 + 0];
+		frameContexts[i].hybridUpscaleDescriptorSet = descriptorSets[i * 2 + 1];
+	}
+	LoadFrameContext( activeFrameContext );
 	return true;
 }
 
@@ -1671,12 +1914,12 @@ bool idSoftwareVulkanBridge::CreateOverlayPipeline() {
 	VkDescriptorPoolSize poolSize;
 	memset( &poolSize, 0, sizeof( poolSize ) );
 	poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	poolSize.descriptorCount = 6;
+	poolSize.descriptorCount = 6 * SW_VK_FRAMES_IN_FLIGHT;
 
 	VkDescriptorPoolCreateInfo poolInfo;
 	memset( &poolInfo, 0, sizeof( poolInfo ) );
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-	poolInfo.maxSets = 1;
+	poolInfo.maxSets = SW_VK_FRAMES_IN_FLIGHT;
 	poolInfo.poolSizeCount = 1;
 	poolInfo.pPoolSizes = &poolSize;
 	if ( vkCreateDescriptorPool( device, &poolInfo, NULL, &overlayDescriptorPool ) != VK_SUCCESS ) {
@@ -1688,12 +1931,22 @@ bool idSoftwareVulkanBridge::CreateOverlayPipeline() {
 	memset( &setInfo, 0, sizeof( setInfo ) );
 	setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
 	setInfo.descriptorPool = overlayDescriptorPool;
-	setInfo.descriptorSetCount = 1;
-	setInfo.pSetLayouts = &overlayDescriptorSetLayout;
-	if ( vkAllocateDescriptorSets( device, &setInfo, &overlayDescriptorSet ) != VK_SUCCESS ) {
+	VkDescriptorSetLayout setLayouts[SW_VK_FRAMES_IN_FLIGHT];
+	VkDescriptorSet descriptorSets[SW_VK_FRAMES_IN_FLIGHT];
+	for ( int i = 0; i < SW_VK_FRAMES_IN_FLIGHT; i++ ) {
+		setLayouts[i] = overlayDescriptorSetLayout;
+		descriptorSets[i] = VK_NULL_HANDLE;
+	}
+	setInfo.descriptorSetCount = SW_VK_FRAMES_IN_FLIGHT;
+	setInfo.pSetLayouts = setLayouts;
+	if ( vkAllocateDescriptorSets( device, &setInfo, descriptorSets ) != VK_SUCCESS ) {
 		LogFailure( "vkAllocateDescriptorSets overlay failed" );
 		return false;
 	}
+	for ( int i = 0; i < SW_VK_FRAMES_IN_FLIGHT; i++ ) {
+		frameContexts[i].overlayDescriptorSet = descriptorSets[i];
+	}
+	LoadFrameContext( activeFrameContext );
 	return true;
 }
 
@@ -1761,12 +2014,12 @@ bool idSoftwareVulkanBridge::CreateOverlayTilePipeline() {
 	VkDescriptorPoolSize poolSize;
 	memset( &poolSize, 0, sizeof( poolSize ) );
 	poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	poolSize.descriptorCount = 8;
+	poolSize.descriptorCount = 8 * SW_VK_FRAMES_IN_FLIGHT;
 
 	VkDescriptorPoolCreateInfo poolInfo;
 	memset( &poolInfo, 0, sizeof( poolInfo ) );
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-	poolInfo.maxSets = 1;
+	poolInfo.maxSets = SW_VK_FRAMES_IN_FLIGHT;
 	poolInfo.poolSizeCount = 1;
 	poolInfo.pPoolSizes = &poolSize;
 	if ( vkCreateDescriptorPool( device, &poolInfo, NULL, &overlayTileDescriptorPool ) != VK_SUCCESS ) {
@@ -1777,11 +2030,21 @@ bool idSoftwareVulkanBridge::CreateOverlayTilePipeline() {
 	memset( &setInfo, 0, sizeof( setInfo ) );
 	setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
 	setInfo.descriptorPool = overlayTileDescriptorPool;
-	setInfo.descriptorSetCount = 1;
-	setInfo.pSetLayouts = &overlayTileDescriptorSetLayout;
-	if ( vkAllocateDescriptorSets( device, &setInfo, &overlayTileDescriptorSet ) != VK_SUCCESS ) {
+	VkDescriptorSetLayout setLayouts[SW_VK_FRAMES_IN_FLIGHT];
+	VkDescriptorSet descriptorSets[SW_VK_FRAMES_IN_FLIGHT];
+	for ( int i = 0; i < SW_VK_FRAMES_IN_FLIGHT; i++ ) {
+		setLayouts[i] = overlayTileDescriptorSetLayout;
+		descriptorSets[i] = VK_NULL_HANDLE;
+	}
+	setInfo.descriptorSetCount = SW_VK_FRAMES_IN_FLIGHT;
+	setInfo.pSetLayouts = setLayouts;
+	if ( vkAllocateDescriptorSets( device, &setInfo, descriptorSets ) != VK_SUCCESS ) {
 		return false;
 	}
+	for ( int i = 0; i < SW_VK_FRAMES_IN_FLIGHT; i++ ) {
+		frameContexts[i].overlayTileDescriptorSet = descriptorSets[i];
+	}
+	LoadFrameContext( activeFrameContext );
 	return true;
 }
 
@@ -1870,14 +2133,14 @@ bool idSoftwareVulkanBridge::CreateHybridPipeline() {
 	VkDescriptorPoolSize poolSizes[2];
 	memset( poolSizes, 0, sizeof( poolSizes ) );
 	poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	poolSizes[0].descriptorCount = 17;
+	poolSizes[0].descriptorCount = 17 * SW_VK_FRAMES_IN_FLIGHT;
 	poolSizes[1].type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-	poolSizes[1].descriptorCount = 1;
+	poolSizes[1].descriptorCount = SW_VK_FRAMES_IN_FLIGHT;
 
 	VkDescriptorPoolCreateInfo poolInfo;
 	memset( &poolInfo, 0, sizeof( poolInfo ) );
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-	poolInfo.maxSets = 1;
+	poolInfo.maxSets = SW_VK_FRAMES_IN_FLIGHT;
 	poolInfo.poolSizeCount = 2;
 	poolInfo.pPoolSizes = poolSizes;
 	if ( vkCreateDescriptorPool( device, &poolInfo, NULL, &hybridDescriptorPool ) != VK_SUCCESS ) {
@@ -1889,12 +2152,22 @@ bool idSoftwareVulkanBridge::CreateHybridPipeline() {
 	memset( &setInfo, 0, sizeof( setInfo ) );
 	setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
 	setInfo.descriptorPool = hybridDescriptorPool;
-	setInfo.descriptorSetCount = 1;
-	setInfo.pSetLayouts = &hybridDescriptorSetLayout;
-	if ( vkAllocateDescriptorSets( device, &setInfo, &hybridDescriptorSet ) != VK_SUCCESS ) {
+	VkDescriptorSetLayout setLayouts[SW_VK_FRAMES_IN_FLIGHT];
+	VkDescriptorSet descriptorSets[SW_VK_FRAMES_IN_FLIGHT];
+	for ( int i = 0; i < SW_VK_FRAMES_IN_FLIGHT; i++ ) {
+		setLayouts[i] = hybridDescriptorSetLayout;
+		descriptorSets[i] = VK_NULL_HANDLE;
+	}
+	setInfo.descriptorSetCount = SW_VK_FRAMES_IN_FLIGHT;
+	setInfo.pSetLayouts = setLayouts;
+	if ( vkAllocateDescriptorSets( device, &setInfo, descriptorSets ) != VK_SUCCESS ) {
 		LogFailure( "vkAllocateDescriptorSets hybrid failed" );
 		return false;
 	}
+	for ( int i = 0; i < SW_VK_FRAMES_IN_FLIGHT; i++ ) {
+		frameContexts[i].hybridDescriptorSet = descriptorSets[i];
+	}
+	LoadFrameContext( activeFrameContext );
 	return true;
 }
 
@@ -2053,6 +2326,7 @@ bool idSoftwareVulkanBridge::EnsureUploadBuffer( int requiredWidth, int required
 	}
 
 	uploadBufferSize = requiredSize;
+	StoreFrameContext();
 	return true;
 }
 
@@ -2100,6 +2374,7 @@ bool idSoftwareVulkanBridge::Ensure2DBuffers( int sourcePixelCount ) {
 			return false;
 		}
 	}
+	StoreFrameContext();
 	return true;
 }
 
@@ -2112,6 +2387,7 @@ bool idSoftwareVulkanBridge::EnsureOverlayBuffers( int triCount ) {
 			return false;
 		}
 	}
+	StoreFrameContext();
 	return true;
 }
 
@@ -2131,6 +2407,7 @@ bool idSoftwareVulkanBridge::EnsureOverlayTileBuffers( int tileCount, int tileIn
 			return false;
 		}
 	}
+	StoreFrameContext();
 	return true;
 }
 
@@ -2264,6 +2541,7 @@ bool idSoftwareVulkanBridge::EnsureHybridBuffers( int requiredWidth, int require
 			return false;
 		}
 	}
+	StoreFrameContext();
 	return true;
 }
 
@@ -3306,6 +3584,11 @@ void idSoftwareVulkanBridge::BeginFrame( bool clearFramePixels ) {
 	if ( frameBegun ) {
 		return;
 	}
+	const int frameIndex = nextFrameContext;
+	nextFrameContext = ( nextFrameContext + 1 ) % SW_VK_FRAMES_IN_FLIGHT;
+	WaitForFrameContext( frameIndex );
+	LoadFrameContext( frameIndex );
+
 	if ( clearFramePixels && framePixels.Num() > 0 ) {
 		memset( framePixels.Ptr(), 0, framePixels.Num() * sizeof( framePixels[0] ) );
 	}
@@ -3493,8 +3776,19 @@ bool idSoftwareVulkanBridge::CompositeHybridGBuffer( const viewDef_t *viewDef, c
 	const uint32_t *lightIndices = ( gbuffer.lightIndices && gbuffer.lightIndexCount > 0 ) ? gbuffer.lightIndices : &emptyLightIndex;
 	const int uploadLightTileCount = Max( 1, gbuffer.lightTileCount );
 	const int uploadLightIndexCount = Max( 1, gbuffer.lightIndexCount );
+	if ( !EnsureInitialized() || !EnsureFrameBuffer() ) {
+		return false;
+	}
+	BeginFrame( false );
+	const bool textureUploadChanged = hybridUploadedTextureGeneration != gbuffer.textureGeneration ||
+		hybridTextureCount != gbuffer.textureInfoCount ||
+		hybridTextureTexelCount != gbuffer.textureTexelCount;
+	if ( textureUploadChanged ) {
+		WaitForAllFrameContexts();
+		LoadFrameContext( activeFrameContext );
+	}
 	const VkBuffer oldTextureTexelBuffer = hybridTextureTexelBuffer.buffer;
-	if ( !EnsureInitialized() || !EnsureFrameBuffer() || !EnsureHybridBuffers( width, height, gbuffer.textureInfoCount, gbuffer.textureTexelCount, uploadLightCount, uploadLightTileCount, uploadLightIndexCount ) ) {
+	if ( !EnsureHybridBuffers( width, height, gbuffer.textureInfoCount, gbuffer.textureTexelCount, uploadLightCount, uploadLightTileCount, uploadLightIndexCount ) ) {
 		return false;
 	}
 
@@ -3535,7 +3829,6 @@ bool idSoftwareVulkanBridge::CompositeHybridGBuffer( const viewDef_t *viewDef, c
 	}
 	hybridCompositeVariant = SelectHybridCompositeVariant( gbuffer, hybridShadowEnabled );
 	UpdateHybridDescriptorSet();
-	BeginFrame( false );
 
 	hybridWidth = width;
 	hybridHeight = height;
@@ -3602,6 +3895,13 @@ bool idSoftwareVulkanBridge::UpdateHybridTextures( const swHybridTextureInfo_t *
 	if ( !EnsureInitialized() ) {
 		return false;
 	}
+	const bool textureUploadChanged = hybridUploadedTextureGeneration != textureGeneration ||
+		hybridTextureCount != textureInfoCount ||
+		hybridTextureTexelCount != textureTexelCount;
+	if ( textureUploadChanged ) {
+		WaitForAllFrameContexts();
+		LoadFrameContext( activeFrameContext );
+	}
 	if ( hybridFrameDirty && ( hybridWidth <= 0 || hybridHeight <= 0 ||
 		 !EnsureHybridBuffers( hybridWidth, hybridHeight, textureInfoCount, textureTexelCount, Max( 1, hybridLightCount ), Max( 1, hybridLightTileCount ), Max( 1, hybridLightIndexCount ) ) ) ) {
 		return false;
@@ -3658,7 +3958,8 @@ bool idSoftwareVulkanBridge::ResolveHybridFrameToCpu() {
 		}
 	}
 
-	vkWaitForFences( device, 1, &inFlightFence, VK_TRUE, UINT64_MAX );
+	WaitForFrameContext( activeFrameContext );
+	LoadFrameContext( activeFrameContext );
 	vkResetFences( device, 1, &inFlightFence );
 	vkResetCommandBuffer( commandBuffer, 0 );
 
@@ -4338,14 +4639,17 @@ bool idSoftwareVulkanBridge::PresentFrame() {
 
 	{
 		swVkScopedPerfTimer timer( perf, perf.waitMsec );
-		vkWaitForFences( device, 1, &inFlightFence, VK_TRUE, UINT64_MAX );
-		vkResetFences( device, 1, &inFlightFence );
+		WaitForFrameContext( activeFrameContext );
+		LoadFrameContext( activeFrameContext );
 	}
 	if ( timestampQueryPending ) {
 		if ( r_showSoftwarePerf.GetInteger() != 0 ) {
 			ReadTimestampQueries();
 		} else {
 			timestampQueryPending = false;
+			for ( int i = 0; i < SW_VK_FRAMES_IN_FLIGHT; i++ ) {
+				frameContexts[i].timestampQueryPending = false;
+			}
 		}
 	}
 
@@ -4419,7 +4723,7 @@ bool idSoftwareVulkanBridge::PresentFrame() {
 			return false;
 		}
 		if ( timestampActive ) {
-			vkCmdResetQueryPool( commandBuffer, timestampQueryPool, 0, SW_VK_GPU_TIMESTAMP_COUNT );
+			vkCmdResetQueryPool( commandBuffer, timestampQueryPool, activeFrameContext * SW_VK_GPU_TIMESTAMP_COUNT, SW_VK_GPU_TIMESTAMP_COUNT );
 			WriteTimestamp( VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, SW_VK_GPU_TIMESTAMP_TOTAL_BEGIN );
 			if ( !useHybridFrame ) {
 				WriteTimestamp( VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, SW_VK_GPU_TIMESTAMP_HYBRID_BEGIN );
@@ -4533,15 +4837,19 @@ bool idSoftwareVulkanBridge::PresentFrame() {
 
 	{
 		swVkScopedPerfTimer timer( perf, perf.submitMsec );
+		vkResetFences( device, 1, &inFlightFence );
 		if ( vkQueueSubmit( queue, 1, &submitInfo, inFlightFence ) != VK_SUCCESS ) {
 			LogFailure( "vkQueueSubmit failed" );
 			return false;
 		}
 	}
 	if ( timestampActive ) {
-		timestampFrame = submitTimestamps;
+		frameContexts[activeFrameContext].timestampFrame = submitTimestamps;
+		frameContexts[activeFrameContext].timestampQueryPending = true;
 		timestampQueryPending = true;
 	}
+	frameContexts[activeFrameContext].submitted = true;
+	StoreFrameContext();
 
 	VkPresentInfoKHR presentInfo;
 	memset( &presentInfo, 0, sizeof( presentInfo ) );
@@ -4793,6 +5101,7 @@ void idSoftwareVulkanBridge::DestroyUploadBuffer() {
 		uploadMemory = VK_NULL_HANDLE;
 	}
 	uploadBufferSize = 0;
+	StoreFrameContext();
 }
 
 void idSoftwareVulkanBridge::DestroyRayQueryScene() {
@@ -4813,28 +5122,13 @@ void idSoftwareVulkanBridge::DestroyRayQueryScene() {
 }
 
 void idSoftwareVulkanBridge::DestroyHybridBuffers() {
-	DestroyBuffer( hybridLightBuffer );
-	DestroyBuffer( hybridLightIndexBuffer );
-	DestroyBuffer( hybridLightTileBuffer );
-	DestroyBuffer( hybridWorldPositionBuffer );
+	WaitForAllFrameContexts();
+	for ( int i = 0; i < SW_VK_FRAMES_IN_FLIGHT; i++ ) {
+		DestroyFrameContextBuffers( frameContexts[i] );
+	}
+	LoadFrameContext( activeFrameContext );
 	DestroyBuffer( hybridTextureTexelBuffer );
 	DestroyBuffer( hybridTextureInfoBuffer );
-	DestroyBuffer( hybridOverlayTileIndexBuffer );
-	DestroyBuffer( hybridOverlayTileBuffer );
-	DestroyBuffer( hybridOverlayTriBuffer );
-	DestroyBuffer( hybrid2DSourceBuffer );
-	DestroyBuffer( hybridOverlayBuffer );
-	DestroyBuffer( hybridFrameBuffer );
-	DestroyBuffer( hybridLitBuffer );
-	DestroyBuffer( hybridSurfaceBuffer );
-	DestroyBuffer( hybridSpecularBuffer );
-	DestroyBuffer( hybridAlbedoBuffer );
-	DestroyBuffer( hybridMaterialBuffer );
-	DestroyBuffer( hybridUVBuffer );
-	DestroyBuffer( hybridBitangentBuffer );
-	DestroyBuffer( hybridTangentBuffer );
-	DestroyBuffer( hybridNormalBuffer );
-	DestroyBuffer( hybridDepthBuffer );
 	hybridWidth = 0;
 	hybridHeight = 0;
 	hybridPresentWidth = 0;
@@ -4857,7 +5151,6 @@ void idSoftwareVulkanBridge::DestroyHybridBuffers() {
 }
 
 void idSoftwareVulkanBridge::Destroy2DPipeline() {
-	DestroyBuffer( hybrid2DSourceBuffer );
 	Clear2DJobs();
 
 	if ( twoDPipeline != VK_NULL_HANDLE ) {
@@ -4877,6 +5170,10 @@ void idSoftwareVulkanBridge::Destroy2DPipeline() {
 		twoDDescriptorPool = VK_NULL_HANDLE;
 		twoDDescriptorSet = VK_NULL_HANDLE;
 		hybridUpscaleDescriptorSet = VK_NULL_HANDLE;
+		for ( int i = 0; i < SW_VK_FRAMES_IN_FLIGHT; i++ ) {
+			frameContexts[i].twoDDescriptorSet = VK_NULL_HANDLE;
+			frameContexts[i].hybridUpscaleDescriptorSet = VK_NULL_HANDLE;
+		}
 	}
 	if ( twoDDescriptorSetLayout != VK_NULL_HANDLE ) {
 		vkDestroyDescriptorSetLayout( device, twoDDescriptorSetLayout, NULL );
@@ -4885,9 +5182,6 @@ void idSoftwareVulkanBridge::Destroy2DPipeline() {
 }
 
 void idSoftwareVulkanBridge::DestroyOverlayPipeline() {
-	DestroyBuffer( hybridOverlayTriBuffer );
-	DestroyBuffer( hybridOverlayTileBuffer );
-	DestroyBuffer( hybridOverlayTileIndexBuffer );
 	if ( overlayPipeline != VK_NULL_HANDLE ) {
 		vkDestroyPipeline( device, overlayPipeline, NULL );
 		overlayPipeline = VK_NULL_HANDLE;
@@ -4904,6 +5198,9 @@ void idSoftwareVulkanBridge::DestroyOverlayPipeline() {
 		vkDestroyDescriptorPool( device, overlayDescriptorPool, NULL );
 		overlayDescriptorPool = VK_NULL_HANDLE;
 		overlayDescriptorSet = VK_NULL_HANDLE;
+		for ( int i = 0; i < SW_VK_FRAMES_IN_FLIGHT; i++ ) {
+			frameContexts[i].overlayDescriptorSet = VK_NULL_HANDLE;
+		}
 	}
 	if ( overlayDescriptorSetLayout != VK_NULL_HANDLE ) {
 		vkDestroyDescriptorSetLayout( device, overlayDescriptorSetLayout, NULL );
@@ -4912,8 +5209,6 @@ void idSoftwareVulkanBridge::DestroyOverlayPipeline() {
 }
 
 void idSoftwareVulkanBridge::DestroyOverlayTilePipeline() {
-	DestroyBuffer( hybridOverlayTileBuffer );
-	DestroyBuffer( hybridOverlayTileIndexBuffer );
 	if ( overlayTilePipeline != VK_NULL_HANDLE ) {
 		vkDestroyPipeline( device, overlayTilePipeline, NULL );
 		overlayTilePipeline = VK_NULL_HANDLE;
@@ -4930,6 +5225,9 @@ void idSoftwareVulkanBridge::DestroyOverlayTilePipeline() {
 		vkDestroyDescriptorPool( device, overlayTileDescriptorPool, NULL );
 		overlayTileDescriptorPool = VK_NULL_HANDLE;
 		overlayTileDescriptorSet = VK_NULL_HANDLE;
+		for ( int i = 0; i < SW_VK_FRAMES_IN_FLIGHT; i++ ) {
+			frameContexts[i].overlayTileDescriptorSet = VK_NULL_HANDLE;
+		}
 	}
 	if ( overlayTileDescriptorSetLayout != VK_NULL_HANDLE ) {
 		vkDestroyDescriptorSetLayout( device, overlayTileDescriptorSetLayout, NULL );
@@ -4958,6 +5256,9 @@ void idSoftwareVulkanBridge::DestroyHybridPipeline() {
 		vkDestroyDescriptorPool( device, hybridDescriptorPool, NULL );
 		hybridDescriptorPool = VK_NULL_HANDLE;
 		hybridDescriptorSet = VK_NULL_HANDLE;
+		for ( int i = 0; i < SW_VK_FRAMES_IN_FLIGHT; i++ ) {
+			frameContexts[i].hybridDescriptorSet = VK_NULL_HANDLE;
+		}
 	}
 	if ( hybridDescriptorSetLayout != VK_NULL_HANDLE ) {
 		vkDestroyDescriptorSetLayout( device, hybridDescriptorSetLayout, NULL );
@@ -5012,7 +5313,6 @@ void idSoftwareVulkanBridge::Shutdown() {
 		vkDeviceWaitIdle( device );
 	}
 
-	DestroyUploadBuffer();
 	DestroyHybridPipeline();
 	Destroy2DPipeline();
 	DestroyOverlayTilePipeline();
@@ -5026,24 +5326,36 @@ void idSoftwareVulkanBridge::Shutdown() {
 	hybridFrameDirty = false;
 	hybridOverlayDirty = false;
 	hybridOverlayOnly = false;
+	activeFrameContext = 0;
+	nextFrameContext = 0;
 
-	if ( inFlightFence != VK_NULL_HANDLE ) {
-		vkDestroyFence( device, inFlightFence, NULL );
-		inFlightFence = VK_NULL_HANDLE;
+	for ( int i = 0; i < SW_VK_FRAMES_IN_FLIGHT; i++ ) {
+		swVkFrameContext_t &ctx = frameContexts[i];
+		if ( ctx.inFlightFence != VK_NULL_HANDLE ) {
+			vkDestroyFence( device, ctx.inFlightFence, NULL );
+			ctx.inFlightFence = VK_NULL_HANDLE;
+		}
+		if ( ctx.renderFinishedSemaphore != VK_NULL_HANDLE ) {
+			vkDestroySemaphore( device, ctx.renderFinishedSemaphore, NULL );
+			ctx.renderFinishedSemaphore = VK_NULL_HANDLE;
+		}
+		if ( ctx.imageAvailableSemaphore != VK_NULL_HANDLE ) {
+			vkDestroySemaphore( device, ctx.imageAvailableSemaphore, NULL );
+			ctx.imageAvailableSemaphore = VK_NULL_HANDLE;
+		}
+		ctx.submitted = false;
 	}
-	if ( renderFinishedSemaphore != VK_NULL_HANDLE ) {
-		vkDestroySemaphore( device, renderFinishedSemaphore, NULL );
-		renderFinishedSemaphore = VK_NULL_HANDLE;
-	}
-	if ( imageAvailableSemaphore != VK_NULL_HANDLE ) {
-		vkDestroySemaphore( device, imageAvailableSemaphore, NULL );
-		imageAvailableSemaphore = VK_NULL_HANDLE;
-	}
+	inFlightFence = VK_NULL_HANDLE;
+	renderFinishedSemaphore = VK_NULL_HANDLE;
+	imageAvailableSemaphore = VK_NULL_HANDLE;
 	DestroyTimestampQueries();
 	if ( commandPool != VK_NULL_HANDLE ) {
 		vkDestroyCommandPool( device, commandPool, NULL );
 		commandPool = VK_NULL_HANDLE;
 		commandBuffer = VK_NULL_HANDLE;
+		for ( int i = 0; i < SW_VK_FRAMES_IN_FLIGHT; i++ ) {
+			frameContexts[i].commandBuffer = VK_NULL_HANDLE;
+		}
 	}
 
 	DestroySwapchain();
