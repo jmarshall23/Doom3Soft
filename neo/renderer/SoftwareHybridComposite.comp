@@ -24,8 +24,8 @@ layout( set = 0, binding = 5, std430 ) readonly buffer SpecularBuffer {
 layout( set = 0, binding = 6, std430 ) readonly buffer SurfaceBuffer {
 	uint surfaceId[];
 };
-layout( set = 0, binding = 7, std430 ) writeonly buffer FrameBuffer {
-	uint framePixels[];
+layout( set = 0, binding = 7, std430 ) writeonly buffer LitBuffer {
+	uint litPixels[];
 };
 layout( set = 0, binding = 8, std430 ) readonly buffer OverlayBuffer {
 	uint overlayPixels[];
@@ -874,15 +874,6 @@ void main() {
 	if ( viewX1 <= viewX0 || viewY1 <= viewY0 ) {
 		return;
 	}
-
-	int frameX0 = max( 0, pc.viewport.x + int( viewX0 ) );
-	int frameY0 = max( 0, pc.viewport.y + int( viewY0 ) );
-	int frameX1 = min( int( pc.dims.z ), pc.viewport.x + int( viewX1 ) );
-	int frameY1 = min( int( pc.dims.w ), pc.viewport.y + int( viewY1 ) );
-	if ( frameX1 <= frameX0 || frameY1 <= frameY0 ) {
-		return;
-	}
-
 	uint color = PackColor( 0u, 0u, 0u, 255u );
 
 	if ( pc.overlayOnly == 0u ) {
@@ -921,16 +912,5 @@ void main() {
 		}
 	}
 
-	for ( int y = frameY0; y < frameY1; y++ ) {
-		uint uploadY = pc.dims.w - 1u - uint( y );
-		uint rowOffset = uploadY * pc.dims.z;
-		uint overlayRowOffset = uint( y ) * pc.dims.z;
-		for ( int x = frameX0; x < frameX1; x++ ) {
-			uint outColor = color;
-			if ( pc.overlayEnabled != 0u ) {
-				outColor = BlendOverlay( outColor, overlayPixels[overlayRowOffset + uint( x )] );
-			}
-			framePixels[rowOffset + uint( x )] = outColor;
-		}
-	}
+	litPixels[srcY * pc.dims.x + srcX] = color;
 }

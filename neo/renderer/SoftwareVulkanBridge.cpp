@@ -521,6 +521,7 @@ private:
 	void Update2DDescriptorSet( bool targetFrame );
 	void UpdateOverlayDescriptorSet( bool targetFrame );
 	void UpdateOverlayTileDescriptorSet( bool targetFrame );
+	void UpdateHybridUpscaleDescriptorSet();
 	bool ResolveHybridFrameToCpu();
 	bool Record2DCompositeCommands( bool targetFrame );
 	bool BuildOverlayTileBins( bool targetFrame, int &dispatchX0, int &dispatchY0, int &dispatchX1, int &dispatchY1 );
@@ -622,6 +623,7 @@ private:
 	swVkBuffer_t hybridAlbedoBuffer;
 	swVkBuffer_t hybridSpecularBuffer;
 	swVkBuffer_t hybridSurfaceBuffer;
+	swVkBuffer_t hybridLitBuffer;
 	swVkBuffer_t hybridFrameBuffer;
 	swVkBuffer_t hybridOverlayBuffer;
 	swVkBuffer_t hybrid2DSourceBuffer;
@@ -654,6 +656,7 @@ private:
 	VkDescriptorSetLayout twoDDescriptorSetLayout;
 	VkDescriptorPool twoDDescriptorPool;
 	VkDescriptorSet twoDDescriptorSet;
+	VkDescriptorSet hybridUpscaleDescriptorSet;
 	VkPipelineLayout twoDPipelineLayout;
 	VkPipeline twoDPipeline;
 	VkShaderModule twoDShaderModule;
@@ -768,6 +771,7 @@ idSoftwareVulkanBridge::idSoftwareVulkanBridge() {
 	twoDDescriptorSetLayout = VK_NULL_HANDLE;
 	twoDDescriptorPool = VK_NULL_HANDLE;
 	twoDDescriptorSet = VK_NULL_HANDLE;
+	hybridUpscaleDescriptorSet = VK_NULL_HANDLE;
 	twoDPipelineLayout = VK_NULL_HANDLE;
 	twoDPipeline = VK_NULL_HANDLE;
 	twoDShaderModule = VK_NULL_HANDLE;
@@ -1511,12 +1515,12 @@ bool idSoftwareVulkanBridge::Create2DPipeline() {
 	VkDescriptorPoolSize poolSize;
 	memset( &poolSize, 0, sizeof( poolSize ) );
 	poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	poolSize.descriptorCount = 2;
+	poolSize.descriptorCount = 4;
 
 	VkDescriptorPoolCreateInfo poolInfo;
 	memset( &poolInfo, 0, sizeof( poolInfo ) );
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-	poolInfo.maxSets = 1;
+	poolInfo.maxSets = 2;
 	poolInfo.poolSizeCount = 1;
 	poolInfo.pPoolSizes = &poolSize;
 	if ( vkCreateDescriptorPool( device, &poolInfo, NULL, &twoDDescriptorPool ) != VK_SUCCESS ) {
@@ -1528,12 +1532,16 @@ bool idSoftwareVulkanBridge::Create2DPipeline() {
 	memset( &setInfo, 0, sizeof( setInfo ) );
 	setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
 	setInfo.descriptorPool = twoDDescriptorPool;
-	setInfo.descriptorSetCount = 1;
-	setInfo.pSetLayouts = &twoDDescriptorSetLayout;
-	if ( vkAllocateDescriptorSets( device, &setInfo, &twoDDescriptorSet ) != VK_SUCCESS ) {
+	VkDescriptorSetLayout setLayouts[2] = { twoDDescriptorSetLayout, twoDDescriptorSetLayout };
+	VkDescriptorSet descriptorSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+	setInfo.descriptorSetCount = 2;
+	setInfo.pSetLayouts = setLayouts;
+	if ( vkAllocateDescriptorSets( device, &setInfo, descriptorSets ) != VK_SUCCESS ) {
 		LogFailure( "vkAllocateDescriptorSets 2D failed" );
 		return false;
 	}
+	twoDDescriptorSet = descriptorSets[0];
+	hybridUpscaleDescriptorSet = descriptorSets[1];
 	return true;
 }
 
@@ -1770,7 +1778,7 @@ bool idSoftwareVulkanBridge::CreateHybridPipeline() {
 	VkShaderModuleCreateInfo shaderInfo;
 	memset( &shaderInfo, 0, sizeof( shaderInfo ) );
 	shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-	shaderInfo.codeSize = swHybridCompositeCompSpvSize;
+	shaderInfo.codeSize = sizeof( swHybridCompositeCompSpv );
 	shaderInfo.pCode = swHybridCompositeCompSpv;
 	if ( vkCreateShaderModule( device, &shaderInfo, NULL, &hybridShaderModule ) != VK_SUCCESS ) {
 		LogFailure( "vkCreateShaderModule hybrid failed" );
@@ -2157,6 +2165,11 @@ bool idSoftwareVulkanBridge::EnsureHybridBuffers( int requiredWidth, int require
 			return false;
 		}
 	}
+	if ( hybridLitBuffer.buffer == VK_NULL_HANDLE || hybridLitBuffer.size < uintSize ) {
+		if ( !CreateBuffer( uintSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false, hybridLitBuffer ) ) {
+			return false;
+		}
+	}
 	if ( hybridFrameBuffer.buffer == VK_NULL_HANDLE || hybridFrameBuffer.size < frameSize ) {
 		if ( !CreateBuffer( frameSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false, hybridFrameBuffer ) ) {
 			return false;
@@ -2318,8 +2331,8 @@ void idSoftwareVulkanBridge::UpdateHybridDescriptorSet() {
 	infos[5].range = hybridSpecularBuffer.size;
 	infos[6].buffer = hybridSurfaceBuffer.buffer;
 	infos[6].range = hybridSurfaceBuffer.size;
-	infos[7].buffer = hybridFrameBuffer.buffer;
-	infos[7].range = hybridFrameBuffer.size;
+	infos[7].buffer = hybridLitBuffer.buffer;
+	infos[7].range = hybridLitBuffer.size;
 	infos[8].buffer = hybridOverlayBuffer.buffer;
 	infos[8].range = hybridOverlayBuffer.size;
 	infos[9].buffer = hybridTextureInfoBuffer.buffer;
@@ -2373,6 +2386,33 @@ void idSoftwareVulkanBridge::UpdateHybridDescriptorSet() {
 		asWrite.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
 		vkUpdateDescriptorSets( device, 1, &asWrite, 0, NULL );
 	}
+}
+
+void idSoftwareVulkanBridge::UpdateHybridUpscaleDescriptorSet() {
+	if ( hybridUpscaleDescriptorSet == VK_NULL_HANDLE ||
+		 hybridLitBuffer.buffer == VK_NULL_HANDLE ||
+		 hybridFrameBuffer.buffer == VK_NULL_HANDLE ) {
+		return;
+	}
+
+	VkDescriptorBufferInfo infos[2];
+	memset( infos, 0, sizeof( infos ) );
+	infos[0].buffer = hybridLitBuffer.buffer;
+	infos[0].range = hybridLitBuffer.size;
+	infos[1].buffer = hybridFrameBuffer.buffer;
+	infos[1].range = hybridFrameBuffer.size;
+
+	VkWriteDescriptorSet writes[2];
+	memset( writes, 0, sizeof( writes ) );
+	for ( uint32_t i = 0; i < 2; i++ ) {
+		writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[i].dstSet = hybridUpscaleDescriptorSet;
+		writes[i].dstBinding = i;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		writes[i].pBufferInfo = &infos[i];
+	}
+	vkUpdateDescriptorSets( device, 2, writes, 0, NULL );
 }
 
 bool idSoftwareVulkanBridge::EnsureShadowBuffers( int width, int height ) {
@@ -3955,7 +3995,11 @@ bool idSoftwareVulkanBridge::RecordOverlayRasterCommands( bool targetFrame ) {
 }
 
 bool idSoftwareVulkanBridge::RecordHybridCompositeCommands( bool outputForCompute ) {
-	if ( !hybridFrameDirty || hybridDescriptorSet == VK_NULL_HANDLE || hybridPipeline == VK_NULL_HANDLE || hybridFrameBuffer.buffer == VK_NULL_HANDLE ) {
+	if ( !hybridFrameDirty ||
+		 hybridDescriptorSet == VK_NULL_HANDLE || hybridUpscaleDescriptorSet == VK_NULL_HANDLE ||
+		 hybridPipeline == VK_NULL_HANDLE || twoDPipeline == VK_NULL_HANDLE || twoDPipelineLayout == VK_NULL_HANDLE ||
+		 hybridLitBuffer.buffer == VK_NULL_HANDLE || hybridOverlayBuffer.buffer == VK_NULL_HANDLE ||
+		 hybridFrameBuffer.buffer == VK_NULL_HANDLE ) {
 		return false;
 	}
 
@@ -4029,7 +4073,7 @@ bool idSoftwareVulkanBridge::RecordHybridCompositeCommands( bool outputForComput
 	push.dispatch[3] = static_cast<int32_t>( dispatchHeight );
 	push.debugView = static_cast<uint32_t>( hybridDebugView );
 	push.textureCount = static_cast<uint32_t>( Max( 0, hybridTextureCount ) );
-	push.overlayEnabled = outputForCompute ? 0u : ( hybridOverlayDirty ? 1u : 0u );
+	push.overlayEnabled = 0u;
 	push.lightCount = static_cast<uint32_t>( Max( 0, hybridLightCount ) );
 	push.shadowEnabled = hybridShadowEnabled ? 1u : 0u;
 	push.overlayOnly = hybridOverlayOnly ? 1u : 0u;
@@ -4046,6 +4090,30 @@ bool idSoftwareVulkanBridge::RecordHybridCompositeCommands( bool outputForComput
 	vkCmdDispatch( commandBuffer,
 		SWVkDispatchGroups( dispatchWidth, SW_VK_LINEAR_GROUP_SIZE_X ),
 		SWVkDispatchGroups( dispatchHeight, SW_VK_LINEAR_GROUP_SIZE_Y ), 1 );
+
+	SWVkComputeMemoryBarrier( commandBuffer, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT );
+	UpdateHybridUpscaleDescriptorSet();
+
+	swVk2DPushConstants_t upscalePush;
+	memset( &upscalePush, 0, sizeof( upscalePush ) );
+	upscalePush.src[0] = 0u;
+	upscalePush.src[1] = static_cast<uint32_t>( hybridWidth );
+	upscalePush.src[2] = static_cast<uint32_t>( hybridHeight );
+	upscalePush.src[3] = 0u;
+	upscalePush.frame[0] = static_cast<uint32_t>( frameWidth );
+	upscalePush.frame[1] = static_cast<uint32_t>( frameHeight );
+	upscalePush.viewport[0] = hybridViewportX;
+	upscalePush.viewport[1] = hybridViewportY;
+	upscalePush.viewport[2] = hybridPresentWidth;
+	upscalePush.viewport[3] = hybridPresentHeight;
+	upscalePush.targetFrame = 1u;
+
+	vkCmdBindPipeline( commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, twoDPipeline );
+	vkCmdBindDescriptorSets( commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, twoDPipelineLayout, 0, 1, &hybridUpscaleDescriptorSet, 0, NULL );
+	vkCmdPushConstants( commandBuffer, twoDPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( upscalePush ), &upscalePush );
+	vkCmdDispatch( commandBuffer,
+		SWVkDispatchGroups( static_cast<uint32_t>( hybridPresentWidth ), SW_VK_LINEAR_GROUP_SIZE_X ),
+		SWVkDispatchGroups( static_cast<uint32_t>( hybridPresentHeight ), SW_VK_LINEAR_GROUP_SIZE_Y ), 1 );
 
 	VkMemoryBarrier outputBarrier;
 	memset( &outputBarrier, 0, sizeof( outputBarrier ) );
@@ -4620,6 +4688,7 @@ void idSoftwareVulkanBridge::DestroyHybridBuffers() {
 	DestroyBuffer( hybrid2DSourceBuffer );
 	DestroyBuffer( hybridOverlayBuffer );
 	DestroyBuffer( hybridFrameBuffer );
+	DestroyBuffer( hybridLitBuffer );
 	DestroyBuffer( hybridSurfaceBuffer );
 	DestroyBuffer( hybridSpecularBuffer );
 	DestroyBuffer( hybridAlbedoBuffer );
@@ -4669,6 +4738,7 @@ void idSoftwareVulkanBridge::Destroy2DPipeline() {
 		vkDestroyDescriptorPool( device, twoDDescriptorPool, NULL );
 		twoDDescriptorPool = VK_NULL_HANDLE;
 		twoDDescriptorSet = VK_NULL_HANDLE;
+		hybridUpscaleDescriptorSet = VK_NULL_HANDLE;
 	}
 	if ( twoDDescriptorSetLayout != VK_NULL_HANDLE ) {
 		vkDestroyDescriptorSetLayout( device, twoDDescriptorSetLayout, NULL );
@@ -4884,6 +4954,7 @@ void idSoftwareVulkanBridge::Shutdown() {
 	hybridOverlayDirty = false;
 	hybridOverlayOnly = false;
 	twoDDescriptorSet = VK_NULL_HANDLE;
+	hybridUpscaleDescriptorSet = VK_NULL_HANDLE;
 	overlayTileDescriptorSet = VK_NULL_HANDLE;
 
 	vkGetPhysicalDeviceFeatures2Local = NULL;
