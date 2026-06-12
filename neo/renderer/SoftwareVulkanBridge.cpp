@@ -234,7 +234,8 @@ public:
 	bool CompositeHybridGBuffer( const viewDef_t *viewDef, const swHybridGBufferUpload_t &gbuffer, int width, int height, int presentWidth, int presentHeight );
 	bool UpdateHybridTextures( const swHybridTextureInfo_t *textureInfos, int textureInfoCount, const unsigned int *textureTexels, int textureTexelCount, unsigned int textureGeneration );
 	bool QueueHybridOverlayTriangles( const viewDef_t *viewDef, const swHybridOverlayTri_t *tris, int triCount, int width, int height, int presentWidth, int presentHeight );
-	bool ReadView( const viewDef_t *viewDef, unsigned int *bgra, int width, int height ) const;
+	bool QueueHybridOverlaySourceTriangles( const viewDef_t *viewDef, const swHybridOverlayTri_t *tris, int triCount, int width, int height, int presentWidth, int presentHeight, const unsigned int *sourcePixels, int sourceWidth, int sourceHeight );
+	bool ReadView( const viewDef_t *viewDef, unsigned int *bgra, int width, int height );
 	bool PresentFrame();
 	bool RayQueryAvailable();
 	bool PrepareRayQueryScene( const viewDef_t *viewDef );
@@ -292,6 +293,7 @@ private:
 	bool Queue2DOverlayBlit( const viewDef_t *viewDef, const unsigned int *bgra, int width, int height, int presentWidth, int presentHeight );
 	void Update2DDescriptorSet( bool targetFrame );
 	void UpdateOverlayDescriptorSet( bool targetFrame );
+	bool ResolveHybridFrameToCpu();
 	bool Record2DCompositeCommands( bool targetFrame );
 	bool RecordOverlayRasterCommands( bool targetFrame );
 	void DestroySwapchain();
@@ -1198,9 +1200,9 @@ bool idSoftwareVulkanBridge::Create2DPipeline() {
 }
 
 bool idSoftwareVulkanBridge::CreateOverlayPipeline() {
-	VkDescriptorSetLayoutBinding bindings[5];
+	VkDescriptorSetLayoutBinding bindings[6];
 	memset( bindings, 0, sizeof( bindings ) );
-	for ( uint32_t i = 0; i < 5; i++ ) {
+	for ( uint32_t i = 0; i < 6; i++ ) {
 		bindings[i].binding = i;
 		bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 		bindings[i].descriptorCount = 1;
@@ -1210,7 +1212,7 @@ bool idSoftwareVulkanBridge::CreateOverlayPipeline() {
 	VkDescriptorSetLayoutCreateInfo layoutInfo;
 	memset( &layoutInfo, 0, sizeof( layoutInfo ) );
 	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	layoutInfo.bindingCount = 5;
+	layoutInfo.bindingCount = 6;
 	layoutInfo.pBindings = bindings;
 	if ( vkCreateDescriptorSetLayout( device, &layoutInfo, NULL, &overlayDescriptorSetLayout ) != VK_SUCCESS ) {
 		LogFailure( "vkCreateDescriptorSetLayout overlay failed" );
@@ -1265,7 +1267,7 @@ bool idSoftwareVulkanBridge::CreateOverlayPipeline() {
 	VkDescriptorPoolSize poolSize;
 	memset( &poolSize, 0, sizeof( poolSize ) );
 	poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	poolSize.descriptorCount = 5;
+	poolSize.descriptorCount = 6;
 
 	VkDescriptorPoolCreateInfo poolInfo;
 	memset( &poolInfo, 0, sizeof( poolInfo ) );
@@ -1517,7 +1519,7 @@ bool idSoftwareVulkanBridge::EnsureUploadBuffer( int requiredWidth, int required
 	memset( &bufferInfo, 0, sizeof( bufferInfo ) );
 	bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
 	bufferInfo.size = requiredSize;
-	bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+	bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 	bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
 	if ( vkCreateBuffer( device, &bufferInfo, NULL, &uploadBuffer ) != VK_SUCCESS ) {
@@ -1761,11 +1763,12 @@ void idSoftwareVulkanBridge::UpdateOverlayDescriptorSet( bool targetFrame ) {
 		 hybridDepthBuffer.buffer == VK_NULL_HANDLE ||
 		 targetBuffer.buffer == VK_NULL_HANDLE ||
 		 hybridTextureInfoBuffer.buffer == VK_NULL_HANDLE ||
-		 hybridTextureTexelBuffer.buffer == VK_NULL_HANDLE ) {
+		 hybridTextureTexelBuffer.buffer == VK_NULL_HANDLE ||
+		 hybrid2DSourceBuffer.buffer == VK_NULL_HANDLE ) {
 		return;
 	}
 
-	VkDescriptorBufferInfo infos[5];
+	VkDescriptorBufferInfo infos[6];
 	memset( infos, 0, sizeof( infos ) );
 	infos[0].buffer = hybridOverlayTriBuffer.buffer;
 	infos[0].range = hybridOverlayTriBuffer.size;
@@ -1777,10 +1780,12 @@ void idSoftwareVulkanBridge::UpdateOverlayDescriptorSet( bool targetFrame ) {
 	infos[3].range = hybridTextureInfoBuffer.size;
 	infos[4].buffer = hybridTextureTexelBuffer.buffer;
 	infos[4].range = hybridTextureTexelBuffer.size;
+	infos[5].buffer = hybrid2DSourceBuffer.buffer;
+	infos[5].range = hybrid2DSourceBuffer.size;
 
-	VkWriteDescriptorSet writes[5];
+	VkWriteDescriptorSet writes[6];
 	memset( writes, 0, sizeof( writes ) );
-	for ( uint32_t i = 0; i < 5; i++ ) {
+	for ( uint32_t i = 0; i < 6; i++ ) {
 		writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
 		writes[i].dstSet = overlayDescriptorSet;
 		writes[i].dstBinding = i;
@@ -1788,7 +1793,7 @@ void idSoftwareVulkanBridge::UpdateOverlayDescriptorSet( bool targetFrame ) {
 		writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 		writes[i].pBufferInfo = &infos[i];
 	}
-	vkUpdateDescriptorSets( device, 5, writes, 0, NULL );
+	vkUpdateDescriptorSets( device, 6, writes, 0, NULL );
 }
 
 void idSoftwareVulkanBridge::UpdateHybridDescriptorSet() {
@@ -2597,9 +2602,14 @@ bool idSoftwareVulkanBridge::Queue2DOverlayBlit( const viewDef_t *viewDef, const
 }
 
 bool idSoftwareVulkanBridge::QueueHybridOverlayTriangles( const viewDef_t *viewDef, const swHybridOverlayTri_t *tris, int triCount, int srcWidth, int srcHeight, int dstWidth, int dstHeight ) {
+	return QueueHybridOverlaySourceTriangles( viewDef, tris, triCount, srcWidth, srcHeight, dstWidth, dstHeight, NULL, 0, 0 );
+}
+
+bool idSoftwareVulkanBridge::QueueHybridOverlaySourceTriangles( const viewDef_t *viewDef, const swHybridOverlayTri_t *tris, int triCount, int srcWidth, int srcHeight, int dstWidth, int dstHeight, const unsigned int *sourcePixels, int sourceWidth, int sourceHeight ) {
 	if ( !viewDef || !tris || triCount <= 0 || srcWidth <= 0 || srcHeight <= 0 || dstWidth <= 0 || dstHeight <= 0 ) {
 		return false;
 	}
+	const bool hasSource = sourcePixels != NULL && sourceWidth > 0 && sourceHeight > 0;
 	if ( !EnsureInitialized() || overlayPipeline == VK_NULL_HANDLE ) {
 		return false;
 	}
@@ -2626,14 +2636,22 @@ bool idSoftwareVulkanBridge::QueueHybridOverlayTriangles( const viewDef_t *viewD
 		hybridFrameDirty = true;
 	}
 
+	int sourceOffset = 0;
+	if ( hasSource ) {
+		sourceOffset = hybrid2DSourcePixels.Num();
+		const int sourcePixelCount = sourceWidth * sourceHeight;
+		hybrid2DSourcePixels.SetNum( sourceOffset + sourcePixelCount, false );
+		memcpy( hybrid2DSourcePixels.Ptr() + sourceOffset, sourcePixels, sourcePixelCount * sizeof( sourcePixels[0] ) );
+	}
+
 	const int oldCount = hybridOverlayTris.Num();
 	hybridOverlayTris.SetNum( oldCount + triCount, false );
 	for ( int i = 0; i < triCount; i++ ) {
 		swHybridOverlayTri_t &dst = hybridOverlayTris[oldCount + i];
 		dst = tris[i];
-		dst.source[0] = srcWidth;
-		dst.source[1] = srcHeight;
-		dst.source[2] = 0;
+		dst.source[0] = hasSource ? sourceWidth : srcWidth;
+		dst.source[1] = hasSource ? sourceHeight : srcHeight;
+		dst.source[2] = sourceOffset;
 		dst.source[3] = 0;
 		dst.viewport[0] = viewDef->viewport.x1;
 		dst.viewport[1] = viewDef->viewport.y1;
@@ -2836,16 +2854,122 @@ bool idSoftwareVulkanBridge::UpdateHybridTextures( const swHybridTextureInfo_t *
 	return true;
 }
 
-bool idSoftwareVulkanBridge::ReadView( const viewDef_t *viewDef, unsigned int *bgra, int width, int height ) const {
+bool idSoftwareVulkanBridge::ResolveHybridFrameToCpu() {
+	if ( !initialized || !hybridFrameDirty ) {
+		return false;
+	}
+	if ( !EnsureFrameBuffer() ||
+		 !EnsureHybridBuffers( hybridWidth, hybridHeight, hybridTextureCount, hybridTextureTexelCount, Max( 1, hybridLightCount ) ) ||
+		 !EnsureUploadBuffer( frameWidth, frameHeight ) ) {
+		return false;
+	}
+
+	UpdateHybridDescriptorSet();
+	if ( hybridOverlayDirty ) {
+		if ( !EnsureOverlayBuffers( hybridOverlayTris.Num() ) ||
+			 !Ensure2DBuffers( Max( 1, hybrid2DSourcePixels.Num() ) ) ) {
+			return false;
+		}
+
+		const swHybridOverlayTri_t dummyTri = {};
+		const VkDeviceSize triSize = static_cast<VkDeviceSize>( Max( 1, hybridOverlayTris.Num() ) ) * sizeof( swHybridOverlayTri_t );
+		const void *triData = hybridOverlayTris.Num() > 0 ? hybridOverlayTris.Ptr() : &dummyTri;
+		if ( !UploadBuffer( hybridOverlayTriBuffer, triData, triSize, "vkMapMemory overlay tris failed" ) ) {
+			return false;
+		}
+		if ( hybrid2DSourcePixels.Num() > 0 ) {
+			const VkDeviceSize sourceSize = static_cast<VkDeviceSize>( hybrid2DSourcePixels.Num() ) * sizeof( uint32_t );
+			if ( !UploadBuffer( hybrid2DSourceBuffer, hybrid2DSourcePixels.Ptr(), sourceSize, "vkMapMemory 2D source failed" ) ) {
+				return false;
+			}
+		}
+	}
+
+	vkWaitForFences( device, 1, &inFlightFence, VK_TRUE, UINT64_MAX );
+	vkResetFences( device, 1, &inFlightFence );
+	vkResetCommandBuffer( commandBuffer, 0 );
+
+	VkCommandBufferBeginInfo beginInfo;
+	memset( &beginInfo, 0, sizeof( beginInfo ) );
+	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	if ( vkBeginCommandBuffer( commandBuffer, &beginInfo ) != VK_SUCCESS ) {
+		LogFailure( "vkBeginCommandBuffer hybrid readback failed" );
+		return false;
+	}
+
+	const bool directHybridOverlay = hybridOverlayDirty;
+	if ( !RecordHybridCompositeCommands( directHybridOverlay ) ) {
+		return false;
+	}
+	if ( directHybridOverlay ) {
+		if ( hybridOverlayTris.Num() > 0 ) {
+			UpdateOverlayDescriptorSet( true );
+			if ( !RecordOverlayRasterCommands( true ) ) {
+				return false;
+			}
+		}
+		if ( hybrid2DSourcePixels.Num() > 0 ) {
+			Update2DDescriptorSet( true );
+			if ( !Record2DCompositeCommands( true ) ) {
+				return false;
+			}
+		}
+		RecordHybridFrameTransferBarrier();
+	}
+
+	VkBufferCopy copyRegion;
+	memset( &copyRegion, 0, sizeof( copyRegion ) );
+	copyRegion.size = static_cast<VkDeviceSize>( frameWidth ) * static_cast<VkDeviceSize>( frameHeight ) * sizeof( uint32_t );
+	vkCmdCopyBuffer( commandBuffer, hybridFrameBuffer.buffer, uploadBuffer, 1, &copyRegion );
+
+	if ( vkEndCommandBuffer( commandBuffer ) != VK_SUCCESS ) {
+		LogFailure( "vkEndCommandBuffer hybrid readback failed" );
+		return false;
+	}
+
+	VkSubmitInfo submitInfo;
+	memset( &submitInfo, 0, sizeof( submitInfo ) );
+	submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	submitInfo.commandBufferCount = 1;
+	submitInfo.pCommandBuffers = &commandBuffer;
+	if ( vkQueueSubmit( queue, 1, &submitInfo, inFlightFence ) != VK_SUCCESS ) {
+		LogFailure( "vkQueueSubmit hybrid readback failed" );
+		return false;
+	}
+	vkWaitForFences( device, 1, &inFlightFence, VK_TRUE, UINT64_MAX );
+
+	void *mapped = NULL;
+	if ( vkMapMemory( device, uploadMemory, 0, uploadBufferSize, 0, &mapped ) != VK_SUCCESS ) {
+		LogFailure( "vkMapMemory hybrid readback failed" );
+		return false;
+	}
+
+	const unsigned int *uploadPixels = reinterpret_cast<const unsigned int *>( mapped );
+	for ( int y = 0; y < frameHeight; y++ ) {
+		const unsigned int *src = uploadPixels + ( frameHeight - 1 - y ) * frameWidth;
+		unsigned int *dst = framePixels.Ptr() + y * frameWidth;
+		memcpy( dst, src, frameWidth * sizeof( unsigned int ) );
+	}
+	vkUnmapMemory( device, uploadMemory );
+
+	hybridFrameDirty = false;
+	hybridOverlayDirty = false;
+	hybridOverlayOnly = false;
+	Clear2DJobs();
+	frameBegun = true;
+	frameDirty = true;
+	return true;
+}
+
+bool idSoftwareVulkanBridge::ReadView( const viewDef_t *viewDef, unsigned int *bgra, int width, int height ) {
 	if ( !viewDef || !bgra || width <= 0 || height <= 0 ) {
 		return false;
 	}
 	if ( initialized && hybridFrameDirty ) {
-		if ( hybridOverlayOnly && !frameDirty ) {
+		if ( !ResolveHybridFrameToCpu() ) {
 			return false;
 		}
-		memset( bgra, 0, width * height * sizeof( bgra[0] ) );
-		return true;
 	}
 	if ( !initialized || !frameBegun || framePixels.Num() != frameWidth * frameHeight ) {
 		return false;
@@ -3180,7 +3304,7 @@ bool idSoftwareVulkanBridge::PresentFrame() {
 			if ( !EnsureOverlayBuffers( hybridOverlayTris.Num() ) ) {
 				return false;
 			}
-			if ( hybrid2DSourcePixels.Num() > 0 && !Ensure2DBuffers( hybrid2DSourcePixels.Num() ) ) {
+			if ( !Ensure2DBuffers( Max( 1, hybrid2DSourcePixels.Num() ) ) ) {
 				return false;
 			}
 		}
@@ -3384,7 +3508,7 @@ bool idSoftwareVulkanBridge::PrepareRayQueryScene( const viewDef_t *viewDef ) {
 		return false;
 	}
 	if ( HasPendingShadowJobs() ) {
-		return rayQuerySceneReady && tlas != VK_NULL_HANDLE;
+		WaitForSubmittedWork();
 	}
 
 	rayQuerySceneFrame++;
@@ -3414,10 +3538,11 @@ bool idSoftwareVulkanBridge::PrepareRayQueryScene( const viewDef_t *viewDef ) {
 		}
 
 		int sourceFrame = 0;
-		if ( geo->deformedSurface ) {
+		if ( geo->deformedSurface ||
+			 ( surf->space->entityDef && surf->space->entityDef->parms.hModel &&
+			   surf->space->entityDef->parms.hModel->IsDynamicModel() != DM_STATIC ) ) {
 			sourceFrame = rayQuerySceneFrame;
-		}
-		if ( !geo->deformedSurface && surf->space->entityDef && ( surf->space->entityDef->dynamicModel || surf->space->entityDef->cachedDynamicModel ) ) {
+		} else if ( surf->space->entityDef && ( surf->space->entityDef->dynamicModel || surf->space->entityDef->cachedDynamicModel ) ) {
 			sourceFrame = surf->space->entityDef->dynamicModelFrameCount;
 		}
 
@@ -3823,6 +3948,10 @@ bool SWVulkan_UpdateHybridTextures( const swHybridTextureInfo_t *textureInfos, i
 
 bool SWVulkan_QueueHybridOverlayTriangles( const viewDef_t *viewDef, const swHybridOverlayTri_t *tris, int triCount, int width, int height, int presentWidth, int presentHeight ) {
 	return swVulkanBridge.QueueHybridOverlayTriangles( viewDef, tris, triCount, width, height, presentWidth, presentHeight );
+}
+
+bool SWVulkan_QueueHybridOverlaySourceTriangles( const viewDef_t *viewDef, const swHybridOverlayTri_t *tris, int triCount, int width, int height, int presentWidth, int presentHeight, const unsigned int *sourcePixels, int sourceWidth, int sourceHeight ) {
+	return swVulkanBridge.QueueHybridOverlaySourceTriangles( viewDef, tris, triCount, width, height, presentWidth, presentHeight, sourcePixels, sourceWidth, sourceHeight );
 }
 
 bool SWVulkan_ReadView( const viewDef_t *viewDef, unsigned int *bgra, int width, int height ) {

@@ -48,6 +48,9 @@ layout( set = 0, binding = 3, std430 ) readonly buffer TextureInfoBuffer {
 layout( set = 0, binding = 4, std430 ) readonly buffer TextureTexelBuffer {
 	uint textureTexels[];
 };
+layout( set = 0, binding = 5, std430 ) readonly buffer SourceBuffer {
+	uint sourcePixels[];
+};
 
 layout( push_constant ) uniform PushConstants {
 	uvec4 tri;       // index, clear, dispatch width, dispatch height
@@ -65,6 +68,7 @@ const uint FLAG_COLOR_MOD = 2u;
 const uint FLAG_ALPHA_TEST = 4u;
 const uint FLAG_DEPTH_TEST = 8u;
 const uint FLAG_DEPTH_EQUAL = 16u;
+const uint FLAG_SOURCE_IMAGE = 32u;
 
 const int SW_BLEND_REPLACE = 0;
 const int SW_BLEND_ALPHA = 1;
@@ -448,7 +452,14 @@ void main() {
 	float t = tOverW * invPerspective;
 
 	uint srcColor = tri.params0.y;
-	if ( ( tri.params0.z & FLAG_TEXTURE ) != 0u ) {
+	if ( ( tri.params0.z & FLAG_SOURCE_IMAGE ) != 0u ) {
+		uint sourceWidth = max( 1u, uint( tri.source.x ) );
+		uint sourceHeight = max( 1u, uint( tri.source.y ) );
+		uint sourceOffset = uint( tri.source.z );
+		uint sourceX = min( sourceWidth - 1u, uint( clamp( srcX, 0.0, float( sourceWidth - 1u ) ) ) );
+		uint sourceY = min( sourceHeight - 1u, uint( clamp( srcY, 0.0, float( sourceHeight - 1u ) ) ) );
+		srcColor = sourcePixels[sourceOffset + sourceY * sourceWidth + sourceX];
+	} else if ( ( tri.params0.z & FLAG_TEXTURE ) != 0u ) {
 		float invW2 = invW * invW;
 		float dsdx = invW2 > 0.000000001 ? ( tri.sPlane.y * invW - sOverW * tri.invWPlane.y ) / invW2 : 0.0;
 		float dtdx = invW2 > 0.000000001 ? ( tri.tPlane.y * invW - tOverW * tri.invWPlane.y ) / invW2 : 0.0;

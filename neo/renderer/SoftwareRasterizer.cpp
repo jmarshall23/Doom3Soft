@@ -55,6 +55,7 @@ static const unsigned int SW_OVERLAY_FLAG_COLOR_MOD = BIT(1);
 static const unsigned int SW_OVERLAY_FLAG_ALPHA_TEST = BIT(2);
 static const unsigned int SW_OVERLAY_FLAG_DEPTH_TEST = BIT(3);
 static const unsigned int SW_OVERLAY_FLAG_DEPTH_EQUAL = BIT(4);
+static const unsigned int SW_OVERLAY_FLAG_SOURCE_IMAGE = BIT(5);
 static const unsigned int SW_HYBRID_LIGHT_NORMAL = 0;
 static const unsigned int SW_HYBRID_LIGHT_FOG = 1;
 static const unsigned int SW_HYBRID_LIGHT_BLEND = 2;
@@ -459,6 +460,8 @@ private:
 	void ClearTileBins();
 	void ClearHybridGBuffer();
 	bool ViewNeedsWorldPosition( const viewDef_t *viewDef ) const;
+	bool ViewContainsSubviewSurface( const viewDef_t *viewDef ) const;
+	bool IsGuiCarrierSurface( const drawSurf_t *surf ) const;
 	void BeginSurfacePass();
 	void BeginInteractionPass();
 	void ReadCurrentFramebuffer( const viewDef_t *viewDef );
@@ -466,6 +469,7 @@ private:
 	void SetupDepthPrepass( const viewDef_t *viewDef );
 	void SetupAmbientTriangles( const viewDef_t *viewDef );
 	void SetupTranslucentTriangles( const viewDef_t *viewDef );
+	void SetupSubviewTriangles( const viewDef_t *viewDef );
 	void SetupDrawSurf( const viewDef_t *viewDef, const drawSurf_t *surf );
 	void SetupDepthDrawSurf( const viewDef_t *viewDef, const drawSurf_t *surf );
 	void SetupDrawSurfStage( const viewDef_t *viewDef, const drawSurf_t *surf, const swSurfaceStage_t &stage );
@@ -602,14 +606,19 @@ private:
 	idList<swHybridTextureInfo_t> hybridTextureInfos;
 	idList<unsigned int> hybridTextureTexels;
 	idList<swHybridLight_t> hybridLights;
+	idList<unsigned int> subviewSourcePixels;
 	unsigned int textureCacheGeneration;
 	unsigned int hybridTextureAtlasGeneration;
 	int hybridImageManagerCount;
+	int subviewSourceWidth;
+	int subviewSourceHeight;
 	bool hybridTextureCachePrimed;
 	swRasterPass_t rasterPass;
 	bool shadowMaskActive;
 	unsigned int hybridSurfaceSerial;
 	bool captureWorldPosition;
+	bool hybridComputeActive;
+	bool hasSubviewSource;
 
 #if defined( _WIN32 ) && !defined( _D3SDK )
 	bool workersStarted;
@@ -636,10 +645,14 @@ idSoftwareRasterizer::idSoftwareRasterizer() {
 	shadowMaskActive = false;
 	hybridSurfaceSerial = 1;
 	captureWorldPosition = false;
+	hybridComputeActive = false;
 	textureCacheGeneration = 1;
 	hybridTextureAtlasGeneration = 0;
 	hybridImageManagerCount = 0;
+	subviewSourceWidth = 0;
+	subviewSourceHeight = 0;
 	hybridTextureCachePrimed = false;
+	hasSubviewSource = false;
 
 #if defined( _WIN32 ) && !defined( _D3SDK )
 	workersStarted = false;
@@ -791,10 +804,26 @@ void idSoftwareRasterizer::DrawView( const viewDef_t *viewDef ) {
 	const float renderScale = is3DView ? idMath::ClampFloat( 0.01f, 1.0f, r_softwareRenderScale.GetFloat() ) : 1.0f;
 	const int renderWidth = Max( 1, idMath::Ftoi( static_cast<float>( presentWidth ) * renderScale + 0.5f ) );
 	const int renderHeight = Max( 1, idMath::Ftoi( static_cast<float>( presentHeight ) * renderScale + 0.5f ) );
+	const bool captureSubviewSource = is3DView && ViewContainsSubviewSurface( viewDef ) && r_softwareVulkanPresent.GetBool();
+	const bool allowHybridCompute = is3DView && r_softwareHybridComputeLighting.GetBool();
 	const bool tryCompute2DOverlay = !is3DView && r_softwareHybridComputeLighting.GetBool() && r_softwareVulkanPresent.GetBool();
+	hybridComputeActive = allowHybridCompute;
 	captureWorldPosition = is3DView && ViewNeedsWorldPosition( viewDef );
 	Resize( renderWidth, renderHeight );
+	hasSubviewSource = false;
+	subviewSourceWidth = 0;
+	subviewSourceHeight = 0;
 	if ( viewDef->viewEntitys ) {
+		if ( captureSubviewSource ) {
+			subviewSourcePixels.SetNum( width * height, false );
+			hasSubviewSource = SWVulkan_ReadView( viewDef, subviewSourcePixels.Ptr(), width, height );
+			if ( hasSubviewSource ) {
+				subviewSourceWidth = width;
+				subviewSourceHeight = height;
+			} else {
+				subviewSourcePixels.SetNum( 0, false );
+			}
+		}
 		Clear( true );
 	} else {
 		if ( !tryCompute2DOverlay ) {
@@ -805,7 +834,7 @@ void idSoftwareRasterizer::DrawView( const viewDef_t *viewDef ) {
 
 	if ( viewDef->viewEntitys ) {
 		RB_DetermineLightScale();
-		if ( r_softwareHybridComputeLighting.GetBool() ) {
+		if ( allowHybridCompute ) {
 			PrimeHybridTextureCacheFromImageManager();
 		}
 
@@ -813,7 +842,7 @@ void idSoftwareRasterizer::DrawView( const viewDef_t *viewDef ) {
 		SetupDepthPrepass( viewDef );
 		RasterizeTiles();
 
-		if ( r_softwareHybridComputeLighting.GetBool() ) {
+		if ( allowHybridCompute ) {
 			swHybridGBufferUpload_t gbuffer;
 			gbuffer.depth = hybridGBuffer.depth.Ptr();
 			gbuffer.normalPacked = hybridGBuffer.normalPacked.Ptr();
@@ -827,8 +856,17 @@ void idSoftwareRasterizer::DrawView( const viewDef_t *viewDef ) {
 			gbuffer.worldPositions = worldPositionBuffer.Ptr();
 			gbuffer.debugView = r_softwareHybridDebugView.GetInteger();
 
+			idList<swHybridOverlayTri_t> subviewOverlayTris;
 			idList<swHybridOverlayTri_t> overlayTris;
 			if ( gbuffer.debugView == 0 ) {
+				if ( hasSubviewSource ) {
+					BeginSurfacePass();
+					SetupSubviewTriangles( viewDef );
+					BuildHybridOverlayTriangles( subviewOverlayTris );
+					for ( int i = 0; i < subviewOverlayTris.Num(); i++ ) {
+						subviewOverlayTris[i].params0[2] |= SW_OVERLAY_FLAG_SOURCE_IMAGE;
+					}
+				}
 				BeginSurfacePass();
 				SetupTranslucentTriangles( viewDef );
 				BuildHybridOverlayTriangles( overlayTris );
@@ -838,8 +876,15 @@ void idSoftwareRasterizer::DrawView( const viewDef_t *viewDef ) {
 			BuildHybridTextureUpload( gbuffer );
 			if ( SWVulkan_CompositeHybridGBuffer( viewDef, gbuffer, width, height, presentWidth, presentHeight ) ) {
 				if ( r_softwareHybridDebugView.GetInteger() == 0 ) {
-					if ( overlayTris.Num() <= 0 ||
-						 SWVulkan_QueueHybridOverlayTriangles( viewDef, overlayTris.Ptr(), overlayTris.Num(), width, height, presentWidth, presentHeight ) ) {
+					bool queuedOverlays = true;
+					if ( subviewOverlayTris.Num() > 0 ) {
+						queuedOverlays = SWVulkan_QueueHybridOverlaySourceTriangles( viewDef, subviewOverlayTris.Ptr(), subviewOverlayTris.Num(),
+							width, height, presentWidth, presentHeight, subviewSourcePixels.Ptr(), subviewSourceWidth, subviewSourceHeight );
+					}
+					if ( queuedOverlays && overlayTris.Num() > 0 ) {
+						queuedOverlays = SWVulkan_QueueHybridOverlayTriangles( viewDef, overlayTris.Ptr(), overlayTris.Num(), width, height, presentWidth, presentHeight );
+					}
+					if ( queuedOverlays ) {
 						return;
 					}
 
@@ -905,6 +950,23 @@ void idSoftwareRasterizer::SetupTriangles( const viewDef_t *viewDef ) {
 	}
 }
 
+bool idSoftwareRasterizer::ViewContainsSubviewSurface( const viewDef_t *viewDef ) const {
+	if ( !viewDef ) {
+		return false;
+	}
+	for ( int i = 0; i < viewDef->numDrawSurfs; i++ ) {
+		const drawSurf_t *surf = viewDef->drawSurfs[i];
+		if ( surf && surf->material && surf->material->GetSort() == SS_SUBVIEW ) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool idSoftwareRasterizer::IsGuiCarrierSurface( const drawSurf_t *surf ) const {
+	return surf && surf->material && surf->material->HasGui() && surf->material->GetNumStages() == 0;
+}
+
 void idSoftwareRasterizer::SetupDepthPrepass( const viewDef_t *viewDef ) {
 	for ( int i = 0; i < viewDef->numDrawSurfs; i++ ) {
 		const drawSurf_t *surf = viewDef->drawSurfs[i];
@@ -912,7 +974,7 @@ void idSoftwareRasterizer::SetupDepthPrepass( const viewDef_t *viewDef ) {
 			continue;
 		}
 		const float sort = surf->material->GetSort();
-		if ( sort != SS_OPAQUE ) {
+		if ( sort != SS_OPAQUE && sort != SS_SUBVIEW ) {
 			continue;
 		}
 		SetupDepthDrawSurf( viewDef, surf );
@@ -923,6 +985,9 @@ void idSoftwareRasterizer::SetupAmbientTriangles( const viewDef_t *viewDef ) {
 	for ( int i = 0; i < viewDef->numDrawSurfs; i++ ) {
 		const drawSurf_t *surf = viewDef->drawSurfs[i];
 		if ( !surf || !surf->geo || !surf->material ) {
+			continue;
+		}
+		if ( IsGuiCarrierSurface( surf ) ) {
 			continue;
 		}
 		const float sort = surf->material->GetSort();
@@ -953,6 +1018,9 @@ void idSoftwareRasterizer::SetupTranslucentTriangles( const viewDef_t *viewDef )
 		if ( !surf || !surf->geo || !surf->material ) {
 			continue;
 		}
+		if ( IsGuiCarrierSurface( surf ) ) {
+			continue;
+		}
 		const float sort = surf->material->GetSort();
 		const bool guiSort = sort >= SS_GUI && sort < SS_OPAQUE;
 		if ( sort >= SS_POST_PROCESS ) {
@@ -965,7 +1033,31 @@ void idSoftwareRasterizer::SetupTranslucentTriangles( const viewDef_t *viewDef )
 	}
 }
 
+void idSoftwareRasterizer::SetupSubviewTriangles( const viewDef_t *viewDef ) {
+	for ( int i = 0; i < viewDef->numDrawSurfs; i++ ) {
+		const drawSurf_t *surf = viewDef->drawSurfs[i];
+		if ( !surf || !surf->geo || !surf->material ) {
+			continue;
+		}
+		if ( surf->material->GetSort() != SS_SUBVIEW ) {
+			continue;
+		}
+
+		swSurfaceStage_t stage;
+		ConfigureDepthStage( surf, stage, NULL );
+		stage.writeMask = SW_WRITE_COLOR;
+		stage.depthWrite = false;
+		stage.depthEqual = true;
+		stage.writeWorldPosition = false;
+		stage.writeGBuffer = false;
+		SetupDrawSurfStage( viewDef, surf, stage );
+	}
+}
+
 void idSoftwareRasterizer::SetupDrawSurf( const viewDef_t *viewDef, const drawSurf_t *surf ) {
+	if ( IsGuiCarrierSurface( surf ) ) {
+		return;
+	}
 	const srfTriangles_t *geo = surf->geo;
 	if ( !geo->verts || !geo->indexes || geo->numVerts <= 0 || geo->numIndexes < 3 || !surf->space ) {
 		return;
@@ -1000,6 +1092,9 @@ void idSoftwareRasterizer::SetupDrawSurf( const viewDef_t *viewDef, const drawSu
 }
 
 void idSoftwareRasterizer::SetupDepthDrawSurf( const viewDef_t *viewDef, const drawSurf_t *surf ) {
+	if ( IsGuiCarrierSurface( surf ) ) {
+		return;
+	}
 	const srfTriangles_t *geo = surf->geo;
 	if ( !geo->indexes || geo->numIndexes < 3 || !surf->space || !surf->material->IsDrawn() ) {
 		return;
@@ -1015,7 +1110,7 @@ void idSoftwareRasterizer::SetupDepthDrawSurf( const viewDef_t *viewDef, const d
 	unsigned int materialId = 0;
 	unsigned int albedoOrTextureId = 0xffffffffu;
 	unsigned int specularAndFlags = 0;
-	if ( r_softwareHybridComputeLighting.GetBool() ) {
+	if ( hybridComputeActive ) {
 		surfaceId = hybridSurfaceSerial++;
 		materialId = surfaceId;
 
@@ -1144,7 +1239,7 @@ void idSoftwareRasterizer::ConfigureDepthStage( const drawSurf_t *surf, swSurfac
 	stage.needsColorModulation = false;
 	stage.alphaTest = false;
 	stage.writeWorldPosition = captureWorldPosition;
-	stage.writeGBuffer = r_softwareHybridComputeLighting.GetBool();
+	stage.writeGBuffer = hybridComputeActive;
 	stage.alphaTestValue = 0.0f;
 	stage.alphaTestByte = 0;
 	stage.fallbackColor = PackColor( 255, 255, 255, 255 );

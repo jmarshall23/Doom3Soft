@@ -104,6 +104,7 @@ bool SWVulkan_BlitView( const viewDef_t *viewDef, const unsigned int *bgra, int 
 bool SWVulkan_CompositeHybridGBuffer( const viewDef_t *viewDef, const swHybridGBufferUpload_t &gbuffer, int width, int height, int presentWidth, int presentHeight );
 bool SWVulkan_UpdateHybridTextures( const swHybridTextureInfo_t *textureInfos, int textureInfoCount, const unsigned int *textureTexels, int textureTexelCount, unsigned int textureGeneration );
 bool SWVulkan_QueueHybridOverlayTriangles( const viewDef_t *viewDef, const swHybridOverlayTri_t *tris, int triCount, int width, int height, int presentWidth, int presentHeight );
+bool SWVulkan_QueueHybridOverlaySourceTriangles( const viewDef_t *viewDef, const swHybridOverlayTri_t *tris, int triCount, int width, int height, int presentWidth, int presentHeight, const unsigned int *sourcePixels, int sourceWidth, int sourceHeight );
 bool SWVulkan_ReadView( const viewDef_t *viewDef, unsigned int *bgra, int width, int height );
 bool SWVulkan_PresentFrame( void );
 bool SWVulkan_RayQueryAvailable( void );
