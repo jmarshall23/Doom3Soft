@@ -108,6 +108,16 @@ static double SWVkTimestampDeltaMsec( uint64_t begin, uint64_t end, uint32_t val
 	return static_cast<double>( delta ) * static_cast<double>( timestampPeriod ) * 0.000001;
 }
 
+static const char *SWVkPresentModeName( VkPresentModeKHR mode ) {
+	switch ( mode ) {
+		case VK_PRESENT_MODE_IMMEDIATE_KHR: return "immediate";
+		case VK_PRESENT_MODE_MAILBOX_KHR: return "mailbox";
+		case VK_PRESENT_MODE_FIFO_KHR: return "fifo";
+		case VK_PRESENT_MODE_FIFO_RELAXED_KHR: return "fifo_relaxed";
+		default: return "unknown";
+	}
+}
+
 static void SWVkPrintGpuTimestampStats( const swVkGpuTimestampFrame_t &frame, const uint64_t timestamps[SW_VK_GPU_TIMESTAMP_COUNT], float timestampPeriod, uint32_t validBits ) {
 	if ( r_showSoftwarePerf.GetInteger() == 0 ) {
 		return;
@@ -734,6 +744,7 @@ private:
 
 	VkSwapchainKHR swapchain;
 	VkFormat swapchainFormat;
+	VkPresentModeKHR swapchainPresentMode;
 	VkExtent2D swapchainExtent;
 	idList<VkImage> swapchainImages;
 	idList<VkImageLayout> swapchainLayouts;
@@ -886,6 +897,7 @@ idSoftwareVulkanBridge::idSoftwareVulkanBridge() {
 
 	swapchain = VK_NULL_HANDLE;
 	swapchainFormat = VK_FORMAT_UNDEFINED;
+	swapchainPresentMode = VK_PRESENT_MODE_FIFO_KHR;
 	swapchainExtent.width = 0;
 	swapchainExtent.height = 0;
 
@@ -990,9 +1002,10 @@ bool idSoftwareVulkanBridge::EnsureInitialized() {
 	}
 
 	initialized = true;
-	common->Printf( "software vulkan: presentation enabled (%dx%d)%s\n",
+	common->Printf( "software vulkan: presentation enabled (%dx%d, %s present)%s\n",
 		static_cast<int>( swapchainExtent.width ),
 		static_cast<int>( swapchainExtent.height ),
+		SWVkPresentModeName( swapchainPresentMode ),
 		rayQuerySupported ? ", ray query shadows supported" : "" );
 	return true;
 }
@@ -1292,10 +1305,33 @@ VkSurfaceFormatKHR idSoftwareVulkanBridge::ChooseSurfaceFormat( const idList<VkS
 }
 
 VkPresentModeKHR idSoftwareVulkanBridge::ChoosePresentMode( const idList<VkPresentModeKHR> &modes ) const {
+	bool hasImmediate = false;
+	bool hasMailbox = false;
 	for ( int i = 0; i < modes.Num(); i++ ) {
-		if ( modes[i] == VK_PRESENT_MODE_MAILBOX_KHR ) {
-			return modes[i];
-		}
+		hasImmediate = hasImmediate || modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR;
+		hasMailbox = hasMailbox || modes[i] == VK_PRESENT_MODE_MAILBOX_KHR;
+	}
+
+	switch ( idMath::ClampInt( 0, 2, r_softwareVulkanPresentMode.GetInteger() ) ) {
+		case 0:
+			if ( hasImmediate ) {
+				return VK_PRESENT_MODE_IMMEDIATE_KHR;
+			}
+			if ( hasMailbox ) {
+				return VK_PRESENT_MODE_MAILBOX_KHR;
+			}
+			break;
+		case 1:
+			if ( hasMailbox ) {
+				return VK_PRESENT_MODE_MAILBOX_KHR;
+			}
+			if ( hasImmediate ) {
+				return VK_PRESENT_MODE_IMMEDIATE_KHR;
+			}
+			break;
+		case 2:
+		default:
+			break;
 	}
 	return VK_PRESENT_MODE_FIFO_KHR;
 }
@@ -1390,6 +1426,7 @@ bool idSoftwareVulkanBridge::CreateSwapchain() {
 	}
 
 	swapchainFormat = surfaceFormat.format;
+	swapchainPresentMode = presentMode;
 	swapchainExtent = extent;
 	frameWidth = static_cast<int>( swapchainExtent.width );
 	frameHeight = static_cast<int>( swapchainExtent.height );
@@ -5331,6 +5368,7 @@ void idSoftwareVulkanBridge::DestroySwapchain() {
 	swapchainImages.Clear();
 	swapchainLayouts.Clear();
 	swapchainFormat = VK_FORMAT_UNDEFINED;
+	swapchainPresentMode = VK_PRESENT_MODE_FIFO_KHR;
 	swapchainExtent.width = 0;
 	swapchainExtent.height = 0;
 }

@@ -886,6 +886,7 @@ extern idCVar r_softwareTextureMode;		// 0 = material textures, 1 = UV gradient,
 extern idCVar r_softwareRenderScale;		// scales the 3D software render buffer before presentation
 extern idCVar r_softwareDepthSIMD;		// 1 = use AVX2 packet depth rasterization when available
 extern idCVar r_softwareVulkanPresent;	// 1 = present the software frame through Vulkan
+extern idCVar r_softwareVulkanPresentMode;	// 0 = immediate, 1 = mailbox, 2 = fifo
 extern idCVar r_softwareRayQueryShadows;	// 1 = use Vulkan ray queries for software shadow visibility when available
 extern idCVar r_softwareRayQueryShadowSamples;	// soft-shadow ray-query tap count
 extern idCVar r_softwareRayQueryShadowRadius;	// soft-shadow ray-query radius in world units

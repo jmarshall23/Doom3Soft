@@ -154,6 +154,7 @@ idCVar r_softwareTextureMode( "r_softwareTextureMode", "0", CVAR_RENDERER | CVAR
 idCVar r_softwareRenderScale( "r_softwareRenderScale", "0.35", CVAR_RENDERER | CVAR_FLOAT, "scale the 3D software render buffer before presentation", 0.0f, 1.0f );
 idCVar r_softwareDepthSIMD( "r_softwareDepthSIMD", "1", CVAR_RENDERER | CVAR_BOOL, "use AVX2 packet depth rasterization when available" );
 idCVar r_softwareVulkanPresent( "r_softwareVulkanPresent", "1", CVAR_RENDERER | CVAR_BOOL, "present software-rendered frames through a Vulkan swapchain" );
+idCVar r_softwareVulkanPresentMode( "r_softwareVulkanPresentMode", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "software Vulkan present mode: 0 immediate, 1 mailbox, 2 fifo", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
 idCVar r_softwareRayQueryShadows( "r_softwareRayQueryShadows", "1", CVAR_RENDERER | CVAR_BOOL, "enable Vulkan ray-query shadow backend when available" );
 idCVar r_softwareRayQueryShadowSamples( "r_softwareRayQueryShadowSamples", "5", CVAR_RENDERER | CVAR_INTEGER, "number of soft-shadow ray-query taps for software shadows", 1, 9, idCmdSystem::ArgCompletion_Integer<1,9> );
 idCVar r_softwareRayQueryShadowRadius( "r_softwareRayQueryShadowRadius", "8", CVAR_RENDERER | CVAR_FLOAT, "world-space radius for software ray-query soft shadows", 0.0f, 64.0f );

@@ -78,6 +78,7 @@ idCVar com_showAsyncStats( "com_showAsyncStats", "0", CVAR_BOOL|CVAR_SYSTEM|CVAR
 idCVar com_showSoundDecoders( "com_showSoundDecoders", "0", CVAR_BOOL|CVAR_SYSTEM|CVAR_NOCHEAT, "show sound decoders" );
 idCVar com_timestampPrints( "com_timestampPrints", "0", CVAR_SYSTEM, "print time with each console print, 1 = msec, 2 = sec", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
 idCVar com_timescale( "timescale", "1", CVAR_SYSTEM | CVAR_FLOAT, "scales the time", 0.1f, 10.0f );
+idCVar com_unlockRenderer( "com_unlockRenderer", "1", CVAR_SYSTEM | CVAR_BOOL | CVAR_ARCHIVE, "render frames without waiting for a fixed game tic" );
 idCVar com_logFile( "logFile", "0", CVAR_SYSTEM | CVAR_NOCHEAT, "1 = buffer log, 2 = flush after each print", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
 idCVar com_logFileName( "logFileName", "qconsole.log", CVAR_SYSTEM | CVAR_NOCHEAT, "name of log file, if empty, qconsole.log will be used" );
 idCVar com_makingBuild( "com_makingBuild", "0", CVAR_BOOL | CVAR_SYSTEM, "1 when making a build" );
@@ -2495,6 +2496,7 @@ void idCommonLocal::Frame(void) {
 
 			// How many game frames to run
 			int numGameFrames = 0;
+			const bool unlockRenderer = com_unlockRenderer.GetBool() && !com_skipRenderer.GetBool() && idAsyncNetwork::serverDedicated.GetInteger() != 1;
 
 			for (;;) {
 				const int thisFrameTime = Sys_Milliseconds();
@@ -2547,8 +2549,8 @@ void idCommonLocal::Frame(void) {
 
 				sessLocal.latchedTicNumber = com_ticNumber;
 
-				if (numGameFrames > 0) {
-					// ready to actually run them
+				if (unlockRenderer || numGameFrames > 0) {
+					// ready to render, with zero or more fixed game tics queued
 					break;
 				}
 
