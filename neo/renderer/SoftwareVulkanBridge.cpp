@@ -3299,13 +3299,23 @@ bool idSoftwareVulkanBridge::RecordHybridCompositeCommands( bool outputForComput
 	const int dispatchY0 = Max( 0, hybridViewportY );
 	const int dispatchX1 = Max( dispatchX0, Min( frameWidth, hybridViewportX + hybridPresentWidth ) );
 	const int dispatchY1 = Max( dispatchY0, Min( frameHeight, hybridViewportY + hybridPresentHeight ) );
-	const uint32_t dispatchWidth = hybridOverlayOnly ? 0u : static_cast<uint32_t>( dispatchX1 - dispatchX0 );
-	const uint32_t dispatchHeight = hybridOverlayOnly ? 0u : static_cast<uint32_t>( dispatchY1 - dispatchY0 );
+	const int viewDispatchX0 = Max( 0, dispatchX0 - hybridViewportX );
+	const int viewDispatchY0 = Max( 0, dispatchY0 - hybridViewportY );
+	const int viewDispatchX1 = Max( viewDispatchX0, Min( hybridPresentWidth, dispatchX1 - hybridViewportX ) );
+	const int viewDispatchY1 = Max( viewDispatchY0, Min( hybridPresentHeight, dispatchY1 - hybridViewportY ) );
+	const int sourceDispatchX0 = hybridOverlayOnly ? 0 : Min( hybridWidth, ( viewDispatchX0 * hybridWidth ) / hybridPresentWidth );
+	const int sourceDispatchY0 = hybridOverlayOnly ? 0 : Min( hybridHeight, ( viewDispatchY0 * hybridHeight ) / hybridPresentHeight );
+	const int sourceDispatchX1 = hybridOverlayOnly ? 0 : Min( hybridWidth, ( viewDispatchX1 * hybridWidth + hybridPresentWidth - 1 ) / hybridPresentWidth );
+	const int sourceDispatchY1 = hybridOverlayOnly ? 0 : Min( hybridHeight, ( viewDispatchY1 * hybridHeight + hybridPresentHeight - 1 ) / hybridPresentHeight );
+	const uint32_t outputDispatchWidth = static_cast<uint32_t>( dispatchX1 - dispatchX0 );
+	const uint32_t outputDispatchHeight = static_cast<uint32_t>( dispatchY1 - dispatchY0 );
+	const uint32_t dispatchWidth = static_cast<uint32_t>( Max( 0, sourceDispatchX1 - sourceDispatchX0 ) );
+	const uint32_t dispatchHeight = static_cast<uint32_t>( Max( 0, sourceDispatchY1 - sourceDispatchY0 ) );
 	const bool dispatchComposite = dispatchWidth != 0u && dispatchHeight != 0u;
 	const bool fullFrameComposite = dispatchComposite &&
 		dispatchX0 == 0 && dispatchY0 == 0 &&
-		dispatchWidth == static_cast<uint32_t>( frameWidth ) &&
-		dispatchHeight == static_cast<uint32_t>( frameHeight );
+		outputDispatchWidth == static_cast<uint32_t>( frameWidth ) &&
+		outputDispatchHeight == static_cast<uint32_t>( frameHeight );
 
 	if ( !fullFrameComposite ) {
 		const VkDeviceSize frameSize = static_cast<VkDeviceSize>( frameWidth ) * static_cast<VkDeviceSize>( frameHeight ) * sizeof( uint32_t );
@@ -3339,8 +3349,8 @@ bool idSoftwareVulkanBridge::RecordHybridCompositeCommands( bool outputForComput
 	push.viewport[1] = hybridViewportY;
 	push.viewport[2] = hybridPresentWidth;
 	push.viewport[3] = hybridPresentHeight;
-	push.dispatch[0] = dispatchX0;
-	push.dispatch[1] = dispatchY0;
+	push.dispatch[0] = sourceDispatchX0;
+	push.dispatch[1] = sourceDispatchY0;
 	push.dispatch[2] = static_cast<int32_t>( dispatchWidth );
 	push.dispatch[3] = static_cast<int32_t>( dispatchHeight );
 	push.debugView = static_cast<uint32_t>( hybridDebugView );

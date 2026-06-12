@@ -71,7 +71,7 @@ layout( set = 0, binding = 15, std430 ) readonly buffer BitangentBuffer {
 layout( push_constant ) uniform PushConstants {
 	uvec4 dims;      // gbufferWidth, gbufferHeight, frameWidth, frameHeight
 	ivec4 viewport;  // x, y, presentWidth, presentHeight in Doom's bottom-left frame space
-	ivec4 dispatch;  // x, y, width, height in frame/logical space
+	ivec4 dispatch;  // x, y, width, height in source/G-buffer space
 	uint debugView;
 	uint textureCount;
 	uint overlayEnabled;
@@ -808,6 +808,10 @@ uint BlendOverlay( uint baseColor, uint overlayColor ) {
 	return PackColorVec( vec4( rgb, alpha ) );
 }
 
+uint CeilDiv( uint numerator, uint denominator ) {
+	return ( numerator + denominator - 1u ) / denominator;
+}
+
 void main() {
 	uint idX = gl_GlobalInvocationID.x;
 	uint idY = gl_GlobalInvocationID.y;
@@ -815,18 +819,34 @@ void main() {
 		return;
 	}
 
-	uint frameX = uint( pc.dispatch.x ) + idX;
-	uint logicalY = uint( pc.dispatch.y ) + idY;
-	uint uploadY = pc.dims.w - 1u - logicalY;
-	uint outIndex = uploadY * pc.dims.z + frameX;
+	uint srcX = uint( pc.dispatch.x ) + idX;
+	uint srcY = uint( pc.dispatch.y ) + idY;
+	if ( srcX >= pc.dims.x || srcY >= pc.dims.y ) {
+		return;
+	}
+
+	uint viewX0 = CeilDiv( srcX * uint( pc.viewport.z ), pc.dims.x );
+	uint viewY0 = CeilDiv( srcY * uint( pc.viewport.w ), pc.dims.y );
+	uint viewX1 = CeilDiv( ( srcX + 1u ) * uint( pc.viewport.z ), pc.dims.x );
+	uint viewY1 = CeilDiv( ( srcY + 1u ) * uint( pc.viewport.w ), pc.dims.y );
+	if ( viewX1 <= viewX0 || viewY1 <= viewY0 ) {
+		return;
+	}
+
+	int frameX0 = max( 0, pc.viewport.x + int( viewX0 ) );
+	int frameY0 = max( 0, pc.viewport.y + int( viewY0 ) );
+	int frameX1 = min( int( pc.dims.z ), pc.viewport.x + int( viewX1 ) );
+	int frameY1 = min( int( pc.dims.w ), pc.viewport.y + int( viewY1 ) );
+	if ( frameX1 <= frameX0 || frameY1 <= frameY0 ) {
+		return;
+	}
+
 	uint color = PackColor( 0u, 0u, 0u, 255u );
 
 	if ( pc.overlayOnly == 0u ) {
-		uint viewX = uint( int( frameX ) - pc.viewport.x );
-		uint viewY = uint( int( logicalY ) - pc.viewport.y );
-		uint srcX = min( pc.dims.x - 1u, ( viewX * pc.dims.x ) / uint( pc.viewport.z ) );
-		uint srcY = min( pc.dims.y - 1u, ( viewY * pc.dims.y ) / uint( pc.viewport.w ) );
 		uint srcIndex = srcY * pc.dims.x + srcX;
+		uint viewX = min( uint( pc.viewport.z ) - 1u, ( viewX0 + viewX1 - 1u ) >> 1u );
+		uint viewY = min( uint( pc.viewport.w ) - 1u, ( viewY0 + viewY1 - 1u ) >> 1u );
 
 		if ( depth[srcIndex] < 1.0 && surfaceId[srcIndex] != 0u ) {
 			if ( pc.debugView == 0u ) {
@@ -859,10 +879,16 @@ void main() {
 		}
 	}
 
-	if ( pc.overlayEnabled != 0u ) {
-		uint overlayIndex = logicalY * pc.dims.z + frameX;
-		color = BlendOverlay( color, overlayPixels[overlayIndex] );
+	for ( int y = frameY0; y < frameY1; y++ ) {
+		uint uploadY = pc.dims.w - 1u - uint( y );
+		uint rowOffset = uploadY * pc.dims.z;
+		uint overlayRowOffset = uint( y ) * pc.dims.z;
+		for ( int x = frameX0; x < frameX1; x++ ) {
+			uint outColor = color;
+			if ( pc.overlayEnabled != 0u ) {
+				outColor = BlendOverlay( outColor, overlayPixels[overlayRowOffset + uint( x )] );
+			}
+			framePixels[rowOffset + uint( x )] = outColor;
+		}
 	}
-
-	framePixels[outIndex] = color;
 }
