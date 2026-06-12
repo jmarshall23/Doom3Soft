@@ -66,6 +66,7 @@ struct swVkSurfaceBlas_t {
 		indexCount = 0;
 		primitiveCount = 0;
 		geometryGeneration = 0;
+		updatable = false;
 		blas = VK_NULL_HANDLE;
 		blasAddress = 0;
 	}
@@ -78,6 +79,7 @@ struct swVkSurfaceBlas_t {
 	int indexCount;
 	uint32_t primitiveCount;
 	unsigned int geometryGeneration;
+	bool updatable;
 	swVkBuffer_t vertexBuffer;
 	swVkBuffer_t indexBuffer;
 	swVkBuffer_t blasBuffer;
@@ -2182,6 +2184,7 @@ void idSoftwareVulkanBridge::DestroySurfaceBlas( swVkSurfaceBlas_t &entry ) {
 	entry.indexCount = 0;
 	entry.primitiveCount = 0;
 	entry.geometryGeneration = 0;
+	entry.updatable = false;
 	entry.blasAddress = 0;
 }
 
@@ -2222,26 +2225,51 @@ bool idSoftwareVulkanBridge::BuildSurfaceBlas( swVkSurfaceBlas_t &entry, srfTria
 
 	const VkDeviceSize vertexSize = static_cast<VkDeviceSize>( vertices.Num() ) * sizeof( vertices[0] );
 	const VkDeviceSize indexSize = static_cast<VkDeviceSize>( indexes.Num() ) * sizeof( indexes[0] );
-	if ( !CreateBuffer( vertexSize,
-			VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-			true,
-			entry.vertexBuffer ) ||
-		 !CreateBuffer( indexSize,
-			VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-			true,
-			entry.indexBuffer ) ) {
-		DestroySurfaceBlas( entry );
-		return false;
+	const uint32_t primitiveCount = indexes.Num() / 3;
+	const bool updateBlas = entry.updatable &&
+		entry.blas != VK_NULL_HANDLE &&
+		entry.blasBuffer.buffer != VK_NULL_HANDLE &&
+		entry.blasAddress != 0 &&
+		entry.vertCount == geo->numVerts &&
+		entry.indexCount == geo->numIndexes &&
+		entry.primitiveCount == primitiveCount &&
+		entry.vertexBuffer.buffer != VK_NULL_HANDLE &&
+		entry.vertexBuffer.size >= vertexSize &&
+		entry.indexBuffer.buffer != VK_NULL_HANDLE &&
+		entry.indexBuffer.size >= indexSize;
+
+	if ( entry.vertexBuffer.buffer == VK_NULL_HANDLE || entry.vertexBuffer.size < vertexSize ) {
+		if ( !CreateBuffer( vertexSize,
+				VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+				true,
+				entry.vertexBuffer ) ) {
+			if ( !updateBlas ) {
+				DestroySurfaceBlas( entry );
+			}
+			return false;
+		}
+	}
+	if ( entry.indexBuffer.buffer == VK_NULL_HANDLE || entry.indexBuffer.size < indexSize ) {
+		if ( !CreateBuffer( indexSize,
+				VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+				true,
+				entry.indexBuffer ) ) {
+			if ( !updateBlas ) {
+				DestroySurfaceBlas( entry );
+			}
+			return false;
+		}
 	}
 	if ( !UploadBuffer( entry.vertexBuffer, vertices.Ptr(), vertexSize, "vkMapMemory surface BLAS vertices failed" ) ||
 		 !UploadBuffer( entry.indexBuffer, indexes.Ptr(), indexSize, "vkMapMemory surface BLAS indexes failed" ) ) {
-		DestroySurfaceBlas( entry );
+		if ( !updateBlas ) {
+			DestroySurfaceBlas( entry );
+		}
 		return false;
 	}
 
-	const uint32_t primitiveCount = indexes.Num() / 3;
 	VkAccelerationStructureGeometryTrianglesDataKHR triangles;
 	memset( &triangles, 0, sizeof( triangles ) );
 	triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
@@ -2263,8 +2291,9 @@ bool idSoftwareVulkanBridge::BuildSurfaceBlas( swVkSurfaceBlas_t &entry, srfTria
 	memset( &buildInfo, 0, sizeof( buildInfo ) );
 	buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
 	buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-	buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
-	buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+	buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+	buildInfo.mode = updateBlas ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+	buildInfo.srcAccelerationStructure = updateBlas ? entry.blas : VK_NULL_HANDLE;
 	buildInfo.geometryCount = 1;
 	buildInfo.pGeometries = &blasGeometry;
 
@@ -2273,34 +2302,48 @@ bool idSoftwareVulkanBridge::BuildSurfaceBlas( swVkSurfaceBlas_t &entry, srfTria
 	sizeInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
 	vkGetAccelerationStructureBuildSizesKHRLocal( device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &buildInfo, &primitiveCount, &sizeInfo );
 
-	if ( !CreateBuffer( sizeInfo.accelerationStructureSize,
-			VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,
-			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-			true,
-			entry.blasBuffer ) ) {
-		DestroySurfaceBlas( entry );
-		return false;
-	}
+	if ( !updateBlas ) {
+		if ( entry.blas != VK_NULL_HANDLE ) {
+			vkDestroyAccelerationStructureKHRLocal( device, entry.blas, NULL );
+			entry.blas = VK_NULL_HANDLE;
+		}
+		DestroyBuffer( entry.blasBuffer );
+		entry.blasAddress = 0;
+		entry.updatable = false;
 
-	VkAccelerationStructureCreateInfoKHR createInfo;
-	memset( &createInfo, 0, sizeof( createInfo ) );
-	createInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
-	createInfo.buffer = entry.blasBuffer.buffer;
-	createInfo.size = sizeInfo.accelerationStructureSize;
-	createInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-	if ( vkCreateAccelerationStructureKHRLocal( device, &createInfo, NULL, &entry.blas ) != VK_SUCCESS ) {
-		LogFailure( "vkCreateAccelerationStructureKHR surface BLAS failed" );
-		DestroySurfaceBlas( entry );
-		return false;
+		if ( !CreateBuffer( sizeInfo.accelerationStructureSize,
+				VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,
+				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+				true,
+				entry.blasBuffer ) ) {
+			DestroySurfaceBlas( entry );
+			return false;
+		}
+
+		VkAccelerationStructureCreateInfoKHR createInfo;
+		memset( &createInfo, 0, sizeof( createInfo ) );
+		createInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+		createInfo.buffer = entry.blasBuffer.buffer;
+		createInfo.size = sizeInfo.accelerationStructureSize;
+		createInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+		if ( vkCreateAccelerationStructureKHRLocal( device, &createInfo, NULL, &entry.blas ) != VK_SUCCESS ) {
+			LogFailure( "vkCreateAccelerationStructureKHR surface BLAS failed" );
+			DestroySurfaceBlas( entry );
+			return false;
+		}
 	}
 
 	swVkBuffer_t scratchBuffer;
-	if ( !CreateBuffer( sizeInfo.buildScratchSize,
+	const VkDeviceSize scratchSize = updateBlas && sizeInfo.updateScratchSize > 0 ? sizeInfo.updateScratchSize : sizeInfo.buildScratchSize;
+	if ( scratchSize == 0 ||
+		 !CreateBuffer( scratchSize,
 			VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
 			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 			true,
 			scratchBuffer ) ) {
-		DestroySurfaceBlas( entry );
+		if ( !updateBlas ) {
+			DestroySurfaceBlas( entry );
+		}
 		return false;
 	}
 
@@ -2318,7 +2361,9 @@ bool idSoftwareVulkanBridge::BuildSurfaceBlas( swVkSurfaceBlas_t &entry, srfTria
 	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	if ( !ImmediateSubmit( beginInfo ) ) {
 		DestroyBuffer( scratchBuffer );
-		DestroySurfaceBlas( entry );
+		if ( !updateBlas ) {
+			DestroySurfaceBlas( entry );
+		}
 		return false;
 	}
 
@@ -2327,7 +2372,9 @@ bool idSoftwareVulkanBridge::BuildSurfaceBlas( swVkSurfaceBlas_t &entry, srfTria
 	if ( vkEndCommandBuffer( commandBuffer ) != VK_SUCCESS ) {
 		LogFailure( "vkEndCommandBuffer surface BLAS failed" );
 		DestroyBuffer( scratchBuffer );
-		DestroySurfaceBlas( entry );
+		if ( !updateBlas ) {
+			DestroySurfaceBlas( entry );
+		}
 		return false;
 	}
 
@@ -2339,7 +2386,9 @@ bool idSoftwareVulkanBridge::BuildSurfaceBlas( swVkSurfaceBlas_t &entry, srfTria
 	if ( vkQueueSubmit( queue, 1, &submitInfo, inFlightFence ) != VK_SUCCESS ) {
 		LogFailure( "vkQueueSubmit surface BLAS failed" );
 		DestroyBuffer( scratchBuffer );
-		DestroySurfaceBlas( entry );
+		if ( !updateBlas ) {
+			DestroySurfaceBlas( entry );
+		}
 		return false;
 	}
 	vkWaitForFences( device, 1, &inFlightFence, VK_TRUE, UINT64_MAX );
@@ -2358,6 +2407,7 @@ bool idSoftwareVulkanBridge::BuildSurfaceBlas( swVkSurfaceBlas_t &entry, srfTria
 	entry.indexCount = geo->numIndexes;
 	entry.primitiveCount = primitiveCount;
 	entry.geometryGeneration = geo->rayQueryGeometryGeneration;
+	entry.updatable = true;
 	if ( entry.blasAddress == 0 ) {
 		DestroySurfaceBlas( entry );
 		return false;
@@ -3613,18 +3663,18 @@ bool idSoftwareVulkanBridge::PrepareRayQueryScene( const viewDef_t *viewDef ) {
 			cachedBlas->blas == VK_NULL_HANDLE ||
 			cachedBlas->blasAddress == 0;
 		if ( needsBlasBuild ) {
-			swVkSurfaceBlas_t rebuilt;
-			if ( !BuildSurfaceBlas( rebuilt, geo ) ) {
-				continue;
-			}
 			if ( cachedBlas ) {
 				WaitForSubmittedWork();
 				DestroyRayQueryTlas();
-				DestroySurfaceBlas( *cachedBlas );
-				*cachedBlas = rebuilt;
+				if ( !BuildSurfaceBlas( *cachedBlas, geo ) ) {
+					continue;
+				}
 			} else {
 				cachedBlas = new swVkSurfaceBlas_t;
-				*cachedBlas = rebuilt;
+				if ( !BuildSurfaceBlas( *cachedBlas, geo ) ) {
+					delete cachedBlas;
+					continue;
+				}
 				rayAttachedBlas.Append( cachedBlas );
 			}
 			geo->rayQueryBlas = cachedBlas;
