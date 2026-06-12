@@ -3521,7 +3521,13 @@ bool idSoftwareVulkanBridge::PrepareRayQueryScene( const viewDef_t *viewDef ) {
 		if ( !surf || !surf->geo || !surf->space || !surf->material ) {
 			continue;
 		}
-		if ( !surf->material->IsDrawn() || !surf->material->SurfaceCastsShadow() || surf->material->Coverage() != MC_OPAQUE ) {
+		const bool dynamicEntity = surf->space->entityDef && surf->space->entityDef->parms.hModel &&
+			surf->space->entityDef->parms.hModel->IsDynamicModel() != DM_STATIC;
+		const materialCoverage_t coverage = surf->material->Coverage();
+		if ( !surf->material->IsDrawn() || !surf->material->SurfaceCastsShadow() || coverage == MC_TRANSLUCENT ) {
+			continue;
+		}
+		if ( coverage == MC_PERFORATED && !dynamicEntity ) {
 			continue;
 		}
 		const float sort = surf->material->GetSort();
@@ -3538,9 +3544,7 @@ bool idSoftwareVulkanBridge::PrepareRayQueryScene( const viewDef_t *viewDef ) {
 		}
 
 		int sourceFrame = 0;
-		if ( geo->deformedSurface ||
-			 ( surf->space->entityDef && surf->space->entityDef->parms.hModel &&
-			   surf->space->entityDef->parms.hModel->IsDynamicModel() != DM_STATIC ) ) {
+		if ( geo->deformedSurface || dynamicEntity ) {
 			sourceFrame = rayQuerySceneFrame;
 		} else if ( surf->space->entityDef && ( surf->space->entityDef->dynamicModel || surf->space->entityDef->cachedDynamicModel ) ) {
 			sourceFrame = surf->space->entityDef->dynamicModelFrameCount;
