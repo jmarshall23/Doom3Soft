@@ -22,6 +22,7 @@ This file is part of the idTech 4 software renderer source code
 #include "Software2DComposite_spv.h"
 #include "SoftwareHybridComposite_spv.h"
 #include "SoftwareOverlayRaster_spv.h"
+#include "SoftwareOverlayTileComposite_spv.h"
 #include "SoftwareRayQueryShadow_spv.h"
 
 /*
@@ -313,6 +314,21 @@ struct swVkOverlayPushConstants_t {
 	uint32_t pad[2];
 };
 
+struct swVkOverlayTilePushConstants_t {
+	uint32_t frame[4];		// width, height, unused, unused
+	int32_t dispatch[4];	// x, y, width, height in Doom's bottom-left frame space
+	uint32_t tileGrid[4];	// tile width, tile height, tiles x, tiles y
+	uint32_t textureCount;
+	uint32_t targetFrame;
+	uint32_t pad[2];
+};
+
+struct swVkOverlayTile_t {
+	uint32_t offset;
+	uint32_t count;
+	uint32_t pad[2];
+};
+
 struct swVk2DJob_t {
 	swVk2DJob_t() {
 		sourceOffset = 0;
@@ -338,6 +354,9 @@ static const uint32_t SW_VK_LINEAR_GROUP_SIZE_X = 32;
 static const uint32_t SW_VK_LINEAR_GROUP_SIZE_Y = 4;
 static const uint32_t SW_VK_OVERLAY_GROUP_SIZE_X = 16;
 static const uint32_t SW_VK_OVERLAY_GROUP_SIZE_Y = 8;
+static const uint32_t SW_VK_OVERLAY_TILE_WIDTH = 32;
+static const uint32_t SW_VK_OVERLAY_TILE_HEIGHT = 16;
+static const int SW_VK_OVERLAY_TILE_MAX_REFS = 8 * 1024 * 1024;
 static const uint32_t SW_VK_SHADOW_GROUP_SIZE_X = 128;
 static const VkDeviceSize SW_VK_MIN_TEXTURE_INFO_BYTES = 4096 * sizeof( swHybridTextureInfo_t );
 static const VkDeviceSize SW_VK_MIN_TEXTURE_TEXEL_BYTES = 32 * 1024 * 1024 * sizeof( uint32_t );
@@ -360,6 +379,24 @@ static void SWVkComputeMemoryBarrier( VkCommandBuffer commandBuffer, VkAccessFla
 
 static bool SWVkRectsOverlap( int ax0, int ay0, int ax1, int ay1, int bx0, int by0, int bx1, int by1 ) {
 	return ax0 < bx1 && bx0 < ax1 && ay0 < by1 && by0 < ay1;
+}
+
+static bool SWVkOverlayTriFrameBounds( const swHybridOverlayTri_t &tri, int frameWidth, int frameHeight, int &x0, int &y0, int &x1, int &y1 ) {
+	const int sourceWidth = Max( 1, tri.source[0] );
+	const int sourceHeight = Max( 1, tri.source[1] );
+	const int viewportX = tri.viewport[0];
+	const int viewportY = tri.viewport[1];
+	const int presentW = Max( 1, tri.viewport[2] );
+	const int presentH = Max( 1, tri.viewport[3] );
+	const int minFrameX = viewportX + ( tri.bounds[0] * presentW ) / sourceWidth;
+	const int minFrameY = viewportY + ( tri.bounds[1] * presentH ) / sourceHeight;
+	const int maxFrameX = viewportX + ( ( tri.bounds[2] + 1 ) * presentW + sourceWidth - 1 ) / sourceWidth;
+	const int maxFrameY = viewportY + ( ( tri.bounds[3] + 1 ) * presentH + sourceHeight - 1 ) / sourceHeight;
+	x0 = Max( 0, Min( frameWidth - 1, minFrameX ) );
+	y0 = Max( 0, Min( frameHeight - 1, minFrameY ) );
+	x1 = Max( 0, Min( frameWidth, maxFrameX ) );
+	y1 = Max( 0, Min( frameHeight, maxFrameY ) );
+	return x1 > x0 && y1 > y0;
 }
 
 static VkDeviceSize SWVkGrowBufferSize( VkDeviceSize required, VkDeviceSize minimum ) {
@@ -439,11 +476,13 @@ private:
 	bool CreateTimestampQueries();
 	bool Create2DPipeline();
 	bool CreateOverlayPipeline();
+	bool CreateOverlayTilePipeline();
 	bool CreateHybridPipeline();
 	bool CreateShadowPipeline();
 	bool EnsureUploadBuffer( int requiredWidth, int requiredHeight );
 	bool Ensure2DBuffers( int sourcePixelCount );
 	bool EnsureOverlayBuffers( int triCount );
+	bool EnsureOverlayTileBuffers( int tileCount, int tileIndexCount );
 	bool EnsureHybridBuffers( int requiredWidth, int requiredHeight, int textureInfoCount, int textureTexelCount, int lightCount, int lightTileCount, int lightIndexCount );
 	bool EnsureHybridTextureBuffers( int textureInfoCount, int textureTexelCount, bool &texelBufferPreserved );
 	bool EnsureShadowBuffers( int width, int height );
@@ -465,6 +504,7 @@ private:
 	void DestroyRayQueryScene();
 	void Destroy2DPipeline();
 	void DestroyOverlayPipeline();
+	void DestroyOverlayTilePipeline();
 	void DestroyShadowPipeline();
 	void DestroyHybridPipeline();
 	void DestroyHybridBuffers();
@@ -480,8 +520,11 @@ private:
 	bool Queue2DOverlayBlit( const viewDef_t *viewDef, const unsigned int *bgra, int width, int height, int presentWidth, int presentHeight );
 	void Update2DDescriptorSet( bool targetFrame );
 	void UpdateOverlayDescriptorSet( bool targetFrame );
+	void UpdateOverlayTileDescriptorSet( bool targetFrame );
 	bool ResolveHybridFrameToCpu();
 	bool Record2DCompositeCommands( bool targetFrame );
+	bool BuildOverlayTileBins( bool targetFrame, int &dispatchX0, int &dispatchY0, int &dispatchX1, int &dispatchY1 );
+	bool RecordOverlayTileCompositeCommands( bool targetFrame );
 	bool RecordOverlayRasterCommands( bool targetFrame );
 	void DestroySwapchain();
 	void DestroyUploadBuffer();
@@ -538,6 +581,8 @@ private:
 	idList<unsigned int> hybrid2DSourcePixels;
 	idList<swVk2DJob_t> hybrid2DJobs;
 	idList<swHybridOverlayTri_t> hybridOverlayTris;
+	idList<swVkOverlayTile_t> hybridOverlayTiles;
+	idList<uint32_t> hybridOverlayTileIndices;
 	int hybridOverlaySourceWidth;
 	int hybridOverlaySourceHeight;
 	int hybridOverlayPresentWidth;
@@ -581,6 +626,8 @@ private:
 	swVkBuffer_t hybridOverlayBuffer;
 	swVkBuffer_t hybrid2DSourceBuffer;
 	swVkBuffer_t hybridOverlayTriBuffer;
+	swVkBuffer_t hybridOverlayTileBuffer;
+	swVkBuffer_t hybridOverlayTileIndexBuffer;
 	swVkBuffer_t hybridTextureInfoBuffer;
 	swVkBuffer_t hybridTextureTexelBuffer;
 	swVkBuffer_t hybridWorldPositionBuffer;
@@ -617,6 +664,13 @@ private:
 	VkPipelineLayout overlayPipelineLayout;
 	VkPipeline overlayPipeline;
 	VkShaderModule overlayShaderModule;
+
+	VkDescriptorSetLayout overlayTileDescriptorSetLayout;
+	VkDescriptorPool overlayTileDescriptorPool;
+	VkDescriptorSet overlayTileDescriptorSet;
+	VkPipelineLayout overlayTilePipelineLayout;
+	VkPipeline overlayTilePipeline;
+	VkShaderModule overlayTileShaderModule;
 
 	VkAccelerationStructureKHR tlas;
 	bool rayQuerySceneReady;
@@ -725,6 +779,13 @@ idSoftwareVulkanBridge::idSoftwareVulkanBridge() {
 	overlayPipeline = VK_NULL_HANDLE;
 	overlayShaderModule = VK_NULL_HANDLE;
 
+	overlayTileDescriptorSetLayout = VK_NULL_HANDLE;
+	overlayTileDescriptorPool = VK_NULL_HANDLE;
+	overlayTileDescriptorSet = VK_NULL_HANDLE;
+	overlayTilePipelineLayout = VK_NULL_HANDLE;
+	overlayTilePipeline = VK_NULL_HANDLE;
+	overlayTileShaderModule = VK_NULL_HANDLE;
+
 	tlas = VK_NULL_HANDLE;
 	rayQuerySceneReady = false;
 	rayQuerySceneFrame = 0;
@@ -778,6 +839,10 @@ bool idSoftwareVulkanBridge::EnsureInitialized() {
 		Shutdown();
 		failed = true;
 		return false;
+	}
+	if ( !CreateOverlayTilePipeline() ) {
+		common->Warning( "software vulkan: overlay tile compositor unavailable, using per-triangle overlay path" );
+		DestroyOverlayTilePipeline();
 	}
 
 	initialized = true;
@@ -1566,6 +1631,94 @@ bool idSoftwareVulkanBridge::CreateOverlayPipeline() {
 	return true;
 }
 
+bool idSoftwareVulkanBridge::CreateOverlayTilePipeline() {
+	VkDescriptorSetLayoutBinding bindings[8];
+	memset( bindings, 0, sizeof( bindings ) );
+	for ( uint32_t i = 0; i < 8; i++ ) {
+		bindings[i].binding = i;
+		bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		bindings[i].descriptorCount = 1;
+		bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	}
+
+	VkDescriptorSetLayoutCreateInfo layoutInfo;
+	memset( &layoutInfo, 0, sizeof( layoutInfo ) );
+	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	layoutInfo.bindingCount = 8;
+	layoutInfo.pBindings = bindings;
+	if ( vkCreateDescriptorSetLayout( device, &layoutInfo, NULL, &overlayTileDescriptorSetLayout ) != VK_SUCCESS ) {
+		return false;
+	}
+
+	VkPushConstantRange pushRange;
+	memset( &pushRange, 0, sizeof( pushRange ) );
+	pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	pushRange.offset = 0;
+	pushRange.size = sizeof( swVkOverlayTilePushConstants_t );
+
+	VkPipelineLayoutCreateInfo pipelineLayoutInfo;
+	memset( &pipelineLayoutInfo, 0, sizeof( pipelineLayoutInfo ) );
+	pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	pipelineLayoutInfo.setLayoutCount = 1;
+	pipelineLayoutInfo.pSetLayouts = &overlayTileDescriptorSetLayout;
+	pipelineLayoutInfo.pushConstantRangeCount = 1;
+	pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+	if ( vkCreatePipelineLayout( device, &pipelineLayoutInfo, NULL, &overlayTilePipelineLayout ) != VK_SUCCESS ) {
+		return false;
+	}
+
+	VkShaderModuleCreateInfo shaderInfo;
+	memset( &shaderInfo, 0, sizeof( shaderInfo ) );
+	shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+	shaderInfo.codeSize = sizeof( swOverlayTileCompositeCompSpv );
+	shaderInfo.pCode = swOverlayTileCompositeCompSpv;
+	if ( vkCreateShaderModule( device, &shaderInfo, NULL, &overlayTileShaderModule ) != VK_SUCCESS ) {
+		return false;
+	}
+
+	VkPipelineShaderStageCreateInfo stageInfo;
+	memset( &stageInfo, 0, sizeof( stageInfo ) );
+	stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+	stageInfo.module = overlayTileShaderModule;
+	stageInfo.pName = "main";
+
+	VkComputePipelineCreateInfo pipelineInfo;
+	memset( &pipelineInfo, 0, sizeof( pipelineInfo ) );
+	pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+	pipelineInfo.stage = stageInfo;
+	pipelineInfo.layout = overlayTilePipelineLayout;
+	if ( vkCreateComputePipelines( device, VK_NULL_HANDLE, 1, &pipelineInfo, NULL, &overlayTilePipeline ) != VK_SUCCESS ) {
+		return false;
+	}
+
+	VkDescriptorPoolSize poolSize;
+	memset( &poolSize, 0, sizeof( poolSize ) );
+	poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	poolSize.descriptorCount = 8;
+
+	VkDescriptorPoolCreateInfo poolInfo;
+	memset( &poolInfo, 0, sizeof( poolInfo ) );
+	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	poolInfo.maxSets = 1;
+	poolInfo.poolSizeCount = 1;
+	poolInfo.pPoolSizes = &poolSize;
+	if ( vkCreateDescriptorPool( device, &poolInfo, NULL, &overlayTileDescriptorPool ) != VK_SUCCESS ) {
+		return false;
+	}
+
+	VkDescriptorSetAllocateInfo setInfo;
+	memset( &setInfo, 0, sizeof( setInfo ) );
+	setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	setInfo.descriptorPool = overlayTileDescriptorPool;
+	setInfo.descriptorSetCount = 1;
+	setInfo.pSetLayouts = &overlayTileDescriptorSetLayout;
+	if ( vkAllocateDescriptorSets( device, &setInfo, &overlayTileDescriptorSet ) != VK_SUCCESS ) {
+		return false;
+	}
+	return true;
+}
+
 bool idSoftwareVulkanBridge::CreateHybridPipeline() {
 	VkDescriptorSetLayoutBinding bindings[18];
 	memset( bindings, 0, sizeof( bindings ) );
@@ -1889,6 +2042,25 @@ bool idSoftwareVulkanBridge::EnsureOverlayBuffers( int triCount ) {
 	return true;
 }
 
+bool idSoftwareVulkanBridge::EnsureOverlayTileBuffers( int tileCount, int tileIndexCount ) {
+	tileCount = Max( 1, tileCount );
+	tileIndexCount = Max( 1, tileIndexCount );
+	const VkDeviceSize tileSize = static_cast<VkDeviceSize>( tileCount ) * sizeof( swVkOverlayTile_t );
+	const VkDeviceSize tileIndexSize = static_cast<VkDeviceSize>( tileIndexCount ) * sizeof( uint32_t );
+	const VkMemoryPropertyFlags hostMemory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	if ( hybridOverlayTileBuffer.buffer == VK_NULL_HANDLE || hybridOverlayTileBuffer.size < tileSize ) {
+		if ( !CreateBuffer( tileSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridOverlayTileBuffer ) ) {
+			return false;
+		}
+	}
+	if ( hybridOverlayTileIndexBuffer.buffer == VK_NULL_HANDLE || hybridOverlayTileIndexBuffer.size < tileIndexSize ) {
+		if ( !CreateBuffer( tileIndexSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridOverlayTileIndexBuffer ) ) {
+			return false;
+		}
+	}
+	return true;
+}
+
 bool idSoftwareVulkanBridge::EnsureHybridTextureBuffers( int textureInfoCount, int textureTexelCount, bool &texelBufferPreserved ) {
 	textureInfoCount = Max( 1, textureInfoCount );
 	textureTexelCount = Max( 1, textureTexelCount );
@@ -2081,6 +2253,52 @@ void idSoftwareVulkanBridge::UpdateOverlayDescriptorSet( bool targetFrame ) {
 		writes[i].pBufferInfo = &infos[i];
 	}
 	vkUpdateDescriptorSets( device, 6, writes, 0, NULL );
+}
+
+void idSoftwareVulkanBridge::UpdateOverlayTileDescriptorSet( bool targetFrame ) {
+	swVkBuffer_t &targetBuffer = targetFrame ? hybridFrameBuffer : hybridOverlayBuffer;
+	if ( overlayTileDescriptorSet == VK_NULL_HANDLE ||
+		 hybridOverlayTriBuffer.buffer == VK_NULL_HANDLE ||
+		 hybridDepthBuffer.buffer == VK_NULL_HANDLE ||
+		 targetBuffer.buffer == VK_NULL_HANDLE ||
+		 hybridTextureInfoBuffer.buffer == VK_NULL_HANDLE ||
+		 hybridTextureTexelBuffer.buffer == VK_NULL_HANDLE ||
+		 hybrid2DSourceBuffer.buffer == VK_NULL_HANDLE ||
+		 hybridOverlayTileBuffer.buffer == VK_NULL_HANDLE ||
+		 hybridOverlayTileIndexBuffer.buffer == VK_NULL_HANDLE ) {
+		return;
+	}
+
+	VkDescriptorBufferInfo infos[8];
+	memset( infos, 0, sizeof( infos ) );
+	infos[0].buffer = hybridOverlayTriBuffer.buffer;
+	infos[0].range = hybridOverlayTriBuffer.size;
+	infos[1].buffer = hybridDepthBuffer.buffer;
+	infos[1].range = hybridDepthBuffer.size;
+	infos[2].buffer = targetBuffer.buffer;
+	infos[2].range = targetBuffer.size;
+	infos[3].buffer = hybridTextureInfoBuffer.buffer;
+	infos[3].range = hybridTextureInfoBuffer.size;
+	infos[4].buffer = hybridTextureTexelBuffer.buffer;
+	infos[4].range = hybridTextureTexelBuffer.size;
+	infos[5].buffer = hybrid2DSourceBuffer.buffer;
+	infos[5].range = hybrid2DSourceBuffer.size;
+	infos[6].buffer = hybridOverlayTileBuffer.buffer;
+	infos[6].range = hybridOverlayTileBuffer.size;
+	infos[7].buffer = hybridOverlayTileIndexBuffer.buffer;
+	infos[7].range = hybridOverlayTileIndexBuffer.size;
+
+	VkWriteDescriptorSet writes[8];
+	memset( writes, 0, sizeof( writes ) );
+	for ( uint32_t i = 0; i < 8; i++ ) {
+		writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[i].dstSet = overlayTileDescriptorSet;
+		writes[i].dstBinding = i;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		writes[i].pBufferInfo = &infos[i];
+	}
+	vkUpdateDescriptorSets( device, 8, writes, 0, NULL );
 }
 
 void idSoftwareVulkanBridge::UpdateHybridDescriptorSet() {
@@ -2932,6 +3150,8 @@ void idSoftwareVulkanBridge::Clear2DJobs() {
 	hybrid2DSourcePixels.SetNum( 0, false );
 	hybrid2DJobs.SetNum( 0, false );
 	hybridOverlayTris.SetNum( 0, false );
+	hybridOverlayTiles.SetNum( 0, false );
+	hybridOverlayTileIndices.SetNum( 0, false );
 	hybridOverlaySourceWidth = 0;
 	hybridOverlaySourceHeight = 0;
 	hybridOverlayPresentWidth = 0;
@@ -3436,6 +3656,176 @@ bool idSoftwareVulkanBridge::Record2DCompositeCommands( bool targetFrame ) {
 	return true;
 }
 
+bool idSoftwareVulkanBridge::BuildOverlayTileBins( bool targetFrame, int &dispatchX0, int &dispatchY0, int &dispatchX1, int &dispatchY1 ) {
+	dispatchX0 = targetFrame ? frameWidth : 0;
+	dispatchY0 = targetFrame ? frameHeight : 0;
+	dispatchX1 = targetFrame ? 0 : frameWidth;
+	dispatchY1 = targetFrame ? 0 : frameHeight;
+
+	if ( frameWidth <= 0 || frameHeight <= 0 ) {
+		return false;
+	}
+
+	const int tileCountX = static_cast<int>( SWVkDispatchGroups( static_cast<uint32_t>( frameWidth ), SW_VK_OVERLAY_TILE_WIDTH ) );
+	const int tileCountY = static_cast<int>( SWVkDispatchGroups( static_cast<uint32_t>( frameHeight ), SW_VK_OVERLAY_TILE_HEIGHT ) );
+	const int tileCount = tileCountX * tileCountY;
+	if ( tileCount <= 0 ) {
+		return false;
+	}
+
+	hybridOverlayTiles.SetNum( tileCount, false );
+	idList<uint32_t> tileCounts;
+	tileCounts.SetNum( tileCount, false );
+	memset( tileCounts.Ptr(), 0, tileCounts.Num() * sizeof( tileCounts[0] ) );
+
+	int totalRefs = 0;
+	bool anyVisible = false;
+	for ( int triIndex = 0; triIndex < hybridOverlayTris.Num(); triIndex++ ) {
+		const swHybridOverlayTri_t &tri = hybridOverlayTris[triIndex];
+		int x0, y0, x1, y1;
+		if ( !SWVkOverlayTriFrameBounds( tri, frameWidth, frameHeight, x0, y0, x1, y1 ) ) {
+			continue;
+		}
+
+		anyVisible = true;
+		if ( targetFrame ) {
+			dispatchX0 = Min( dispatchX0, x0 );
+			dispatchY0 = Min( dispatchY0, y0 );
+			dispatchX1 = Max( dispatchX1, x1 );
+			dispatchY1 = Max( dispatchY1, y1 );
+		}
+
+		const int tileX0 = Max( 0, Min( tileCountX - 1, x0 / static_cast<int>( SW_VK_OVERLAY_TILE_WIDTH ) ) );
+		const int tileY0 = Max( 0, Min( tileCountY - 1, y0 / static_cast<int>( SW_VK_OVERLAY_TILE_HEIGHT ) ) );
+		const int tileX1 = Max( tileX0 + 1, Min( tileCountX, ( x1 + static_cast<int>( SW_VK_OVERLAY_TILE_WIDTH ) - 1 ) / static_cast<int>( SW_VK_OVERLAY_TILE_WIDTH ) ) );
+		const int tileY1 = Max( tileY0 + 1, Min( tileCountY, ( y1 + static_cast<int>( SW_VK_OVERLAY_TILE_HEIGHT ) - 1 ) / static_cast<int>( SW_VK_OVERLAY_TILE_HEIGHT ) ) );
+		for ( int tileY = tileY0; tileY < tileY1; tileY++ ) {
+			for ( int tileX = tileX0; tileX < tileX1; tileX++ ) {
+				tileCounts[tileY * tileCountX + tileX]++;
+				totalRefs++;
+				if ( totalRefs > SW_VK_OVERLAY_TILE_MAX_REFS ) {
+					return false;
+				}
+			}
+		}
+	}
+
+	if ( targetFrame && !anyVisible ) {
+		hybridOverlayTiles.SetNum( 0, false );
+		hybridOverlayTileIndices.SetNum( 0, false );
+		dispatchX0 = dispatchY0 = dispatchX1 = dispatchY1 = 0;
+		return true;
+	}
+
+	uint32_t offset = 0;
+	for ( int tile = 0; tile < tileCount; tile++ ) {
+		hybridOverlayTiles[tile].offset = offset;
+		hybridOverlayTiles[tile].count = tileCounts[tile];
+		hybridOverlayTiles[tile].pad[0] = 0;
+		hybridOverlayTiles[tile].pad[1] = 0;
+		offset += tileCounts[tile];
+	}
+
+	hybridOverlayTileIndices.SetNum( Max( 1, totalRefs ), false );
+	if ( totalRefs <= 0 ) {
+		hybridOverlayTileIndices[0] = 0;
+		return true;
+	}
+
+	idList<uint32_t> tileCursors;
+	tileCursors.SetNum( tileCount, false );
+	for ( int tile = 0; tile < tileCount; tile++ ) {
+		tileCursors[tile] = hybridOverlayTiles[tile].offset;
+	}
+
+	for ( int triIndex = 0; triIndex < hybridOverlayTris.Num(); triIndex++ ) {
+		const swHybridOverlayTri_t &tri = hybridOverlayTris[triIndex];
+		int x0, y0, x1, y1;
+		if ( !SWVkOverlayTriFrameBounds( tri, frameWidth, frameHeight, x0, y0, x1, y1 ) ) {
+			continue;
+		}
+
+		const int tileX0 = Max( 0, Min( tileCountX - 1, x0 / static_cast<int>( SW_VK_OVERLAY_TILE_WIDTH ) ) );
+		const int tileY0 = Max( 0, Min( tileCountY - 1, y0 / static_cast<int>( SW_VK_OVERLAY_TILE_HEIGHT ) ) );
+		const int tileX1 = Max( tileX0 + 1, Min( tileCountX, ( x1 + static_cast<int>( SW_VK_OVERLAY_TILE_WIDTH ) - 1 ) / static_cast<int>( SW_VK_OVERLAY_TILE_WIDTH ) ) );
+		const int tileY1 = Max( tileY0 + 1, Min( tileCountY, ( y1 + static_cast<int>( SW_VK_OVERLAY_TILE_HEIGHT ) - 1 ) / static_cast<int>( SW_VK_OVERLAY_TILE_HEIGHT ) ) );
+		for ( int tileY = tileY0; tileY < tileY1; tileY++ ) {
+			for ( int tileX = tileX0; tileX < tileX1; tileX++ ) {
+				const int tile = tileY * tileCountX + tileX;
+				hybridOverlayTileIndices[tileCursors[tile]++] = static_cast<uint32_t>( triIndex );
+			}
+		}
+	}
+	return true;
+}
+
+bool idSoftwareVulkanBridge::RecordOverlayTileCompositeCommands( bool targetFrame ) {
+	if ( overlayTileDescriptorSet == VK_NULL_HANDLE || overlayTilePipeline == VK_NULL_HANDLE || overlayTilePipelineLayout == VK_NULL_HANDLE ) {
+		return false;
+	}
+
+	int dispatchX0, dispatchY0, dispatchX1, dispatchY1;
+	if ( !BuildOverlayTileBins( targetFrame, dispatchX0, dispatchY0, dispatchX1, dispatchY1 ) ) {
+		return false;
+	}
+	if ( dispatchX1 <= dispatchX0 || dispatchY1 <= dispatchY0 ) {
+		return true;
+	}
+
+	const swVkOverlayTile_t dummyTile = {};
+	const uint32_t dummyIndex = 0;
+	const int tileCount = Max( 1, hybridOverlayTiles.Num() );
+	const int tileIndexCount = Max( 1, hybridOverlayTileIndices.Num() );
+	if ( !EnsureOverlayTileBuffers( tileCount, tileIndexCount ) ) {
+		return false;
+	}
+	if ( !UploadBuffer( hybridOverlayTileBuffer, hybridOverlayTiles.Num() > 0 ? hybridOverlayTiles.Ptr() : &dummyTile,
+		 static_cast<VkDeviceSize>( tileCount ) * sizeof( swVkOverlayTile_t ), "vkMapMemory overlay tiles failed" ) ) {
+		return false;
+	}
+	if ( !UploadBuffer( hybridOverlayTileIndexBuffer, hybridOverlayTileIndices.Num() > 0 ? hybridOverlayTileIndices.Ptr() : &dummyIndex,
+		 static_cast<VkDeviceSize>( tileIndexCount ) * sizeof( uint32_t ), "vkMapMemory overlay tile indices failed" ) ) {
+		return false;
+	}
+
+	UpdateOverlayTileDescriptorSet( targetFrame );
+
+	VkMemoryBarrier inputBarrier;
+	memset( &inputBarrier, 0, sizeof( inputBarrier ) );
+	inputBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	inputBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+	inputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+	vkCmdPipelineBarrier( commandBuffer,
+		VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		0, 1, &inputBarrier, 0, NULL, 0, NULL );
+
+	vkCmdBindPipeline( commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, overlayTilePipeline );
+	vkCmdBindDescriptorSets( commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, overlayTilePipelineLayout, 0, 1, &overlayTileDescriptorSet, 0, NULL );
+
+	swVkOverlayTilePushConstants_t push;
+	memset( &push, 0, sizeof( push ) );
+	push.frame[0] = static_cast<uint32_t>( Max( 1, frameWidth ) );
+	push.frame[1] = static_cast<uint32_t>( Max( 1, frameHeight ) );
+	push.dispatch[0] = dispatchX0;
+	push.dispatch[1] = dispatchY0;
+	push.dispatch[2] = dispatchX1 - dispatchX0;
+	push.dispatch[3] = dispatchY1 - dispatchY0;
+	push.tileGrid[0] = SW_VK_OVERLAY_TILE_WIDTH;
+	push.tileGrid[1] = SW_VK_OVERLAY_TILE_HEIGHT;
+	push.tileGrid[2] = SWVkDispatchGroups( static_cast<uint32_t>( frameWidth ), SW_VK_OVERLAY_TILE_WIDTH );
+	push.tileGrid[3] = SWVkDispatchGroups( static_cast<uint32_t>( frameHeight ), SW_VK_OVERLAY_TILE_HEIGHT );
+	push.textureCount = static_cast<uint32_t>( Max( 0, hybridTextureCount ) );
+	push.targetFrame = targetFrame ? 1u : 0u;
+
+	vkCmdPushConstants( commandBuffer, overlayTilePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+	vkCmdDispatch( commandBuffer,
+		SWVkDispatchGroups( static_cast<uint32_t>( dispatchX1 - dispatchX0 ), SW_VK_OVERLAY_GROUP_SIZE_X ),
+		SWVkDispatchGroups( static_cast<uint32_t>( dispatchY1 - dispatchY0 ), SW_VK_OVERLAY_GROUP_SIZE_Y ), 1 );
+	SWVkComputeMemoryBarrier( commandBuffer, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT );
+	return true;
+}
+
 bool idSoftwareVulkanBridge::RecordOverlayRasterCommands( bool targetFrame ) {
 	if ( !hybridOverlayDirty ) {
 		return true;
@@ -3446,6 +3836,9 @@ bool idSoftwareVulkanBridge::RecordOverlayRasterCommands( bool targetFrame ) {
 	if ( overlayDescriptorSet == VK_NULL_HANDLE || overlayPipeline == VK_NULL_HANDLE || overlayPipelineLayout == VK_NULL_HANDLE ||
 		 hybridOverlayTriBuffer.buffer == VK_NULL_HANDLE || ( targetFrame ? hybridFrameBuffer.buffer : hybridOverlayBuffer.buffer ) == VK_NULL_HANDLE ) {
 		return false;
+	}
+	if ( RecordOverlayTileCompositeCommands( targetFrame ) ) {
+		return true;
 	}
 
 	VkMemoryBarrier inputBarrier;
@@ -4221,6 +4614,8 @@ void idSoftwareVulkanBridge::DestroyHybridBuffers() {
 	DestroyBuffer( hybridWorldPositionBuffer );
 	DestroyBuffer( hybridTextureTexelBuffer );
 	DestroyBuffer( hybridTextureInfoBuffer );
+	DestroyBuffer( hybridOverlayTileIndexBuffer );
+	DestroyBuffer( hybridOverlayTileBuffer );
 	DestroyBuffer( hybridOverlayTriBuffer );
 	DestroyBuffer( hybrid2DSourceBuffer );
 	DestroyBuffer( hybridOverlayBuffer );
@@ -4283,6 +4678,8 @@ void idSoftwareVulkanBridge::Destroy2DPipeline() {
 
 void idSoftwareVulkanBridge::DestroyOverlayPipeline() {
 	DestroyBuffer( hybridOverlayTriBuffer );
+	DestroyBuffer( hybridOverlayTileBuffer );
+	DestroyBuffer( hybridOverlayTileIndexBuffer );
 	if ( overlayPipeline != VK_NULL_HANDLE ) {
 		vkDestroyPipeline( device, overlayPipeline, NULL );
 		overlayPipeline = VK_NULL_HANDLE;
@@ -4303,6 +4700,32 @@ void idSoftwareVulkanBridge::DestroyOverlayPipeline() {
 	if ( overlayDescriptorSetLayout != VK_NULL_HANDLE ) {
 		vkDestroyDescriptorSetLayout( device, overlayDescriptorSetLayout, NULL );
 		overlayDescriptorSetLayout = VK_NULL_HANDLE;
+	}
+}
+
+void idSoftwareVulkanBridge::DestroyOverlayTilePipeline() {
+	DestroyBuffer( hybridOverlayTileBuffer );
+	DestroyBuffer( hybridOverlayTileIndexBuffer );
+	if ( overlayTilePipeline != VK_NULL_HANDLE ) {
+		vkDestroyPipeline( device, overlayTilePipeline, NULL );
+		overlayTilePipeline = VK_NULL_HANDLE;
+	}
+	if ( overlayTileShaderModule != VK_NULL_HANDLE ) {
+		vkDestroyShaderModule( device, overlayTileShaderModule, NULL );
+		overlayTileShaderModule = VK_NULL_HANDLE;
+	}
+	if ( overlayTilePipelineLayout != VK_NULL_HANDLE ) {
+		vkDestroyPipelineLayout( device, overlayTilePipelineLayout, NULL );
+		overlayTilePipelineLayout = VK_NULL_HANDLE;
+	}
+	if ( overlayTileDescriptorPool != VK_NULL_HANDLE ) {
+		vkDestroyDescriptorPool( device, overlayTileDescriptorPool, NULL );
+		overlayTileDescriptorPool = VK_NULL_HANDLE;
+		overlayTileDescriptorSet = VK_NULL_HANDLE;
+	}
+	if ( overlayTileDescriptorSetLayout != VK_NULL_HANDLE ) {
+		vkDestroyDescriptorSetLayout( device, overlayTileDescriptorSetLayout, NULL );
+		overlayTileDescriptorSetLayout = VK_NULL_HANDLE;
 	}
 }
 
@@ -4382,6 +4805,7 @@ void idSoftwareVulkanBridge::Shutdown() {
 	DestroyUploadBuffer();
 	DestroyHybridPipeline();
 	Destroy2DPipeline();
+	DestroyOverlayTilePipeline();
 	DestroyOverlayPipeline();
 	DestroyShadowPipeline();
 	framePixels.Clear();
@@ -4460,6 +4884,7 @@ void idSoftwareVulkanBridge::Shutdown() {
 	hybridOverlayDirty = false;
 	hybridOverlayOnly = false;
 	twoDDescriptorSet = VK_NULL_HANDLE;
+	overlayTileDescriptorSet = VK_NULL_HANDLE;
 
 	vkGetPhysicalDeviceFeatures2Local = NULL;
 	vkGetBufferDeviceAddressKHRLocal = NULL;
