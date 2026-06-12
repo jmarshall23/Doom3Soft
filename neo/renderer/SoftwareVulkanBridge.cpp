@@ -308,7 +308,7 @@ private:
 	swVkShadowJob_t *AllocShadowJob();
 	bool RecordShadowJob( swVkShadowJob_t &job, const viewLight_t *vLight, const idVec4 *worldPositions, int width, int height );
 	void DestroyShadowJobs();
-	void BeginFrame();
+	void BeginFrame( bool clearFramePixels );
 	void Clear2DJobs();
 	bool Queue2DOverlayBlit( const viewDef_t *viewDef, const unsigned int *bgra, int width, int height, int presentWidth, int presentHeight );
 	void Update2DDescriptorSet( bool targetFrame );
@@ -2029,13 +2029,6 @@ bool idSoftwareVulkanBridge::RecordShadowJob( swVkShadowJob_t &job, const viewLi
 	memcpy( mapped, worldPositions, positionSize );
 	vkUnmapMemory( device, job.worldPositionBuffer.memory );
 
-	if ( vkMapMemory( device, job.shadowMaskBuffer.memory, 0, maskSize, 0, &mapped ) != VK_SUCCESS ) {
-		LogFailure( "vkMapMemory shadow mask clear failed" );
-		return false;
-	}
-	memset( mapped, 255, static_cast<size_t>( maskSize ) );
-	vkUnmapMemory( device, job.shadowMaskBuffer.memory );
-
 	VkWriteDescriptorSetAccelerationStructureKHR asInfo;
 	memset( &asInfo, 0, sizeof( asInfo ) );
 	asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
@@ -2650,11 +2643,11 @@ bool idSoftwareVulkanBridge::BuildRayQueryTlas( const idList<swVkRayInstance_t> 
 	return true;
 }
 
-void idSoftwareVulkanBridge::BeginFrame() {
+void idSoftwareVulkanBridge::BeginFrame( bool clearFramePixels ) {
 	if ( frameBegun ) {
 		return;
 	}
-	if ( framePixels.Num() > 0 ) {
+	if ( clearFramePixels && framePixels.Num() > 0 ) {
 		memset( framePixels.Ptr(), 0, framePixels.Num() * sizeof( framePixels[0] ) );
 	}
 	Clear2DJobs();
@@ -2717,7 +2710,7 @@ bool idSoftwareVulkanBridge::QueueHybridOverlaySourceTriangles( const viewDef_t 
 		if ( !EnsureFrameBuffer() || frameBegun ) {
 			return false;
 		}
-		BeginFrame();
+		BeginFrame( false );
 		hybridWidth = srcWidth;
 		hybridHeight = srcHeight;
 		hybridPresentWidth = dstWidth;
@@ -2778,7 +2771,7 @@ bool idSoftwareVulkanBridge::BlitView( const viewDef_t *viewDef, const unsigned 
 		return false;
 	}
 
-	BeginFrame();
+	BeginFrame( true );
 	if ( hybridFrameDirty && twoDPipeline != VK_NULL_HANDLE ) {
 		return Queue2DOverlayBlit( viewDef, bgra, width, height, presentWidth, presentHeight );
 	}
@@ -2864,7 +2857,7 @@ bool idSoftwareVulkanBridge::CompositeHybridGBuffer( const viewDef_t *viewDef, c
 		hybridShadowEnabled = PrepareRayQueryScene( viewDef ) && tlas != VK_NULL_HANDLE;
 	}
 	UpdateHybridDescriptorSet();
-	BeginFrame();
+	BeginFrame( false );
 
 	hybridWidth = width;
 	hybridHeight = height;

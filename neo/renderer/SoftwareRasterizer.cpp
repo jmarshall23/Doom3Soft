@@ -711,11 +711,15 @@ void idSoftwareRasterizer::Resize( int newWidth, int newHeight ) {
 void idSoftwareRasterizer::Clear( bool clearColor ) {
 	const float clearDepth = 1.0f;
 	SWFillList( depthBuffer, clearDepth );
-	SWZeroList( worldPositionBuffer );
-	ClearHybridGBuffer();
+	if ( captureWorldPosition && !hybridComputeActive ) {
+		SWZeroList( worldPositionBuffer );
+	}
+	if ( hybridComputeActive ) {
+		ClearHybridGBuffer();
+	}
 	shadowMaskActive = false;
 	hybridSurfaceSerial = 1;
-	if ( clearColor ) {
+	if ( clearColor && !hybridComputeActive ) {
 		const unsigned int clearColorValue = 0xff000000u;
 		SWFillList( colorBuffer, clearColorValue );
 	}
@@ -739,16 +743,6 @@ void idSoftwareRasterizer::ClearHybridGBuffer() {
 		return;
 	}
 
-	const float clearDepth = 1.0f;
-	const unsigned int invalidTextureId = 0xffffffffu;
-	SWFillList( hybridGBuffer.depth, clearDepth );
-	SWZeroList( hybridGBuffer.normalPacked );
-	SWZeroList( hybridGBuffer.tangentPacked );
-	SWZeroList( hybridGBuffer.bitangentPacked );
-	SWZeroList( hybridGBuffer.uvPacked );
-	SWZeroList( hybridGBuffer.materialId );
-	SWFillList( hybridGBuffer.albedoOrTextureId, invalidTextureId );
-	SWZeroList( hybridGBuffer.specularAndFlags );
 	SWZeroList( hybridGBuffer.surfaceId );
 }
 
@@ -912,6 +906,10 @@ void idSoftwareRasterizer::DrawView( const viewDef_t *viewDef ) {
 				WriteHybridDebugView();
 				Present();
 				return;
+			}
+			{
+				const unsigned int clearColorValue = 0xff000000u;
+				SWFillList( colorBuffer, clearColorValue );
 			}
 		}
 
