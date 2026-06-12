@@ -59,6 +59,7 @@ static const unsigned int SW_OVERLAY_FLAG_SOURCE_IMAGE = BIT(5);
 static const unsigned int SW_HYBRID_LIGHT_NORMAL = 0;
 static const unsigned int SW_HYBRID_LIGHT_FOG = 1;
 static const unsigned int SW_HYBRID_LIGHT_BLEND = 2;
+static const int SW_HYBRID_LIGHT_TILE_SIZE = 16;
 static const int SW_FOG_SIZE = 128;
 static const float SW_FOG_RAMP_RANGE = 8.0f;
 static const float SW_FOG_DEEP_RANGE = -30.0f;
@@ -505,6 +506,7 @@ private:
 	void WriteHybridDebugView();
 	void BuildHybridTextureUpload( swHybridGBufferUpload_t &gbuffer );
 	void BuildHybridLightUpload( const viewDef_t *viewDef, swHybridGBufferUpload_t &gbuffer );
+	void BuildHybridLightTiles( int normalLightCount, swHybridGBufferUpload_t &gbuffer );
 	bool BuildFogLightState( const viewDef_t *viewDef, const viewLight_t *vLight, swFogLightState_t &fog );
 	bool BuildBlendLightStage( const viewLight_t *vLight, const shaderStage_t *stage, swBlendLightStage_t &blend );
 	void AddHybridFogLight( const swFogLightState_t &fog );
@@ -620,6 +622,9 @@ private:
 	idList<swHybridTextureInfo_t> hybridTextureInfos;
 	idList<unsigned int> hybridTextureTexels;
 	idList<swHybridLight_t> hybridLights;
+	idList<swHybridLight_t> hybridPostLights;
+	idList<swHybridLightTile_t> hybridLightTiles;
+	idList<unsigned int> hybridLightIndices;
 	idList<unsigned int> subviewSourcePixels;
 	unsigned int textureCacheGeneration;
 	unsigned int hybridTextureAtlasGeneration;
@@ -2341,15 +2346,24 @@ void idSoftwareRasterizer::BuildHybridTextureUpload( swHybridGBufferUpload_t &gb
 
 void idSoftwareRasterizer::BuildHybridLightUpload( const viewDef_t *viewDef, swHybridGBufferUpload_t &gbuffer ) {
 	hybridLights.SetNum( 0, false );
+	hybridPostLights.SetNum( 0, false );
+	hybridLightTiles.SetNum( 0, false );
+	hybridLightIndices.SetNum( 0, false );
 	if ( !viewDef ) {
 		gbuffer.lights = NULL;
 		gbuffer.lightCount = 0;
+		gbuffer.normalLightCount = 0;
+		gbuffer.postLightCount = 0;
+		gbuffer.lightTiles = NULL;
+		gbuffer.lightTileCount = 0;
+		gbuffer.lightIndices = NULL;
+		gbuffer.lightIndexCount = 0;
 		return;
 	}
 
 	static const int MAX_HYBRID_LIGHTS = 64;
 	const bool skipFogSystem = r_skipFogLights.GetBool() || r_showOverDraw.GetInteger() != 0 || viewDef->isXraySubview;
-	for ( const viewLight_t *vLight = viewDef->viewLights; vLight && hybridLights.Num() < MAX_HYBRID_LIGHTS; vLight = vLight->next ) {
+	for ( const viewLight_t *vLight = viewDef->viewLights; vLight && hybridLights.Num() + hybridPostLights.Num() < MAX_HYBRID_LIGHTS; vLight = vLight->next ) {
 		if ( !vLight->lightShader ) {
 			continue;
 		}
@@ -2367,7 +2381,7 @@ void idSoftwareRasterizer::BuildHybridLightUpload( const viewDef_t *viewDef, swH
 			if ( skipFogSystem || r_skipBlendLights.GetBool() || ( !vLight->globalInteractions && !vLight->localInteractions ) ) {
 				continue;
 			}
-			for ( int stageIndex = 0; stageIndex < vLight->lightShader->GetNumStages() && hybridLights.Num() < MAX_HYBRID_LIGHTS; stageIndex++ ) {
+			for ( int stageIndex = 0; stageIndex < vLight->lightShader->GetNumStages() && hybridLights.Num() + hybridPostLights.Num() < MAX_HYBRID_LIGHTS; stageIndex++ ) {
 				const shaderStage_t *stage = vLight->lightShader->GetStage( stageIndex );
 				swBlendLightStage_t blend;
 				if ( BuildBlendLightStage( vLight, stage, blend ) ) {
@@ -2418,6 +2432,9 @@ void idSoftwareRasterizer::BuildHybridLightUpload( const viewDef_t *viewDef, swH
 		if ( lightColor[0] <= 0.0f && lightColor[1] <= 0.0f && lightColor[2] <= 0.0f ) {
 			continue;
 		}
+		if ( hybridLights.Num() + hybridPostLights.Num() >= MAX_HYBRID_LIGHTS ) {
+			break;
+		}
 
 		float radius = 1024.0f;
 		bool parallel = false;
@@ -2460,12 +2477,129 @@ void idSoftwareRasterizer::BuildHybridLightUpload( const viewDef_t *viewDef, swH
 		light.textureIds[3] = 0u;
 	}
 
+	const int normalLightCount = hybridLights.Num();
+	for ( int i = 0; i < hybridPostLights.Num() && hybridLights.Num() < MAX_HYBRID_LIGHTS; i++ ) {
+		hybridLights.Append( hybridPostLights[i] );
+	}
+
 	gbuffer.lights = hybridLights.Num() > 0 ? hybridLights.Ptr() : NULL;
 	gbuffer.lightCount = hybridLights.Num();
+	gbuffer.normalLightCount = normalLightCount;
+	gbuffer.postLightCount = hybridLights.Num() - normalLightCount;
+	BuildHybridLightTiles( normalLightCount, gbuffer );
+}
+
+void idSoftwareRasterizer::BuildHybridLightTiles( int normalLightCount, swHybridGBufferUpload_t &gbuffer ) {
+	gbuffer.lightTiles = NULL;
+	gbuffer.lightTileCount = 0;
+	gbuffer.lightIndices = NULL;
+	gbuffer.lightIndexCount = 0;
+
+	const int lightCount = hybridLights.Num();
+	if ( lightCount <= 0 || width <= 0 || height <= 0 || presentWidth <= 0 || presentHeight <= 0 ) {
+		return;
+	}
+
+	const int tileCountX = Max( 1, ( width + SW_HYBRID_LIGHT_TILE_SIZE - 1 ) / SW_HYBRID_LIGHT_TILE_SIZE );
+	const int tileCountY = Max( 1, ( height + SW_HYBRID_LIGHT_TILE_SIZE - 1 ) / SW_HYBRID_LIGHT_TILE_SIZE );
+	const int tileCount = tileCountX * tileCountY;
+
+	idList<int> normalCounts;
+	idList<int> postCounts;
+	normalCounts.SetNum( tileCount, false );
+	postCounts.SetNum( tileCount, false );
+	SWZeroList( normalCounts );
+	SWZeroList( postCounts );
+
+	for ( int lightIndex = 0; lightIndex < lightCount; lightIndex++ ) {
+		const swHybridLight_t &light = hybridLights[lightIndex];
+		const int srcX0 = Max( 0, Min( width, ( light.scissor[0] * width ) / presentWidth ) );
+		const int srcY0 = Max( 0, Min( height, ( light.scissor[1] * height ) / presentHeight ) );
+		const int srcX1 = Max( srcX0, Min( width, ( ( light.scissor[2] + 1 ) * width + presentWidth - 1 ) / presentWidth ) );
+		const int srcY1 = Max( srcY0, Min( height, ( ( light.scissor[3] + 1 ) * height + presentHeight - 1 ) / presentHeight ) );
+		if ( srcX0 >= srcX1 || srcY0 >= srcY1 ) {
+			continue;
+		}
+
+		const int tileX0 = srcX0 / SW_HYBRID_LIGHT_TILE_SIZE;
+		const int tileY0 = srcY0 / SW_HYBRID_LIGHT_TILE_SIZE;
+		const int tileX1 = ( srcX1 - 1 ) / SW_HYBRID_LIGHT_TILE_SIZE;
+		const int tileY1 = ( srcY1 - 1 ) / SW_HYBRID_LIGHT_TILE_SIZE;
+		for ( int tileY = tileY0; tileY <= tileY1; tileY++ ) {
+			for ( int tileX = tileX0; tileX <= tileX1; tileX++ ) {
+				const int tileIndex = tileY * tileCountX + tileX;
+				if ( lightIndex < normalLightCount ) {
+					normalCounts[tileIndex]++;
+				} else {
+					postCounts[tileIndex]++;
+				}
+			}
+		}
+	}
+
+	hybridLightTiles.SetNum( tileCount, false );
+	memset( hybridLightTiles.Ptr(), 0, static_cast<size_t>( tileCount ) * sizeof( hybridLightTiles[0] ) );
+
+	int indexCount = 0;
+	for ( int tileIndex = 0; tileIndex < tileCount; tileIndex++ ) {
+		hybridLightTiles[tileIndex].normalOffset = static_cast<unsigned int>( indexCount );
+		hybridLightTiles[tileIndex].normalCount = static_cast<unsigned int>( normalCounts[tileIndex] );
+		indexCount += normalCounts[tileIndex];
+	}
+	for ( int tileIndex = 0; tileIndex < tileCount; tileIndex++ ) {
+		hybridLightTiles[tileIndex].postOffset = static_cast<unsigned int>( indexCount );
+		hybridLightTiles[tileIndex].postCount = static_cast<unsigned int>( postCounts[tileIndex] );
+		indexCount += postCounts[tileIndex];
+	}
+
+	hybridLightIndices.SetNum( Max( 1, indexCount ), false );
+	if ( indexCount == 0 ) {
+		hybridLightIndices[0] = 0;
+	} else {
+		idList<int> normalCursors;
+		idList<int> postCursors;
+		normalCursors.SetNum( tileCount, false );
+		postCursors.SetNum( tileCount, false );
+		SWZeroList( normalCursors );
+		SWZeroList( postCursors );
+
+		for ( int lightIndex = 0; lightIndex < lightCount; lightIndex++ ) {
+			const swHybridLight_t &light = hybridLights[lightIndex];
+			const int srcX0 = Max( 0, Min( width, ( light.scissor[0] * width ) / presentWidth ) );
+			const int srcY0 = Max( 0, Min( height, ( light.scissor[1] * height ) / presentHeight ) );
+			const int srcX1 = Max( srcX0, Min( width, ( ( light.scissor[2] + 1 ) * width + presentWidth - 1 ) / presentWidth ) );
+			const int srcY1 = Max( srcY0, Min( height, ( ( light.scissor[3] + 1 ) * height + presentHeight - 1 ) / presentHeight ) );
+			if ( srcX0 >= srcX1 || srcY0 >= srcY1 ) {
+				continue;
+			}
+
+			const int tileX0 = srcX0 / SW_HYBRID_LIGHT_TILE_SIZE;
+			const int tileY0 = srcY0 / SW_HYBRID_LIGHT_TILE_SIZE;
+			const int tileX1 = ( srcX1 - 1 ) / SW_HYBRID_LIGHT_TILE_SIZE;
+			const int tileY1 = ( srcY1 - 1 ) / SW_HYBRID_LIGHT_TILE_SIZE;
+			for ( int tileY = tileY0; tileY <= tileY1; tileY++ ) {
+				for ( int tileX = tileX0; tileX <= tileX1; tileX++ ) {
+					const int tileIndex = tileY * tileCountX + tileX;
+					if ( lightIndex < normalLightCount ) {
+						const int writeIndex = static_cast<int>( hybridLightTiles[tileIndex].normalOffset ) + normalCursors[tileIndex]++;
+						hybridLightIndices[writeIndex] = static_cast<unsigned int>( lightIndex );
+					} else {
+						const int writeIndex = static_cast<int>( hybridLightTiles[tileIndex].postOffset ) + postCursors[tileIndex]++;
+						hybridLightIndices[writeIndex] = static_cast<unsigned int>( lightIndex );
+					}
+				}
+			}
+		}
+	}
+
+	gbuffer.lightTiles = hybridLightTiles.Ptr();
+	gbuffer.lightTileCount = hybridLightTiles.Num();
+	gbuffer.lightIndices = hybridLightIndices.Ptr();
+	gbuffer.lightIndexCount = hybridLightIndices.Num();
 }
 
 void idSoftwareRasterizer::AddHybridFogLight( const swFogLightState_t &fog ) {
-	swHybridLight_t &light = hybridLights.Alloc();
+	swHybridLight_t &light = hybridPostLights.Alloc();
 	memset( &light, 0, sizeof( light ) );
 	light.originRadius[3] = fog.enterS;
 	for ( int i = 0; i < 4; i++ ) {
@@ -2485,7 +2619,7 @@ void idSoftwareRasterizer::AddHybridFogLight( const swFogLightState_t &fog ) {
 }
 
 void idSoftwareRasterizer::AddHybridBlendLight( const swBlendLightStage_t &blend ) {
-	swHybridLight_t &light = hybridLights.Alloc();
+	swHybridLight_t &light = hybridPostLights.Alloc();
 	memset( &light, 0, sizeof( light ) );
 	for ( int i = 0; i < 4; i++ ) {
 		light.color[i] = blend.color[i];

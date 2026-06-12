@@ -151,7 +151,7 @@ idCVar r_useOptimizedShadows( "r_useOptimizedShadows", "1", CVAR_RENDERER | CVAR
 idCVar r_useScissor( "r_useScissor", "1", CVAR_RENDERER | CVAR_BOOL, "scissor clip as portals and lights are processed" );
 idCVar r_useSoftwareRenderer( "r_useSoftwareRenderer", "1", CVAR_RENDERER | CVAR_BOOL, "route 3D views through the CPU tiled software rasterizer" );
 idCVar r_softwareTextureMode( "r_softwareTextureMode", "0", CVAR_RENDERER | CVAR_INTEGER, "software renderer texture debug mode: 0 material, 1 UV gradient, 2 UV checker", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
-idCVar r_softwareRenderScale( "r_softwareRenderScale", "0.5", CVAR_RENDERER | CVAR_FLOAT, "scale the 3D software render buffer before presentation", 0.0f, 1.0f );
+idCVar r_softwareRenderScale( "r_softwareRenderScale", "0.35", CVAR_RENDERER | CVAR_FLOAT, "scale the 3D software render buffer before presentation", 0.0f, 1.0f );
 idCVar r_softwareDepthSIMD( "r_softwareDepthSIMD", "1", CVAR_RENDERER | CVAR_BOOL, "use AVX2 packet depth rasterization when available" );
 idCVar r_softwareVulkanPresent( "r_softwareVulkanPresent", "1", CVAR_RENDERER | CVAR_BOOL, "present software-rendered frames through a Vulkan swapchain" );
 idCVar r_softwareRayQueryShadows( "r_softwareRayQueryShadows", "1", CVAR_RENDERER | CVAR_BOOL, "enable Vulkan ray-query shadow backend when available" );

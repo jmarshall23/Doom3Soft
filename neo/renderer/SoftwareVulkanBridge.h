@@ -34,6 +34,13 @@ struct swHybridLight_t {
 	unsigned int textureIds[4];
 };
 
+struct swHybridLightTile_t {
+	unsigned int normalOffset;
+	unsigned int normalCount;
+	unsigned int postOffset;
+	unsigned int postCount;
+};
+
 struct swHybridOverlayTri_t {
 	float p0[4];
 	float p1[4];
@@ -77,6 +84,12 @@ struct swHybridGBufferUpload_t {
 		textureGeneration = 0;
 		lights = NULL;
 		lightCount = 0;
+		normalLightCount = 0;
+		postLightCount = 0;
+		lightTiles = NULL;
+		lightTileCount = 0;
+		lightIndices = NULL;
+		lightIndexCount = 0;
 		debugView = 0;
 	}
 
@@ -97,6 +110,12 @@ struct swHybridGBufferUpload_t {
 	unsigned int textureGeneration;
 	const swHybridLight_t *lights;
 	int lightCount;
+	int normalLightCount;
+	int postLightCount;
+	const swHybridLightTile_t *lightTiles;
+	int lightTileCount;
+	const unsigned int *lightIndices;
+	int lightIndexCount;
 	int debugView;
 };
 

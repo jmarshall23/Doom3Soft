@@ -67,6 +67,12 @@ layout( set = 0, binding = 14, std430 ) readonly buffer TangentBuffer {
 layout( set = 0, binding = 15, std430 ) readonly buffer BitangentBuffer {
 	uint bitangentPacked[];
 };
+layout( set = 0, binding = 16, std430 ) readonly buffer LightTileBuffer {
+	uvec4 lightTiles[];
+};
+layout( set = 0, binding = 17, std430 ) readonly buffer LightIndexBuffer {
+	uint lightIndices[];
+};
 
 layout( push_constant ) uniform PushConstants {
 	uvec4 dims;      // gbufferWidth, gbufferHeight, frameWidth, frameHeight
@@ -86,7 +92,12 @@ layout( push_constant ) uniform PushConstants {
 const uint LIGHT_TYPE_NORMAL = 0u;
 const uint LIGHT_TYPE_FOG = 1u;
 const uint LIGHT_TYPE_BLEND = 2u;
+const uint LIGHT_TILE_SIZE = 16u;
 const float FOG_ENTER = 65.0 / 128.0;
+
+uint CeilDiv( uint numerator, uint denominator ) {
+	return ( numerator + denominator - 1u ) / denominator;
+}
 
 const int SW_WRITE_RED = 1;
 const int SW_WRITE_GREEN = 2;
@@ -275,12 +286,44 @@ float WrappedUvDelta( float delta, uint repeat ) {
 	return delta;
 }
 
-vec2 SurfaceNeighborDelta( uint neighborIndex, vec2 uv, uint repeat ) {
-	vec2 delta = DecodePackedUV( uvPacked[neighborIndex] ) - uv;
+vec2 WrappedUvDelta2( vec2 delta, uint repeat ) {
 	return vec2( WrappedUvDelta( delta.x, repeat ), WrappedUvDelta( delta.y, repeat ) );
 }
 
-float TextureLodFromNeighbors( uint textureId, uint srcIndex, vec2 uv ) {
+struct RawUvDerivatives {
+	vec2 dx;
+	vec2 dy;
+	uvec2 have;
+};
+
+RawUvDerivatives ComputeRawUvDerivatives( uint srcIndex, vec2 uv ) {
+	RawUvDerivatives derivs;
+	derivs.dx = vec2( 0.0 );
+	derivs.dy = vec2( 0.0 );
+	derivs.have = uvec2( 0u );
+	uint x = srcIndex % pc.dims.x;
+	uint y = srcIndex / pc.dims.x;
+	uint currentSurface = surfaceId[srcIndex];
+
+	if ( x + 1u < pc.dims.x && surfaceId[srcIndex + 1u] == currentSurface ) {
+		derivs.dx = DecodePackedUV( uvPacked[srcIndex + 1u] ) - uv;
+		derivs.have.x = 1u;
+	} else if ( x > 0u && surfaceId[srcIndex - 1u] == currentSurface ) {
+		derivs.dx = uv - DecodePackedUV( uvPacked[srcIndex - 1u] );
+		derivs.have.x = 1u;
+	}
+
+	if ( y + 1u < pc.dims.y && surfaceId[srcIndex + pc.dims.x] == currentSurface ) {
+		derivs.dy = DecodePackedUV( uvPacked[srcIndex + pc.dims.x] ) - uv;
+		derivs.have.y = 1u;
+	} else if ( y > 0u && surfaceId[srcIndex - pc.dims.x] == currentSurface ) {
+		derivs.dy = uv - DecodePackedUV( uvPacked[srcIndex - pc.dims.x] );
+		derivs.have.y = 1u;
+	}
+	return derivs;
+}
+
+float TextureLodFromDerivatives( uint textureId, RawUvDerivatives derivs ) {
 	if ( textureId == 0xffffffffu || textureId >= pc.textureCount ) {
 		return 0.0;
 	}
@@ -290,35 +333,17 @@ float TextureLodFromNeighbors( uint textureId, uint srcIndex, vec2 uv ) {
 		return 0.0;
 	}
 
-	uint x = srcIndex % pc.dims.x;
-	uint y = srcIndex / pc.dims.x;
-	uint currentSurface = surfaceId[srcIndex];
-	vec2 dx = vec2( 0.0 );
-	vec2 dy = vec2( 0.0 );
-	bool haveX = false;
-	bool haveY = false;
-
-	if ( x + 1u < pc.dims.x && surfaceId[srcIndex + 1u] == currentSurface ) {
-		dx = SurfaceNeighborDelta( srcIndex + 1u, uv, info.repeat );
-		haveX = true;
-	} else if ( x > 0u && surfaceId[srcIndex - 1u] == currentSurface ) {
-		dx = -SurfaceNeighborDelta( srcIndex - 1u, uv, info.repeat );
-		haveX = true;
-	}
-
-	if ( y + 1u < pc.dims.y && surfaceId[srcIndex + pc.dims.x] == currentSurface ) {
-		dy = SurfaceNeighborDelta( srcIndex + pc.dims.x, uv, info.repeat );
-		haveY = true;
-	} else if ( y > 0u && surfaceId[srcIndex - pc.dims.x] == currentSurface ) {
-		dy = -SurfaceNeighborDelta( srcIndex - pc.dims.x, uv, info.repeat );
-		haveY = true;
-	}
-
+	vec2 dx = WrappedUvDelta2( derivs.dx, info.repeat );
+	vec2 dy = WrappedUvDelta2( derivs.dy, info.repeat );
 	vec2 textureSize = vec2( float( info.width ), float( info.height ) );
-	float rhoX = haveX ? length( dx * textureSize ) : 0.0;
-	float rhoY = haveY ? length( dy * textureSize ) : 0.0;
+	float rhoX = derivs.have.x != 0u ? length( dx * textureSize ) : 0.0;
+	float rhoY = derivs.have.y != 0u ? length( dy * textureSize ) : 0.0;
 	float rho = max( rhoX, rhoY );
 	return rho > 1.0 ? log2( rho ) : 0.0;
+}
+
+float TextureLodFromNeighbors( uint textureId, uint srcIndex, vec2 uv ) {
+	return TextureLodFromDerivatives( textureId, ComputeRawUvDerivatives( srcIndex, uv ) );
 }
 
 uint AddressProjectedTexel( int coord, uint size, uint repeat ) {
@@ -486,6 +511,14 @@ float TraceShadow( vec3 worldPos, vec3 normal, vec3 lightPosition, vec3 lightDir
 	return visible / float( samples );
 }
 
+uvec4 LightTileRange( uint srcX, uint srcY ) {
+	uint tileCountX = CeilDiv( pc.dims.x, LIGHT_TILE_SIZE );
+	uint tileCountY = CeilDiv( pc.dims.y, LIGHT_TILE_SIZE );
+	uint tileX = min( srcX / LIGHT_TILE_SIZE, tileCountX - 1u );
+	uint tileY = min( srcY / LIGHT_TILE_SIZE, tileCountY - 1u );
+	return lightTiles[tileY * tileCountX + tileX];
+}
+
 uint BlendSourceOver( uint src, uint dst ) {
 	uint srcA = ( src >> 24 ) & 255u;
 	if ( srcA == 0u ) {
@@ -638,11 +671,12 @@ uint ApplyWriteMask( uint src, uint dst, int writeMask ) {
 	return outColor;
 }
 
-uint ShadeTexturedPixel( uint srcIndex, uint viewX, uint viewY ) {
+uint ShadeTexturedPixel( uint srcIndex, uint srcX, uint srcY, uint viewX, uint viewY ) {
 	uint packedUV = uvPacked[srcIndex];
 	vec2 uv = DecodePackedUV( packedUV );
+	RawUvDerivatives uvDerivs = ComputeRawUvDerivatives( srcIndex, uv );
 	uint albedoTextureId = albedoOrTextureId[srcIndex];
-	vec4 albedo = SampleTextureMip( albedoTextureId, uv, TextureLodFromNeighbors( albedoTextureId, srcIndex, uv ), PackColor( 255u, 255u, 255u, 255u ) );
+	vec4 albedo = SampleTextureMip( albedoTextureId, uv, TextureLodFromDerivatives( albedoTextureId, uvDerivs ), PackColor( 255u, 255u, 255u, 255u ) );
 	vec3 normal = DecodeNormal( normalPacked[srcIndex] );
 	uint packedMaterial = specularAndFlags[srcIndex];
 	uint bumpTextureId = OptionalTextureId( packedMaterial & 0xffffu );
@@ -656,9 +690,14 @@ uint ShadeTexturedPixel( uint srcIndex, uint viewX, uint viewY ) {
 	bool specularReady = false;
 	vec3 lit = albedo.rgb * 0.04;
 	vec4 world = worldPositions[srcIndex];
+	uvec4 tileRange = pc.lightCount > 0u ? LightTileRange( srcX, srcY ) : uvec4( 0u );
 
 	if ( world.w > 0.0 && pc.lightCount > 0u ) {
-		for ( uint i = 0u; i < pc.lightCount; i++ ) {
+		for ( uint tileLight = 0u; tileLight < tileRange.y; tileLight++ ) {
+			uint i = lightIndices[tileRange.x + tileLight];
+			if ( i >= pc.lightCount ) {
+				continue;
+			}
 			HybridLight light = lights[i];
 			if ( int( viewX ) < light.scissor.x || int( viewX ) > light.scissor.z ||
 				 int( viewY ) < light.scissor.y || int( viewY ) > light.scissor.w ) {
@@ -704,7 +743,7 @@ uint ShadeTexturedPixel( uint srcIndex, uint viewX, uint viewY ) {
 			}
 			if ( !bumpReady ) {
 				if ( bumpTextureId != 0xffffffffu && bumpTextureId < pc.textureCount ) {
-					vec4 bumpTexel = SampleTextureMip( bumpTextureId, uv, TextureLodFromNeighbors( bumpTextureId, srcIndex, uv ), PackColor( 128u, 128u, 255u, 255u ) );
+					vec4 bumpTexel = SampleTextureMip( bumpTextureId, uv, TextureLodFromDerivatives( bumpTextureId, uvDerivs ), PackColor( 128u, 128u, 255u, 255u ) );
 					bumpNormal = DecodeNormalMapTexel( PackColorVec( bumpTexel ) );
 				}
 				bumpReady = true;
@@ -714,6 +753,9 @@ uint ShadeTexturedPixel( uint srcIndex, uint viewX, uint viewY ) {
 				lightTS = normalize( lightTS );
 			}
 			float nDotL = max( dot( bumpNormal, lightTS ), 0.0 );
+			if ( nDotL <= 0.0 ) {
+				continue;
+			}
 			float shadow = light.flags.z != 0u ? TraceShadow( world.xyz, normal, light.originRadius.xyz, lightDir, dist ) : 1.0;
 			float lightAmount = nDotL * attenuation * falloff * shadow;
 			vec3 projectedLightColor = lightColor * lightTexel.rgb;
@@ -721,7 +763,7 @@ uint ShadeTexturedPixel( uint srcIndex, uint viewX, uint viewY ) {
 			if ( lightAmount > 0.0 ) {
 				if ( !specularReady ) {
 					if ( specularTextureId != 0xffffffffu && specularTextureId < pc.textureCount ) {
-						specularColor = SampleTextureMip( specularTextureId, uv, TextureLodFromNeighbors( specularTextureId, srcIndex, uv ), PackColor( 0u, 0u, 0u, 255u ) ).rgb;
+						specularColor = SampleTextureMip( specularTextureId, uv, TextureLodFromDerivatives( specularTextureId, uvDerivs ), PackColor( 0u, 0u, 0u, 255u ) ).rgb;
 					}
 					specularReady = true;
 				}
@@ -746,7 +788,11 @@ uint ShadeTexturedPixel( uint srcIndex, uint viewX, uint viewY ) {
 	uint color = PackColorVec( vec4( lit, albedo.a ) );
 	if ( world.w > 0.0 && pc.lightCount > 0u ) {
 		vec4 world4 = vec4( world.xyz, 1.0 );
-		for ( uint i = 0u; i < pc.lightCount; i++ ) {
+		for ( uint tileLight = 0u; tileLight < tileRange.w; tileLight++ ) {
+			uint i = lightIndices[tileRange.z + tileLight];
+			if ( i >= pc.lightCount ) {
+				continue;
+			}
 			HybridLight light = lights[i];
 			if ( int( viewX ) < light.scissor.x || int( viewX ) > light.scissor.z ||
 				 int( viewY ) < light.scissor.y || int( viewY ) > light.scissor.w ) {
@@ -808,10 +854,6 @@ uint BlendOverlay( uint baseColor, uint overlayColor ) {
 	return PackColorVec( vec4( rgb, alpha ) );
 }
 
-uint CeilDiv( uint numerator, uint denominator ) {
-	return ( numerator + denominator - 1u ) / denominator;
-}
-
 void main() {
 	uint idX = gl_GlobalInvocationID.x;
 	uint idY = gl_GlobalInvocationID.y;
@@ -850,7 +892,7 @@ void main() {
 
 		if ( depth[srcIndex] < 1.0 && surfaceId[srcIndex] != 0u ) {
 			if ( pc.debugView == 0u ) {
-				color = ShadeTexturedPixel( srcIndex, viewX, viewY );
+				color = ShadeTexturedPixel( srcIndex, srcX, srcY, viewX, viewY );
 			} else if ( pc.debugView == 1u ) {
 				uint v = ByteFromFloat( 1.0 - depth[srcIndex] );
 				color = PackColor( v, v, v, 255u );
@@ -872,7 +914,7 @@ void main() {
 				uint packed = uvPacked[srcIndex];
 				vec2 uv = DecodePackedUV( packed );
 				uint textureId = albedoOrTextureId[srcIndex];
-				color = PackColorVec( SampleTextureMip( textureId, uv, TextureLodFromNeighbors( textureId, srcIndex, uv ), PackColor( 255u, 255u, 255u, 255u ) ) );
+				color = PackColorVec( SampleTextureMip( textureId, uv, TextureLodFromDerivatives( textureId, ComputeRawUvDerivatives( srcIndex, uv ) ), PackColor( 255u, 255u, 255u, 255u ) ) );
 			} else if ( pc.debugView == 6u ) {
 				color = IdDebugColor( surfaceId[srcIndex] );
 			}
