@@ -286,6 +286,18 @@ struct swHybridGBuffer_t {
 	idList<unsigned int> surfaceId;
 };
 
+struct swHybridGBufferPointers_t {
+	float *depth;
+	unsigned int *normalPacked;
+	unsigned int *tangentPacked;
+	unsigned int *bitangentPacked;
+	unsigned int *uvPacked;
+	unsigned int *materialId;
+	unsigned int *albedoOrTextureId;
+	unsigned int *specularAndFlags;
+	unsigned int *surfaceId;
+};
+
 struct swTriSetup_t {
 	int x[3];
 	int y[3];
@@ -517,7 +529,8 @@ private:
 	template<bool HAS_TEXTURE, int TEXTURE_MODE, bool COLOR_MOD, int BLEND_MODE, int WRITE_MASK, bool DEPTH_TEST, bool DEPTH_WRITE, bool ALPHA_TEST>
 	void RasterizeTriangleInTileSpecialized( const swTriSetup_t &tri, int tileX, int tileY );
 	void RasterizeInteractionTriangleInTile( const swInteractionTri_t &tri, int tileX, int tileY );
-	void WriteHybridGBufferPixel( int pixelIndex, const swTriSetup_t &tri, float z, float invW, float sOverW, float tOverW, const float normalOverW[3], const float tangent0OverW[3], const float tangent1OverW[3] );
+	ID_INLINE swHybridGBufferPointers_t GetHybridGBufferPointers();
+	ID_INLINE void WriteHybridGBufferPixel( const swHybridGBufferPointers_t &gbuffer, int pixelIndex, const swTriSetup_t &tri, float z, float invW, float sOverW, float tOverW, const float normalOverW[3], const float tangent0OverW[3], const float tangent1OverW[3] );
 	unsigned int ShadeInteractionPixel( const swInteractionTri_t &tri, int x, int y, float invW, const float attrOverW[SW_INTERACTION_ATTR_COUNT] ) const;
 	float ShadowVisibility( int x, int y ) const;
 	void ApplyLightScale();
@@ -558,10 +571,11 @@ private:
 	static unsigned int ApplyWriteMask( unsigned int src, unsigned int dst, int writeMask );
 	static void SetupFloatPlane( float v0, float v1, float v2, float fx0, float fy0, float fx1, float fy1, float fx2, float fy2, float denom, float &base, float &dx, float &dy );
 	static unsigned int PackColor( int r, int g, int b, int a = 255 );
-	static int PackSnorm10( float value );
+	static ID_INLINE int PackSnorm10( float value );
 	static float UnpackSnorm10( unsigned int packed, int shift );
-	static unsigned int PackNormal10( const idVec3 &normal );
-	static unsigned int PackUV16( float s, float t );
+	static ID_INLINE unsigned int PackNormal10( const idVec3 &normal );
+	static ID_INLINE unsigned int PackNormal10( float x, float y, float z );
+	static ID_INLINE unsigned int PackUV16( float s, float t );
 	static unsigned int PackOptionalTextureId16( int textureIndex );
 	static unsigned int IdDebugColor( unsigned int value );
 	static unsigned int ModulateColor( unsigned int color, const float scale[4] );
@@ -2827,6 +2841,10 @@ void idSoftwareRasterizer::RasterizeDepthTriangleInTile( const swTriSetup_t &tri
 			rowTangent1OverW[i] = tri.tangent1OverW0[i] + tri.dTangent1OverWdx[i] * ( static_cast<float>( x0 ) + 0.5f ) + tri.dTangent1OverWdy[i] * ( static_cast<float>( y0 ) + 0.5f );
 		}
 	}
+	swHybridGBufferPointers_t gbuffer;
+	if ( tri.writeGBuffer ) {
+		gbuffer = GetHybridGBufferPointers();
+	}
 
 #if SW_AVX2_DEPTH_PATH
 	const bool useAVX2 = r_softwareDepthSIMD.GetBool() && !tri.writeWorldPosition && !tri.writeGBuffer;
@@ -2901,44 +2919,88 @@ void idSoftwareRasterizer::RasterizeDepthTriangleInTile( const swTriSetup_t &tri
 		}
 #endif
 
-		for ( ; x <= x1; x++ ) {
-			if ( ( e0 | e1 | e2 ) >= 0 && z < *depth ) {
-				*depth = z;
-				if ( tri.writeWorldPosition && invW != 0.0f ) {
-					const float invPerspective = 1.0f / invW;
-					worldPos->Set( globalOverW[0] * invPerspective, globalOverW[1] * invPerspective, globalOverW[2] * invPerspective, 1.0f );
-				}
-				if ( tri.writeGBuffer ) {
-					WriteHybridGBufferPixel( pixelIndex, tri, z, invW, sOverW, tOverW, normalOverW, tangent0OverW, tangent1OverW );
-				}
-			}
+		if ( x <= x1 ) {
+			const long long rowEndE0 = e0 + stepX0 * ( x1 - x );
+			const long long rowEndE1 = e1 + stepX1 * ( x1 - x );
+			const long long rowEndE2 = e2 + stepX2 * ( x1 - x );
+			if ( ( e0 | e1 | e2 | rowEndE0 | rowEndE1 | rowEndE2 ) >= 0 ) {
+				for ( ; x <= x1; x++ ) {
+					if ( z < *depth ) {
+						*depth = z;
+						if ( tri.writeWorldPosition && invW != 0.0f ) {
+							const float invPerspective = 1.0f / invW;
+							worldPos->Set( globalOverW[0] * invPerspective, globalOverW[1] * invPerspective, globalOverW[2] * invPerspective, 1.0f );
+						}
+						if ( tri.writeGBuffer ) {
+							WriteHybridGBufferPixel( gbuffer, pixelIndex, tri, z, invW, sOverW, tOverW, normalOverW, tangent0OverW, tangent1OverW );
+						}
+					}
 
-			e0 += stepX0;
-			e1 += stepX1;
-			e2 += stepX2;
-			z += tri.dzdx;
-			invW += tri.dinvWdx;
-			sOverW += tri.dsOverWdx;
-			tOverW += tri.dtOverWdx;
-			if ( tri.writeWorldPosition ) {
-				globalOverW[0] += tri.dGlobalOverWdx[0];
-				globalOverW[1] += tri.dGlobalOverWdx[1];
-				globalOverW[2] += tri.dGlobalOverWdx[2];
+					z += tri.dzdx;
+					invW += tri.dinvWdx;
+					sOverW += tri.dsOverWdx;
+					tOverW += tri.dtOverWdx;
+					if ( tri.writeWorldPosition ) {
+						globalOverW[0] += tri.dGlobalOverWdx[0];
+						globalOverW[1] += tri.dGlobalOverWdx[1];
+						globalOverW[2] += tri.dGlobalOverWdx[2];
+					}
+					if ( tri.writeGBuffer ) {
+						normalOverW[0] += tri.dNormalOverWdx[0];
+						normalOverW[1] += tri.dNormalOverWdx[1];
+						normalOverW[2] += tri.dNormalOverWdx[2];
+						tangent0OverW[0] += tri.dTangent0OverWdx[0];
+						tangent0OverW[1] += tri.dTangent0OverWdx[1];
+						tangent0OverW[2] += tri.dTangent0OverWdx[2];
+						tangent1OverW[0] += tri.dTangent1OverWdx[0];
+						tangent1OverW[1] += tri.dTangent1OverWdx[1];
+						tangent1OverW[2] += tri.dTangent1OverWdx[2];
+					}
+					depth++;
+					worldPos++;
+					pixelIndex++;
+				}
+			} else {
+				for ( ; x <= x1; x++ ) {
+					if ( ( e0 | e1 | e2 ) >= 0 && z < *depth ) {
+						*depth = z;
+						if ( tri.writeWorldPosition && invW != 0.0f ) {
+							const float invPerspective = 1.0f / invW;
+							worldPos->Set( globalOverW[0] * invPerspective, globalOverW[1] * invPerspective, globalOverW[2] * invPerspective, 1.0f );
+						}
+						if ( tri.writeGBuffer ) {
+							WriteHybridGBufferPixel( gbuffer, pixelIndex, tri, z, invW, sOverW, tOverW, normalOverW, tangent0OverW, tangent1OverW );
+						}
+					}
+
+					e0 += stepX0;
+					e1 += stepX1;
+					e2 += stepX2;
+					z += tri.dzdx;
+					invW += tri.dinvWdx;
+					sOverW += tri.dsOverWdx;
+					tOverW += tri.dtOverWdx;
+					if ( tri.writeWorldPosition ) {
+						globalOverW[0] += tri.dGlobalOverWdx[0];
+						globalOverW[1] += tri.dGlobalOverWdx[1];
+						globalOverW[2] += tri.dGlobalOverWdx[2];
+					}
+					if ( tri.writeGBuffer ) {
+						normalOverW[0] += tri.dNormalOverWdx[0];
+						normalOverW[1] += tri.dNormalOverWdx[1];
+						normalOverW[2] += tri.dNormalOverWdx[2];
+						tangent0OverW[0] += tri.dTangent0OverWdx[0];
+						tangent0OverW[1] += tri.dTangent0OverWdx[1];
+						tangent0OverW[2] += tri.dTangent0OverWdx[2];
+						tangent1OverW[0] += tri.dTangent1OverWdx[0];
+						tangent1OverW[1] += tri.dTangent1OverWdx[1];
+						tangent1OverW[2] += tri.dTangent1OverWdx[2];
+					}
+					depth++;
+					worldPos++;
+					pixelIndex++;
+				}
 			}
-			if ( tri.writeGBuffer ) {
-				normalOverW[0] += tri.dNormalOverWdx[0];
-				normalOverW[1] += tri.dNormalOverWdx[1];
-				normalOverW[2] += tri.dNormalOverWdx[2];
-				tangent0OverW[0] += tri.dTangent0OverWdx[0];
-				tangent0OverW[1] += tri.dTangent0OverWdx[1];
-				tangent0OverW[2] += tri.dTangent0OverWdx[2];
-				tangent1OverW[0] += tri.dTangent1OverWdx[0];
-				tangent1OverW[1] += tri.dTangent1OverWdx[1];
-				tangent1OverW[2] += tri.dTangent1OverWdx[2];
-			}
-			depth++;
-			worldPos++;
-			pixelIndex++;
 		}
 
 		rowE0 += stepY0;
@@ -3013,6 +3075,7 @@ void idSoftwareRasterizer::RasterizeAlphaTestDepthTriangleInTile( const swTriSet
 	const long long stepY0 = tri.B[0] * SW_FP_ONE;
 	const long long stepY1 = tri.B[1] * SW_FP_ONE;
 	const long long stepY2 = tri.B[2] * SW_FP_ONE;
+	swHybridGBufferPointers_t gbuffer = GetHybridGBufferPointers();
 
 	for ( int y = y0; y <= y1; y++ ) {
 		long long e0 = rowE0;
@@ -3069,7 +3132,7 @@ void idSoftwareRasterizer::RasterizeAlphaTestDepthTriangleInTile( const swTriSet
 					if ( tri.writeWorldPosition ) {
 						worldPos->Set( globalOverW[0] * invPerspective, globalOverW[1] * invPerspective, globalOverW[2] * invPerspective, 1.0f );
 					}
-					WriteHybridGBufferPixel( pixelIndex, tri, z, invW, sOverW, tOverW, normalOverW, tangent0OverW, tangent1OverW );
+					WriteHybridGBufferPixel( gbuffer, pixelIndex, tri, z, invW, sOverW, tOverW, normalOverW, tangent0OverW, tangent1OverW );
 				}
 			}
 
@@ -3344,43 +3407,56 @@ void idSoftwareRasterizer::RasterizeTriangleInTileSpecialized( const swTriSetup_
 	}
 }
 
-void idSoftwareRasterizer::WriteHybridGBufferPixel( int pixelIndex, const swTriSetup_t &tri, float z, float invW, float sOverW, float tOverW, const float normalOverW[3], const float tangent0OverW[3], const float tangent1OverW[3] ) {
-	if ( pixelIndex < 0 || pixelIndex >= hybridGBuffer.depth.Num() ) {
-		return;
-	}
+ID_INLINE swHybridGBufferPointers_t idSoftwareRasterizer::GetHybridGBufferPointers() {
+	swHybridGBufferPointers_t gbuffer;
+	gbuffer.depth = hybridGBuffer.depth.Ptr();
+	gbuffer.normalPacked = hybridGBuffer.normalPacked.Ptr();
+	gbuffer.tangentPacked = hybridGBuffer.tangentPacked.Ptr();
+	gbuffer.bitangentPacked = hybridGBuffer.bitangentPacked.Ptr();
+	gbuffer.uvPacked = hybridGBuffer.uvPacked.Ptr();
+	gbuffer.materialId = hybridGBuffer.materialId.Ptr();
+	gbuffer.albedoOrTextureId = hybridGBuffer.albedoOrTextureId.Ptr();
+	gbuffer.specularAndFlags = hybridGBuffer.specularAndFlags.Ptr();
+	gbuffer.surfaceId = hybridGBuffer.surfaceId.Ptr();
+	return gbuffer;
+}
 
+ID_INLINE void idSoftwareRasterizer::WriteHybridGBufferPixel( const swHybridGBufferPointers_t &gbuffer, int pixelIndex, const swTriSetup_t &tri, float z, float invW, float sOverW, float tOverW, const float normalOverW[3], const float tangent0OverW[3], const float tangent1OverW[3] ) {
 	float s = 0.0f;
 	float t = 0.0f;
-	idVec3 normal( 0.0f, 0.0f, 1.0f );
-	idVec3 tangent0( 1.0f, 0.0f, 0.0f );
-	idVec3 tangent1( 0.0f, 1.0f, 0.0f );
+	float normalX = 0.0f;
+	float normalY = 0.0f;
+	float normalZ = 1.0f;
+	float tangent0X = 1.0f;
+	float tangent0Y = 0.0f;
+	float tangent0Z = 0.0f;
+	float tangent1X = 0.0f;
+	float tangent1Y = 1.0f;
+	float tangent1Z = 0.0f;
 	if ( invW != 0.0f ) {
 		const float invPerspective = 1.0f / invW;
 		s = sOverW * invPerspective;
 		t = tOverW * invPerspective;
-		normal.Set( normalOverW[0] * invPerspective, normalOverW[1] * invPerspective, normalOverW[2] * invPerspective );
-		//if ( normal.Normalize() == 0.0f ) {
-		//	normal.Set( 0.0f, 0.0f, 1.0f );
-		//}
-		tangent0.Set( tangent0OverW[0] * invPerspective, tangent0OverW[1] * invPerspective, tangent0OverW[2] * invPerspective );
-		//if ( tangent0.Normalize() == 0.0f ) {
-		//	tangent0.Set( 1.0f, 0.0f, 0.0f );
-		//}
-		tangent1.Set( tangent1OverW[0] * invPerspective, tangent1OverW[1] * invPerspective, tangent1OverW[2] * invPerspective );
-		//if ( tangent1.Normalize() == 0.0f ) {
-		//	tangent1.Set( 0.0f, 1.0f, 0.0f );
-		//}
+		normalX = normalOverW[0] * invPerspective;
+		normalY = normalOverW[1] * invPerspective;
+		normalZ = normalOverW[2] * invPerspective;
+		tangent0X = tangent0OverW[0] * invPerspective;
+		tangent0Y = tangent0OverW[1] * invPerspective;
+		tangent0Z = tangent0OverW[2] * invPerspective;
+		tangent1X = tangent1OverW[0] * invPerspective;
+		tangent1Y = tangent1OverW[1] * invPerspective;
+		tangent1Z = tangent1OverW[2] * invPerspective;
 	}
 
-	hybridGBuffer.depth[pixelIndex] = z;
-	hybridGBuffer.normalPacked[pixelIndex] = PackNormal10( normal );
-	hybridGBuffer.tangentPacked[pixelIndex] = PackNormal10( tangent0 );
-	hybridGBuffer.bitangentPacked[pixelIndex] = PackNormal10( tangent1 );
-	hybridGBuffer.uvPacked[pixelIndex] = PackUV16( s, t );
-	hybridGBuffer.materialId[pixelIndex] = tri.materialId;
-	hybridGBuffer.albedoOrTextureId[pixelIndex] = tri.albedoOrTextureId;
-	hybridGBuffer.specularAndFlags[pixelIndex] = tri.specularAndFlags;
-	hybridGBuffer.surfaceId[pixelIndex] = tri.surfaceId;
+	gbuffer.depth[pixelIndex] = z;
+	gbuffer.normalPacked[pixelIndex] = PackNormal10( normalX, normalY, normalZ );
+	gbuffer.tangentPacked[pixelIndex] = PackNormal10( tangent0X, tangent0Y, tangent0Z );
+	gbuffer.bitangentPacked[pixelIndex] = PackNormal10( tangent1X, tangent1Y, tangent1Z );
+	gbuffer.uvPacked[pixelIndex] = PackUV16( s, t );
+	gbuffer.materialId[pixelIndex] = tri.materialId;
+	gbuffer.albedoOrTextureId[pixelIndex] = tri.albedoOrTextureId;
+	gbuffer.specularAndFlags[pixelIndex] = tri.specularAndFlags;
+	gbuffer.surfaceId[pixelIndex] = tri.surfaceId;
 }
 
 void idSoftwareRasterizer::RasterizeInteractionTriangleInTile( const swInteractionTri_t &tri, int tileX, int tileY ) {
@@ -4635,7 +4711,7 @@ unsigned int idSoftwareRasterizer::PackColor( int r, int g, int b, int a ) {
 	return ( static_cast<unsigned int>( a ) << 24 ) | ( static_cast<unsigned int>( r ) << 16 ) | ( static_cast<unsigned int>( g ) << 8 ) | static_cast<unsigned int>( b );
 }
 
-int idSoftwareRasterizer::PackSnorm10( float value ) {
+ID_INLINE int idSoftwareRasterizer::PackSnorm10( float value ) {
 	const float clamped = idMath::ClampFloat( -1.0f, 1.0f, value );
 	const int quantized = Max( -511, Min( 511, idMath::FtoiFast( clamped * 511.0f ) ) );
 	return quantized & 1023;
@@ -4649,15 +4725,25 @@ float idSoftwareRasterizer::UnpackSnorm10( unsigned int packed, int shift ) {
 	return idMath::ClampFloat( -1.0f, 1.0f, static_cast<float>( value ) * ( 1.0f / 511.0f ) );
 }
 
-unsigned int idSoftwareRasterizer::PackNormal10( const idVec3 &normal ) {
-	return static_cast<unsigned int>( PackSnorm10( normal[0] ) ) |
-		( static_cast<unsigned int>( PackSnorm10( normal[1] ) ) << 10 ) |
-		( static_cast<unsigned int>( PackSnorm10( normal[2] ) ) << 20 );
+ID_INLINE unsigned int idSoftwareRasterizer::PackNormal10( const idVec3 &normal ) {
+	return PackNormal10( normal[0], normal[1], normal[2] );
 }
 
-unsigned int idSoftwareRasterizer::PackUV16( float s, float t ) {
-	const float wrappedS = WrapTextureCoordinate( s, TR_REPEAT );
-	const float wrappedT = WrapTextureCoordinate( t, TR_REPEAT );
+ID_INLINE unsigned int idSoftwareRasterizer::PackNormal10( float x, float y, float z ) {
+	return static_cast<unsigned int>( PackSnorm10( x ) ) |
+		( static_cast<unsigned int>( PackSnorm10( y ) ) << 10 ) |
+		( static_cast<unsigned int>( PackSnorm10( z ) ) << 20 );
+}
+
+ID_INLINE unsigned int idSoftwareRasterizer::PackUV16( float s, float t ) {
+	float wrappedS = s - idMath::Floor( s );
+	if ( wrappedS < 0.0f ) {
+		wrappedS += 1.0f;
+	}
+	float wrappedT = t - idMath::Floor( t );
+	if ( wrappedT < 0.0f ) {
+		wrappedT += 1.0f;
+	}
 	const unsigned int us = static_cast<unsigned int>( Max( 0, Min( 65535, idMath::FtoiFast( wrappedS * 65535.0f ) ) ) );
 	const unsigned int vt = static_cast<unsigned int>( Max( 0, Min( 65535, idMath::FtoiFast( wrappedT * 65535.0f ) ) ) );
 	return us | ( vt << 16 );
