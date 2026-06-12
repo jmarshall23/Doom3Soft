@@ -561,20 +561,21 @@ will be used instead.
 ====================
 */
 typedef struct vidmode_s {
-    const char *description;
-    int         width, height;
+	const char* description;
+	int         width, height;
 } vidmode_t;
 
 vidmode_t r_vidModes[] = {
-    { "Mode  0: 320x240",		320,	240 },
-    { "Mode  1: 400x300",		400,	300 },
-    { "Mode  2: 512x384",		512,	384 },
-    { "Mode  3: 640x480",		640,	480 },
-    { "Mode  4: 800x600",		800,	600 },
-    { "Mode  5: 1024x768",		1024,	768 },
-    { "Mode  6: 1152x864",		1152,	864 },
-    { "Mode  7: 1280x1024",		1280,	1024 },
-    { "Mode  8: 1600x1200",		1600,	1200 },
+	{ "Mode  0: 320x180",       320,    180 },
+	{ "Mode  1: 400x225",       400,    225 },
+	{ "Mode  2: 512x288",       512,    288 },
+	{ "Mode  3: 640x360",       640,    360 },
+	{ "Mode  4: 800x450",       800,    450 },
+	{ "Mode  5: 1024x576",      1024,   576 },
+	{ "Mode  6: 1152x648",      1152,   648 },
+	{ "Mode  7: 1280x720",      1280,   720 },
+	{ "Mode  8: 1600x900",      1600,   900 },
+	{ "Mode  8: 1920x1080",     1920,   1080 },
 };
 static int	s_numVidModes = ( sizeof( r_vidModes ) / sizeof( r_vidModes[0] ) );
 
@@ -589,7 +590,7 @@ static bool R_GetModeInfo( int *width, int *height, int mode ) {
         return false;
 	}
 	if ( mode >= s_numVidModes ) {
-		return false;
+		mode = 7;
 	}
 
 	if ( mode == -1 ) {

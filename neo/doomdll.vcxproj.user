@@ -40,8 +40,8 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LocalDebuggerCommand>D:\projects\Doom3Soft\Doom3.exe</LocalDebuggerCommand>
     <DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor>
-    <LocalDebuggerCommandArguments>+set r_fullscreen 0 +set r_mode 6</LocalDebuggerCommandArguments>
+    <LocalDebuggerCommandArguments>+set r_fullscreen 0 +set r_mode 9</LocalDebuggerCommandArguments>
     <LocalDebuggerWorkingDirectory>D:\projects\Doom3Soft\</LocalDebuggerWorkingDirectory>
-    <LocalDebuggerCommandArgumentsHistory>+set r_fullscreen 0 +set r_mode 6|</LocalDebuggerCommandArgumentsHistory>
+    <LocalDebuggerCommandArgumentsHistory>+set r_fullscreen 0 +set r_mode 6|+set r_fullscreen 0 +set r_mode 7|+set r_fullscreen 0 +set r_mode 9|</LocalDebuggerCommandArgumentsHistory>
   </PropertyGroup>
 </Project>
