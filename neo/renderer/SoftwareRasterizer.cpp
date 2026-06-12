@@ -2287,7 +2287,11 @@ void idSoftwareRasterizer::DrawLights( const viewDef_t *viewDef ) {
 			perf.lightCount++;
 		}
 
-		const bool wantsRayQueryShadow = rayQueryShadows && !vLight->lightShader->IsAmbientLight();
+		const bool wantsRayQueryShadow = rayQueryShadows &&
+			vLight->lightDef &&
+			!vLight->lightDef->parms.noShadows &&
+			!vLight->lightShader->IsAmbientLight() &&
+			vLight->lightShader->LightCastsShadows();
 		const bool shadowMaskPending = wantsRayQueryShadow &&
 			SWVulkan_BeginLightShadowMask( vLight, worldPositionBuffer.Ptr(), width, height );
 

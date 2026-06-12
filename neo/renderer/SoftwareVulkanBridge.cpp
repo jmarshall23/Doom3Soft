@@ -676,6 +676,9 @@ private:
 	void RecordHybridFrameTransferBarrier();
 	void ReadTimestampQueries();
 	void WriteTimestamp( VkPipelineStageFlagBits stage, swVkGpuTimestampQuery_t query );
+	bool RayQuerySurfaceCanCastShadow( const srfTriangles_t *geo, const idMaterial *material, const viewEntity_t *space ) const;
+	bool RayQuerySurfaceTouchesShadowLight( const viewDef_t *viewDef, const srfTriangles_t *geo, const idMaterial *material, const viewEntity_t *space ) const;
+	bool AddRayQuerySurfaceInstance( idList<swVkRayInstance_t> &instances, srfTriangles_t *geo, const float modelMatrix[16], idRenderEntityLocal *entity );
 
 	bool DeviceHasExtension( VkPhysicalDevice device, const char *name ) const;
 	bool QueryRayQuerySupport( VkPhysicalDevice device ) const;
@@ -3427,6 +3430,142 @@ swVkEntityTlas_t *idSoftwareVulkanBridge::EnsureEntityTlas( idRenderEntityLocal 
 	return entry;
 }
 
+bool idSoftwareVulkanBridge::RayQuerySurfaceCanCastShadow( const srfTriangles_t *geo, const idMaterial *material, const viewEntity_t *space ) const {
+	if ( !geo || !geo->verts || !geo->indexes || geo->numVerts <= 0 || geo->numIndexes < 3 || !geo->rayQueryPersistent || !material ) {
+		return false;
+	}
+
+	const idRenderEntityLocal *entity = space ? space->entityDef : NULL;
+	if ( entity && ( entity->parms.noShadow || entity->parms.weaponDepthHack ) ) {
+		return false;
+	}
+
+	const bool dynamicEntity = entity && entity->parms.hModel && entity->parms.hModel->IsDynamicModel() != DM_STATIC;
+	const materialCoverage_t coverage = material->Coverage();
+	if ( !material->IsDrawn() || !material->SurfaceCastsShadow() || coverage == MC_TRANSLUCENT ) {
+		return false;
+	}
+	if ( coverage == MC_PERFORATED && !dynamicEntity ) {
+		return false;
+	}
+
+	const float sort = material->GetSort();
+	if ( sort < SS_OPAQUE || sort == SS_PORTAL_SKY || sort >= SS_POST_PROCESS ) {
+		return false;
+	}
+	return true;
+}
+
+bool idSoftwareVulkanBridge::RayQuerySurfaceTouchesShadowLight( const viewDef_t *viewDef, const srfTriangles_t *geo, const idMaterial *material, const viewEntity_t *space ) const {
+	if ( !viewDef || !geo || !material || !space ) {
+		return false;
+	}
+
+	idRenderEntityLocal *entity = space->entityDef;
+	for ( const viewLight_t *vLight = viewDef->viewLights; vLight; vLight = vLight->next ) {
+		if ( !vLight->lightDef || !vLight->lightShader ) {
+			continue;
+		}
+		if ( vLight->lightDef->parms.noShadows || vLight->lightShader->IsFogLight() || vLight->lightShader->IsBlendLight() ||
+				vLight->lightShader->IsAmbientLight() || !vLight->lightShader->LightCastsShadows() ) {
+			continue;
+		}
+		if ( material->Spectrum() != vLight->lightShader->Spectrum() ) {
+			continue;
+		}
+		if ( !vLight->localInteractions && !vLight->globalInteractions && !vLight->translucentInteractions ) {
+			continue;
+		}
+
+		if ( entity ) {
+			bool activeInteraction = false;
+			for ( idInteraction *inter = entity->firstInteraction; inter != NULL && !inter->IsEmpty(); inter = inter->entityNext ) {
+				if ( inter->lightDef == vLight->lightDef ) {
+					activeInteraction = true;
+					break;
+				}
+			}
+			if ( !activeInteraction ) {
+				continue;
+			}
+		}
+
+		if ( !R_CullLocalBox( geo->bounds, space->modelMatrix, 6, vLight->lightDef->frustum ) ) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool idSoftwareVulkanBridge::AddRayQuerySurfaceInstance( idList<swVkRayInstance_t> &instances, srfTriangles_t *geo, const float modelMatrix[16], idRenderEntityLocal *entity ) {
+	if ( !geo ) {
+		return false;
+	}
+
+	swVkSurfaceBlas_t *cachedBlas = static_cast<swVkSurfaceBlas_t *>( geo->rayQueryBlas );
+	if ( cachedBlas && cachedBlas->owner != geo ) {
+		cachedBlas = NULL;
+		geo->rayQueryBlas = NULL;
+		geo->rayQueryBlasDirty = true;
+	}
+
+	const bool needsBlasBuild = !cachedBlas ||
+		geo->rayQueryBlasDirty ||
+		cachedBlas->verts != geo->verts ||
+		cachedBlas->indexes != geo->indexes ||
+		cachedBlas->vertCount != geo->numVerts ||
+		cachedBlas->indexCount != geo->numIndexes ||
+		cachedBlas->geometryGeneration != geo->rayQueryGeometryGeneration ||
+		cachedBlas->blas == VK_NULL_HANDLE ||
+		cachedBlas->blasAddress == 0;
+	if ( needsBlasBuild ) {
+		if ( cachedBlas ) {
+			WaitForSubmittedWork();
+			DestroyRayQueryTlas();
+			if ( !BuildSurfaceBlas( *cachedBlas, geo ) ) {
+				return false;
+			}
+		} else {
+			cachedBlas = new swVkSurfaceBlas_t;
+			if ( !BuildSurfaceBlas( *cachedBlas, geo ) ) {
+				delete cachedBlas;
+				return false;
+			}
+			rayAttachedBlas.Append( cachedBlas );
+		}
+		geo->rayQueryBlas = cachedBlas;
+		geo->rayQueryBlasDirty = false;
+	}
+
+	swVkRayInstance_t instance;
+	instance.blasAddress = cachedBlas->blasAddress;
+	memcpy( instance.modelMatrix, modelMatrix, sizeof( instance.modelMatrix ) );
+	instances.Append( instance );
+
+	swVkEntityTlas_t *entityTlas = EnsureEntityTlas( entity );
+	if ( entityTlas ) {
+		if ( entityTlas->frame != rayQuerySceneFrame ) {
+			entityTlas->instances.Clear();
+			entityTlas->signature = 1469598103934665603ULL;
+			entityTlas->signature = SWVkHashU64( entityTlas->signature, reinterpret_cast<uintptr_t>( entity ) );
+			entityTlas->instanceCount = 0;
+			entityTlas->frame = rayQuerySceneFrame;
+		}
+		entityTlas->instances.Append( instance );
+		entityTlas->signature = SWVkHashU64( entityTlas->signature, instance.blasAddress );
+		for ( int matrixIndex = 0; matrixIndex < 16; matrixIndex++ ) {
+			uint32_t bits;
+			memcpy( &bits, &instance.modelMatrix[matrixIndex], sizeof( bits ) );
+			entityTlas->signature = SWVkHashU32( entityTlas->signature, bits );
+		}
+		entityTlas->instanceCount = entityTlas->instances.Num();
+		entity->rayQueryTlasSignature = entityTlas->signature;
+		entity->rayQueryTlasInstanceCount = entityTlas->instanceCount;
+		entity->rayQueryTlasFrame = rayQuerySceneFrame;
+	}
+	return true;
+}
+
 void idSoftwareVulkanBridge::DestroyRayQueryBlasHandle( void *blas ) {
 	if ( !blas ) {
 		return;
@@ -4960,102 +5099,50 @@ bool idSoftwareVulkanBridge::PrepareRayQueryScene( const viewDef_t *viewDef ) {
 
 	rayQuerySceneFrame++;
 	idList<swVkRayInstance_t> instances;
-	instances.SetNum( viewDef->numDrawSurfs, false );
-	int instanceCount = 0;
+	const int instanceGranularity = viewDef->numDrawSurfs > 16 ? viewDef->numDrawSurfs : 16;
+	instances.SetGranularity( instanceGranularity );
 
-	for ( int i = 0; i < viewDef->numDrawSurfs; i++ ) {
-		const drawSurf_t *surf = viewDef->drawSurfs[i];
-		if ( !surf || !surf->geo || !surf->space || !surf->material ) {
-			continue;
-		}
-		const bool dynamicEntity = surf->space->entityDef && surf->space->entityDef->parms.hModel &&
-			surf->space->entityDef->parms.hModel->IsDynamicModel() != DM_STATIC;
-		const materialCoverage_t coverage = surf->material->Coverage();
-		if ( !surf->material->IsDrawn() || !surf->material->SurfaceCastsShadow() || coverage == MC_TRANSLUCENT ) {
-			continue;
-		}
-		if ( coverage == MC_PERFORATED && !dynamicEntity ) {
-			continue;
-		}
-		const float sort = surf->material->GetSort();
-		if ( sort < SS_OPAQUE || sort == SS_PORTAL_SKY || sort >= SS_POST_PROCESS ) {
-			continue;
-		}
-		if ( surf->space->entityDef && ( surf->space->entityDef->parms.noShadow || surf->space->entityDef->parms.weaponDepthHack ) ) {
+	for ( const viewEntity_t *vEntity = viewDef->viewEntitys; vEntity; vEntity = vEntity->next ) {
+		idRenderEntityLocal *def = vEntity->entityDef;
+		if ( !def || !def->parms.hModel ) {
 			continue;
 		}
 
-		srfTriangles_t *geo = const_cast<srfTriangles_t *>( surf->geo );
-		if ( !geo->verts || !geo->indexes || geo->numVerts <= 0 || geo->numIndexes < 3 ) {
+		idRenderModel *model = def->dynamicModel ? def->dynamicModel : def->parms.hModel;
+		if ( !model || model->NumSurfaces() <= 0 ) {
 			continue;
 		}
-		if ( !geo->rayQueryPersistent ) {
+		if ( !def->dynamicModel && model->IsDynamicModel() != DM_STATIC ) {
 			continue;
 		}
 
-		swVkSurfaceBlas_t *cachedBlas = static_cast<swVkSurfaceBlas_t *>( geo->rayQueryBlas );
-		if ( cachedBlas && cachedBlas->owner != geo ) {
-			cachedBlas = NULL;
-			geo->rayQueryBlas = NULL;
-			geo->rayQueryBlasDirty = true;
-		}
-
-		const bool needsBlasBuild = !cachedBlas ||
-			geo->rayQueryBlasDirty ||
-			cachedBlas->verts != geo->verts ||
-			cachedBlas->indexes != geo->indexes ||
-			cachedBlas->vertCount != geo->numVerts ||
-			cachedBlas->indexCount != geo->numIndexes ||
-			cachedBlas->geometryGeneration != geo->rayQueryGeometryGeneration ||
-			cachedBlas->blas == VK_NULL_HANDLE ||
-			cachedBlas->blasAddress == 0;
-		if ( needsBlasBuild ) {
-			if ( cachedBlas ) {
-				WaitForSubmittedWork();
-				DestroyRayQueryTlas();
-				if ( !BuildSurfaceBlas( *cachedBlas, geo ) ) {
-					continue;
-				}
-			} else {
-				cachedBlas = new swVkSurfaceBlas_t;
-				if ( !BuildSurfaceBlas( *cachedBlas, geo ) ) {
-					delete cachedBlas;
-					continue;
-				}
-				rayAttachedBlas.Append( cachedBlas );
+		for ( int surfaceIndex = 0; surfaceIndex < model->NumSurfaces(); surfaceIndex++ ) {
+			const modelSurface_t *surface = model->Surface( surfaceIndex );
+			if ( !surface || !surface->geometry ) {
+				continue;
 			}
-			geo->rayQueryBlas = cachedBlas;
-			geo->rayQueryBlasDirty = false;
-		}
 
-		swVkRayInstance_t &instance = instances[instanceCount++];
-		instance.blasAddress = cachedBlas->blasAddress;
-		memcpy( instance.modelMatrix, surf->space->modelMatrix, sizeof( instance.modelMatrix ) );
+			const idMaterial *material = surface->shader;
+			material = R_RemapShaderBySkin( material, def->parms.customSkin, def->parms.customShader );
+			if ( !material ) {
+				continue;
+			}
+			R_GlobalShaderOverride( &material );
+			if ( !material ) {
+				continue;
+			}
 
-		idRenderEntityLocal *entity = surf->space->entityDef;
-		swVkEntityTlas_t *entityTlas = EnsureEntityTlas( entity );
-		if ( entityTlas ) {
-			if ( entityTlas->frame != rayQuerySceneFrame ) {
-				entityTlas->instances.Clear();
-				entityTlas->signature = 1469598103934665603ULL;
-				entityTlas->signature = SWVkHashU64( entityTlas->signature, reinterpret_cast<uintptr_t>( entity ) );
-				entityTlas->instanceCount = 0;
-				entityTlas->frame = rayQuerySceneFrame;
+			srfTriangles_t *geo = surface->geometry;
+			if ( !RayQuerySurfaceCanCastShadow( geo, material, vEntity ) ) {
+				continue;
 			}
-			entityTlas->instances.Append( instance );
-			entityTlas->signature = SWVkHashU64( entityTlas->signature, instance.blasAddress );
-			for ( int matrixIndex = 0; matrixIndex < 16; matrixIndex++ ) {
-				uint32_t bits;
-				memcpy( &bits, &instance.modelMatrix[matrixIndex], sizeof( bits ) );
-				entityTlas->signature = SWVkHashU32( entityTlas->signature, bits );
+			if ( !RayQuerySurfaceTouchesShadowLight( viewDef, geo, material, vEntity ) ) {
+				continue;
 			}
-			entityTlas->instanceCount = entityTlas->instances.Num();
-			entity->rayQueryTlasSignature = entityTlas->signature;
-			entity->rayQueryTlasInstanceCount = entityTlas->instanceCount;
-			entity->rayQueryTlasFrame = rayQuerySceneFrame;
+
+			AddRayQuerySurfaceInstance( instances, geo, vEntity->modelMatrix, def );
 		}
 	}
-	instances.SetNum( instanceCount, false );
 
 	if ( instances.Num() <= 0 ) {
 		WaitForSubmittedWork();
