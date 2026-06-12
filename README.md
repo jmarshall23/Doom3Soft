@@ -1,11 +1,10 @@
 # Doom3Software Rasterizer
 
-A CPU-based software rasterizer experiment for Doom 3.
+A Software renderer for Doom 3 with optional compute based acceleration with optional raytraced shadows via vulkan headless raytracing extensions.
 
-![Doom3Software Rasterizer](https://i.ibb.co/mC0wbV9Z/image.webp)
+![Doom3Software Rasterizer](https://i.ibb.co/NdgRrVXn/image-1.webp)
 
 ## Status
 
-This project currently runs the rasterizer on the CPU and includes lighting and bumpmapping support.
+Fully works. Being worked on as my test bed for next generation pipeline rendering research. 
 
-Shadows are not implemented yet.
