@@ -30,6 +30,7 @@ If you have questions concerning this license or the applicable additional terms
 #pragma hdrstop
 
 #include "tr_local.h"
+#include "SoftwareVulkanBridge.h"
 
 /*
 ==============================================================================
@@ -376,6 +377,11 @@ void R_ReallyFreeStaticTriSurf( srfTriangles_t *tri ) {
 		return;
 	}
 
+	if ( tri->rayQueryBlas ) {
+		SWVulkan_DestroyRayQueryBlas( tri->rayQueryBlas );
+		tri->rayQueryBlas = NULL;
+	}
+
 	R_FreeStaticTriSurfVertexCaches( tri );
 
 	if ( tri->verts != NULL ) {
@@ -422,6 +428,22 @@ void R_ReallyFreeStaticTriSurf( srfTriangles_t *tri ) {
 #endif
 
 	srfTrianglesAllocator.Free( tri );
+}
+
+/*
+=================
+R_BumpTriSurfRayQueryGeneration
+=================
+*/
+void R_BumpTriSurfRayQueryGeneration( srfTriangles_t *tri ) {
+	if ( !tri ) {
+		return;
+	}
+	tri->rayQueryGeometryGeneration++;
+	if ( tri->rayQueryGeometryGeneration == 0 ) {
+		tri->rayQueryGeometryGeneration = 1;
+	}
+	tri->rayQueryBlasDirty = true;
 }
 
 /*
@@ -523,6 +545,7 @@ R_AllocStaticTriSurf
 srfTriangles_t *R_AllocStaticTriSurf( void ) {
 	srfTriangles_t *tris = srfTrianglesAllocator.Alloc();
 	memset( tris, 0, sizeof( srfTriangles_t ) );
+	tris->rayQueryPersistent = true;
 	return tris;
 }
 
@@ -2271,4 +2294,3 @@ int R_DeformInfoMemoryUsed( deformInfo_t *deformInfo ) {
 	total += sizeof( *deformInfo );
 	return total;
 }
-

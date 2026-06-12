@@ -264,6 +264,10 @@ public:
 	int						dynamicModelFrameCount;	// continuously animating dynamic models will recreate
 													// dynamicModel if this doesn't == tr.viewCount
 	idRenderModel *			cachedDynamicModel;
+	void *					rayQueryTlas;			// opaque software Vulkan per-entity ray-query instance cache
+	unsigned long long		rayQueryTlasSignature;
+	int						rayQueryTlasInstanceCount;
+	int						rayQueryTlasFrame;
 
 	idBounds				referenceBounds;		// the local bounds used to place entityRefs, either from parms or a model
 
@@ -1497,6 +1501,7 @@ void				R_ReferenceStaticTriSurfIndexes( srfTriangles_t *tri, const srfTriangles
 void				R_FreeStaticTriSurfSilIndexes( srfTriangles_t *tri );
 void				R_FreeStaticTriSurf( srfTriangles_t *tri );
 void				R_FreeStaticTriSurfVertexCaches( srfTriangles_t *tri );
+void				R_BumpTriSurfRayQueryGeneration( srfTriangles_t *tri );
 void				R_ReallyFreeStaticTriSurf( srfTriangles_t *tri );
 void				R_FreeDeferredTriSurfs( frameData_t *frame );
 int					R_TriSurfMemory( const srfTriangles_t *tri );

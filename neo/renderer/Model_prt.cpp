@@ -236,6 +236,7 @@ idRenderModel *idRenderModelPrt::InstantiateDynamicModel( const struct renderEnt
 		surf->geometry->numVerts = numVerts;
 		surf->geometry->numIndexes = numIndexes;
 		surf->geometry->bounds = stage->bounds;		// just always draw the particles
+		R_BumpTriSurfRayQueryGeneration( surf->geometry );
 	}
 
 	return staticModel;

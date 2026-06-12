@@ -107,6 +107,7 @@ modelSurface_t idRenderModelLiquid::GenerateSurface( float lerp ) {
 	}
 
 	R_BoundTriSurf( tri );
+	R_BumpTriSurfRayQueryGeneration( tri );
 
 	// If a surface is going to be have a lighting interaction generated, it will also have to call
 	// R_DeriveTangents() to get normals, tangents, and face planes.  If it only

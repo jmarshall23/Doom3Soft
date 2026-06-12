@@ -30,6 +30,7 @@ If you have questions concerning this license or the applicable additional terms
 #pragma hdrstop
 
 #include "tr_local.h"
+#include "SoftwareVulkanBridge.h"
 
 /*
 ===================
@@ -323,6 +324,10 @@ void idRenderWorldLocal::FreeEntityDef( qhandle_t entityHandle ) {
 	def->parms.gui[ 0 ] = NULL;
 	def->parms.gui[ 1 ] = NULL;
 	def->parms.gui[ 2 ] = NULL;
+
+	if ( def->rayQueryTlas ) {
+		SWVulkan_DestroyRayQueryEntity( def->rayQueryTlas );
+	}
 
 	delete def;
 	entityDefs[ entityHandle ] = NULL;

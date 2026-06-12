@@ -56,28 +56,28 @@ struct swVkShadowVertex_t {
 	float pad;
 };
 
-struct swVkCachedBlas_t {
-	swVkCachedBlas_t() {
+struct swVkSurfaceBlas_t {
+	swVkSurfaceBlas_t() {
+		owner = NULL;
 		key = NULL;
 		verts = NULL;
 		indexes = NULL;
 		vertCount = 0;
 		indexCount = 0;
 		primitiveCount = 0;
-		sourceFrame = 0;
-		lastUsedFrame = 0;
+		geometryGeneration = 0;
 		blas = VK_NULL_HANDLE;
 		blasAddress = 0;
 	}
 
+	srfTriangles_t *owner;
 	const srfTriangles_t *key;
 	const idDrawVert *verts;
 	const glIndex_t *indexes;
 	int vertCount;
 	int indexCount;
 	uint32_t primitiveCount;
-	int sourceFrame;
-	int lastUsedFrame;
+	unsigned int geometryGeneration;
 	swVkBuffer_t vertexBuffer;
 	swVkBuffer_t indexBuffer;
 	swVkBuffer_t blasBuffer;
@@ -88,6 +88,21 @@ struct swVkCachedBlas_t {
 struct swVkRayInstance_t {
 	VkDeviceAddress blasAddress;
 	float modelMatrix[16];
+};
+
+struct swVkEntityTlas_t {
+	swVkEntityTlas_t() {
+		owner = NULL;
+		signature = 0;
+		instanceCount = 0;
+		frame = 0;
+	}
+
+	idRenderEntityLocal *owner;
+	idList<swVkRayInstance_t> instances;
+	uint64_t signature;
+	int instanceCount;
+	int frame;
 };
 
 struct swVkShadowPushConstants_t {
@@ -242,6 +257,8 @@ public:
 	bool BeginLightShadowMask( const viewLight_t *vLight, const idVec4 *worldPositions, int width, int height );
 	bool FinishLightShadowMask( const viewLight_t *vLight, int width, int height, unsigned char *shadowMask );
 	bool TraceLightShadowMask( const viewLight_t *vLight, const idVec4 *worldPositions, int width, int height, unsigned char *shadowMask );
+	void DestroyRayQueryBlasHandle( void *blas );
+	void DestroyRayQueryEntityHandle( void *entityTlas );
 	void Shutdown();
 
 private:
@@ -271,10 +288,11 @@ private:
 	VkDeviceAddress GetBufferAddress( VkBuffer buffer ) const;
 	bool ImmediateSubmit( const VkCommandBufferBeginInfo &beginInfo );
 	void WaitForSubmittedWork();
-	bool BuildCachedBlas( swVkCachedBlas_t &entry, const srfTriangles_t *geo, int sourceFrame );
-	bool EnsureCachedBlas( const srfTriangles_t *geo, int sourceFrame, int frameIndex, swVkCachedBlas_t *&entry );
+	bool BuildSurfaceBlas( swVkSurfaceBlas_t &entry, srfTriangles_t *geo );
+	swVkEntityTlas_t *EnsureEntityTlas( idRenderEntityLocal *entity );
 	bool BuildRayQueryTlas( const idList<swVkRayInstance_t> &instances );
-	void DestroyCachedBlas( swVkCachedBlas_t &entry );
+	void DestroySurfaceBlas( swVkSurfaceBlas_t &entry );
+	void DestroySurfaceBlasList( idList<swVkSurfaceBlas_t *> &list );
 	void DestroyRayQueryTlas();
 	void DestroyRayQueryScene();
 	void Destroy2DPipeline();
@@ -402,7 +420,8 @@ private:
 	swVkBuffer_t worldPositionBuffer;
 	swVkBuffer_t shadowMaskBuffer;
 	swVkShadowJob_t shadowJobs[SW_VK_MAX_SHADOW_JOBS];
-	idList<swVkCachedBlas_t> rayBlasCache;
+	idList<swVkSurfaceBlas_t *> rayAttachedBlas;
+	idList<swVkEntityTlas_t *> rayEntityTlasCache;
 
 	VkDescriptorSetLayout twoDDescriptorSetLayout;
 	VkDescriptorPool twoDDescriptorPool;
@@ -2144,7 +2163,10 @@ bool idSoftwareVulkanBridge::EnsureFrameBuffer() {
 	return true;
 }
 
-void idSoftwareVulkanBridge::DestroyCachedBlas( swVkCachedBlas_t &entry ) {
+void idSoftwareVulkanBridge::DestroySurfaceBlas( swVkSurfaceBlas_t &entry ) {
+	if ( entry.owner && entry.owner->rayQueryBlas == &entry ) {
+		entry.owner->rayQueryBlas = NULL;
+	}
 	if ( entry.blas != VK_NULL_HANDLE ) {
 		vkDestroyAccelerationStructureKHRLocal( device, entry.blas, NULL );
 		entry.blas = VK_NULL_HANDLE;
@@ -2152,18 +2174,18 @@ void idSoftwareVulkanBridge::DestroyCachedBlas( swVkCachedBlas_t &entry ) {
 	DestroyBuffer( entry.blasBuffer );
 	DestroyBuffer( entry.indexBuffer );
 	DestroyBuffer( entry.vertexBuffer );
+	entry.owner = NULL;
 	entry.key = NULL;
 	entry.verts = NULL;
 	entry.indexes = NULL;
 	entry.vertCount = 0;
 	entry.indexCount = 0;
 	entry.primitiveCount = 0;
-	entry.sourceFrame = 0;
-	entry.lastUsedFrame = 0;
+	entry.geometryGeneration = 0;
 	entry.blasAddress = 0;
 }
 
-bool idSoftwareVulkanBridge::BuildCachedBlas( swVkCachedBlas_t &entry, const srfTriangles_t *geo, int sourceFrame ) {
+bool idSoftwareVulkanBridge::BuildSurfaceBlas( swVkSurfaceBlas_t &entry, srfTriangles_t *geo ) {
 	if ( !rayQuerySupported || !geo || !geo->verts || !geo->indexes || geo->numVerts <= 0 || geo->numIndexes < 3 ) {
 		return false;
 	}
@@ -2210,12 +2232,12 @@ bool idSoftwareVulkanBridge::BuildCachedBlas( swVkCachedBlas_t &entry, const srf
 			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
 			true,
 			entry.indexBuffer ) ) {
-		DestroyCachedBlas( entry );
+		DestroySurfaceBlas( entry );
 		return false;
 	}
-	if ( !UploadBuffer( entry.vertexBuffer, vertices.Ptr(), vertexSize, "vkMapMemory cached BLAS vertices failed" ) ||
-		 !UploadBuffer( entry.indexBuffer, indexes.Ptr(), indexSize, "vkMapMemory cached BLAS indexes failed" ) ) {
-		DestroyCachedBlas( entry );
+	if ( !UploadBuffer( entry.vertexBuffer, vertices.Ptr(), vertexSize, "vkMapMemory surface BLAS vertices failed" ) ||
+		 !UploadBuffer( entry.indexBuffer, indexes.Ptr(), indexSize, "vkMapMemory surface BLAS indexes failed" ) ) {
+		DestroySurfaceBlas( entry );
 		return false;
 	}
 
@@ -2256,7 +2278,7 @@ bool idSoftwareVulkanBridge::BuildCachedBlas( swVkCachedBlas_t &entry, const srf
 			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 			true,
 			entry.blasBuffer ) ) {
-		DestroyCachedBlas( entry );
+		DestroySurfaceBlas( entry );
 		return false;
 	}
 
@@ -2267,8 +2289,8 @@ bool idSoftwareVulkanBridge::BuildCachedBlas( swVkCachedBlas_t &entry, const srf
 	createInfo.size = sizeInfo.accelerationStructureSize;
 	createInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
 	if ( vkCreateAccelerationStructureKHRLocal( device, &createInfo, NULL, &entry.blas ) != VK_SUCCESS ) {
-		LogFailure( "vkCreateAccelerationStructureKHR cached BLAS failed" );
-		DestroyCachedBlas( entry );
+		LogFailure( "vkCreateAccelerationStructureKHR surface BLAS failed" );
+		DestroySurfaceBlas( entry );
 		return false;
 	}
 
@@ -2278,7 +2300,7 @@ bool idSoftwareVulkanBridge::BuildCachedBlas( swVkCachedBlas_t &entry, const srf
 			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 			true,
 			scratchBuffer ) ) {
-		DestroyCachedBlas( entry );
+		DestroySurfaceBlas( entry );
 		return false;
 	}
 
@@ -2296,16 +2318,16 @@ bool idSoftwareVulkanBridge::BuildCachedBlas( swVkCachedBlas_t &entry, const srf
 	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	if ( !ImmediateSubmit( beginInfo ) ) {
 		DestroyBuffer( scratchBuffer );
-		DestroyCachedBlas( entry );
+		DestroySurfaceBlas( entry );
 		return false;
 	}
 
 	vkCmdBuildAccelerationStructuresKHRLocal( commandBuffer, 1, &buildInfo, ranges );
 
 	if ( vkEndCommandBuffer( commandBuffer ) != VK_SUCCESS ) {
-		LogFailure( "vkEndCommandBuffer cached BLAS failed" );
+		LogFailure( "vkEndCommandBuffer surface BLAS failed" );
 		DestroyBuffer( scratchBuffer );
-		DestroyCachedBlas( entry );
+		DestroySurfaceBlas( entry );
 		return false;
 	}
 
@@ -2315,9 +2337,9 @@ bool idSoftwareVulkanBridge::BuildCachedBlas( swVkCachedBlas_t &entry, const srf
 	submitInfo.commandBufferCount = 1;
 	submitInfo.pCommandBuffers = &commandBuffer;
 	if ( vkQueueSubmit( queue, 1, &submitInfo, inFlightFence ) != VK_SUCCESS ) {
-		LogFailure( "vkQueueSubmit cached BLAS failed" );
+		LogFailure( "vkQueueSubmit surface BLAS failed" );
 		DestroyBuffer( scratchBuffer );
-		DestroyCachedBlas( entry );
+		DestroySurfaceBlas( entry );
 		return false;
 	}
 	vkWaitForFences( device, 1, &inFlightFence, VK_TRUE, UINT64_MAX );
@@ -2328,59 +2350,87 @@ bool idSoftwareVulkanBridge::BuildCachedBlas( swVkCachedBlas_t &entry, const srf
 	addressInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
 	addressInfo.accelerationStructure = entry.blas;
 	entry.blasAddress = vkGetAccelerationStructureDeviceAddressKHRLocal( device, &addressInfo );
+	entry.owner = geo;
 	entry.key = geo;
 	entry.verts = geo->verts;
 	entry.indexes = geo->indexes;
 	entry.vertCount = geo->numVerts;
 	entry.indexCount = geo->numIndexes;
 	entry.primitiveCount = primitiveCount;
-	entry.sourceFrame = sourceFrame;
-	return entry.blasAddress != 0;
+	entry.geometryGeneration = geo->rayQueryGeometryGeneration;
+	if ( entry.blasAddress == 0 ) {
+		DestroySurfaceBlas( entry );
+		return false;
+	}
+	return true;
 }
 
-bool idSoftwareVulkanBridge::EnsureCachedBlas( const srfTriangles_t *geo, int sourceFrame, int frameIndex, swVkCachedBlas_t *&entry ) {
-	entry = NULL;
-	if ( !geo ) {
-		return false;
+swVkEntityTlas_t *idSoftwareVulkanBridge::EnsureEntityTlas( idRenderEntityLocal *entity ) {
+	if ( !entity ) {
+		return NULL;
 	}
+	swVkEntityTlas_t *entry = static_cast<swVkEntityTlas_t *>( entity->rayQueryTlas );
+	if ( entry && entry->owner != entity ) {
+		entry = NULL;
+		entity->rayQueryTlas = NULL;
+	}
+	if ( !entry ) {
+		entry = new swVkEntityTlas_t;
+		entry->owner = entity;
+		entity->rayQueryTlas = entry;
+		rayEntityTlasCache.Append( entry );
+	}
+	return entry;
+}
 
-	for ( int i = 0; i < rayBlasCache.Num(); i++ ) {
-		swVkCachedBlas_t &candidate = rayBlasCache[i];
-		if ( candidate.key != geo ) {
-			continue;
-		}
-		if ( candidate.verts != geo->verts ||
-			 candidate.indexes != geo->indexes ||
-			 candidate.vertCount != geo->numVerts ||
-			 candidate.indexCount != geo->numIndexes ||
-			 candidate.sourceFrame != sourceFrame ||
-			 candidate.blas == VK_NULL_HANDLE ||
-			 candidate.blasAddress == 0 ) {
-			swVkCachedBlas_t rebuilt;
-			if ( !BuildCachedBlas( rebuilt, geo, sourceFrame ) ) {
-				return false;
-			}
-			WaitForSubmittedWork();
-			DestroyRayQueryTlas();
-			DestroyCachedBlas( candidate );
-			candidate = rebuilt;
-		}
-		candidate.lastUsedFrame = frameIndex;
-		entry = &candidate;
-		return true;
+void idSoftwareVulkanBridge::DestroyRayQueryBlasHandle( void *blas ) {
+	if ( !blas ) {
+		return;
 	}
+	swVkSurfaceBlas_t *entry = static_cast<swVkSurfaceBlas_t *>( blas );
+	for ( int i = 0; i < rayAttachedBlas.Num(); i++ ) {
+		if ( rayAttachedBlas[i] == entry ) {
+			rayAttachedBlas.RemoveIndex( i );
+			break;
+		}
+	}
+	if ( initialized && device != VK_NULL_HANDLE ) {
+		WaitForSubmittedWork();
+		DestroyRayQueryTlas();
+		DestroySurfaceBlas( *entry );
+	} else if ( entry->owner && entry->owner->rayQueryBlas == entry ) {
+		entry->owner->rayQueryBlas = NULL;
+	}
+	delete entry;
+}
 
-	const int cacheIndex = rayBlasCache.Num();
-	swVkCachedBlas_t &newEntry = rayBlasCache.Alloc();
-	newEntry = swVkCachedBlas_t();
-	if ( !BuildCachedBlas( newEntry, geo, sourceFrame ) ) {
-		DestroyCachedBlas( newEntry );
-		rayBlasCache.RemoveIndex( cacheIndex );
-		return false;
+void idSoftwareVulkanBridge::DestroyRayQueryEntityHandle( void *entityTlas ) {
+	if ( !entityTlas ) {
+		return;
 	}
-	newEntry.lastUsedFrame = frameIndex;
-	entry = &newEntry;
-	return true;
+	swVkEntityTlas_t *entry = static_cast<swVkEntityTlas_t *>( entityTlas );
+	for ( int i = 0; i < rayEntityTlasCache.Num(); i++ ) {
+		if ( rayEntityTlasCache[i] == entry ) {
+			rayEntityTlasCache.RemoveIndex( i );
+			break;
+		}
+	}
+	if ( entry->owner && entry->owner->rayQueryTlas == entry ) {
+		entry->owner->rayQueryTlas = NULL;
+		entry->owner->rayQueryTlasSignature = 0;
+		entry->owner->rayQueryTlasInstanceCount = 0;
+		entry->owner->rayQueryTlasFrame = 0;
+	}
+	delete entry;
+}
+
+void idSoftwareVulkanBridge::DestroySurfaceBlasList( idList<swVkSurfaceBlas_t *> &list ) {
+	for ( int i = 0; i < list.Num(); i++ ) {
+		swVkSurfaceBlas_t *entry = list[i];
+		DestroySurfaceBlas( *entry );
+		delete entry;
+	}
+	list.Clear();
 }
 
 void idSoftwareVulkanBridge::DestroyRayQueryTlas() {
@@ -3538,42 +3588,77 @@ bool idSoftwareVulkanBridge::PrepareRayQueryScene( const viewDef_t *viewDef ) {
 			continue;
 		}
 
-		const srfTriangles_t *geo = surf->geo;
+		srfTriangles_t *geo = const_cast<srfTriangles_t *>( surf->geo );
 		if ( !geo->verts || !geo->indexes || geo->numVerts <= 0 || geo->numIndexes < 3 ) {
 			continue;
 		}
-
-		int sourceFrame = 0;
-		if ( geo->deformedSurface || dynamicEntity ) {
-			sourceFrame = rayQuerySceneFrame;
-		} else if ( surf->space->entityDef && ( surf->space->entityDef->dynamicModel || surf->space->entityDef->cachedDynamicModel ) ) {
-			sourceFrame = surf->space->entityDef->dynamicModelFrameCount;
+		if ( !geo->rayQueryPersistent ) {
+			continue;
 		}
 
-		swVkCachedBlas_t *cachedBlas = NULL;
-		if ( !EnsureCachedBlas( geo, sourceFrame, rayQuerySceneFrame, cachedBlas ) || !cachedBlas ) {
-			continue;
+		swVkSurfaceBlas_t *cachedBlas = static_cast<swVkSurfaceBlas_t *>( geo->rayQueryBlas );
+		if ( cachedBlas && cachedBlas->owner != geo ) {
+			cachedBlas = NULL;
+			geo->rayQueryBlas = NULL;
+			geo->rayQueryBlasDirty = true;
+		}
+
+		const bool needsBlasBuild = !cachedBlas ||
+			geo->rayQueryBlasDirty ||
+			cachedBlas->verts != geo->verts ||
+			cachedBlas->indexes != geo->indexes ||
+			cachedBlas->vertCount != geo->numVerts ||
+			cachedBlas->indexCount != geo->numIndexes ||
+			cachedBlas->geometryGeneration != geo->rayQueryGeometryGeneration ||
+			cachedBlas->blas == VK_NULL_HANDLE ||
+			cachedBlas->blasAddress == 0;
+		if ( needsBlasBuild ) {
+			swVkSurfaceBlas_t rebuilt;
+			if ( !BuildSurfaceBlas( rebuilt, geo ) ) {
+				continue;
+			}
+			if ( cachedBlas ) {
+				WaitForSubmittedWork();
+				DestroyRayQueryTlas();
+				DestroySurfaceBlas( *cachedBlas );
+				*cachedBlas = rebuilt;
+			} else {
+				cachedBlas = new swVkSurfaceBlas_t;
+				*cachedBlas = rebuilt;
+				rayAttachedBlas.Append( cachedBlas );
+			}
+			geo->rayQueryBlas = cachedBlas;
+			geo->rayQueryBlasDirty = false;
 		}
 
 		swVkRayInstance_t &instance = instances[instanceCount++];
 		instance.blasAddress = cachedBlas->blasAddress;
 		memcpy( instance.modelMatrix, surf->space->modelMatrix, sizeof( instance.modelMatrix ) );
-	}
-	instances.SetNum( instanceCount, false );
 
-	bool waitedForPrune = false;
-	for ( int i = rayBlasCache.Num() - 1; i >= 0; i-- ) {
-		if ( rayQuerySceneFrame - rayBlasCache[i].lastUsedFrame > 300 ) {
-			if ( !waitedForPrune ) {
-				WaitForSubmittedWork();
-				DestroyRayQueryTlas();
-				waitedForPrune = true;
+		idRenderEntityLocal *entity = surf->space->entityDef;
+		swVkEntityTlas_t *entityTlas = EnsureEntityTlas( entity );
+		if ( entityTlas ) {
+			if ( entityTlas->frame != rayQuerySceneFrame ) {
+				entityTlas->instances.Clear();
+				entityTlas->signature = 1469598103934665603ULL;
+				entityTlas->signature = SWVkHashU64( entityTlas->signature, reinterpret_cast<uintptr_t>( entity ) );
+				entityTlas->instanceCount = 0;
+				entityTlas->frame = rayQuerySceneFrame;
 			}
-			DestroyCachedBlas( rayBlasCache[i] );
-			rayBlasCache[i] = swVkCachedBlas_t();
-			rayBlasCache.RemoveIndex( i );
+			entityTlas->instances.Append( instance );
+			entityTlas->signature = SWVkHashU64( entityTlas->signature, instance.blasAddress );
+			for ( int matrixIndex = 0; matrixIndex < 16; matrixIndex++ ) {
+				uint32_t bits;
+				memcpy( &bits, &instance.modelMatrix[matrixIndex], sizeof( bits ) );
+				entityTlas->signature = SWVkHashU32( entityTlas->signature, bits );
+			}
+			entityTlas->instanceCount = entityTlas->instances.Num();
+			entity->rayQueryTlasSignature = entityTlas->signature;
+			entity->rayQueryTlasInstanceCount = entityTlas->instanceCount;
+			entity->rayQueryTlasFrame = rayQuerySceneFrame;
 		}
 	}
+	instances.SetNum( instanceCount, false );
 
 	if ( instances.Num() <= 0 ) {
 		WaitForSubmittedWork();
@@ -3687,10 +3772,18 @@ void idSoftwareVulkanBridge::DestroyUploadBuffer() {
 
 void idSoftwareVulkanBridge::DestroyRayQueryScene() {
 	DestroyRayQueryTlas();
-	for ( int i = 0; i < rayBlasCache.Num(); i++ ) {
-		DestroyCachedBlas( rayBlasCache[i] );
+	DestroySurfaceBlasList( rayAttachedBlas );
+	for ( int i = 0; i < rayEntityTlasCache.Num(); i++ ) {
+		swVkEntityTlas_t *entry = rayEntityTlasCache[i];
+		if ( entry->owner && entry->owner->rayQueryTlas == entry ) {
+			entry->owner->rayQueryTlas = NULL;
+			entry->owner->rayQueryTlasSignature = 0;
+			entry->owner->rayQueryTlasInstanceCount = 0;
+			entry->owner->rayQueryTlasFrame = 0;
+		}
+		delete entry;
 	}
-	rayBlasCache.Clear();
+	rayEntityTlasCache.Clear();
 	rayQuerySceneFrame = 0;
 }
 
@@ -3986,6 +4079,15 @@ bool SWVulkan_TraceLightShadowMask( const viewLight_t *vLight, const idVec4 *wor
 	return swVulkanBridge.TraceLightShadowMask( vLight, worldPositions, width, height, shadowMask );
 }
 
+void SWVulkan_DestroyRayQueryBlas( void *blas ) {
+	swVulkanBridge.DestroyRayQueryBlasHandle( blas );
+}
+
+void SWVulkan_DestroyRayQueryEntity( void *entityTlas ) {
+	swVulkanBridge.DestroyRayQueryEntityHandle( entityTlas );
+}
+
 void SWVulkan_Shutdown( void ) {
 	swVulkanBridge.Shutdown();
 }
+

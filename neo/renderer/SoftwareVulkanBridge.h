@@ -112,6 +112,8 @@ bool SWVulkan_PrepareRayQueryScene( const viewDef_t *viewDef );
 bool SWVulkan_BeginLightShadowMask( const viewLight_t *vLight, const idVec4 *worldPositions, int width, int height );
 bool SWVulkan_FinishLightShadowMask( const viewLight_t *vLight, int width, int height, unsigned char *shadowMask );
 bool SWVulkan_TraceLightShadowMask( const viewLight_t *vLight, const idVec4 *worldPositions, int width, int height, unsigned char *shadowMask );
+void SWVulkan_DestroyRayQueryBlas( void *blas );
+void SWVulkan_DestroyRayQueryEntity( void *entityTlas );
 void SWVulkan_Shutdown( void );
 
 #endif /* !__SOFTWARE_VULKAN_BRIDGE_H__ */

@@ -42,6 +42,10 @@ idRenderEntityLocal::idRenderEntityLocal() {
 	dynamicModel			= NULL;
 	dynamicModelFrameCount	= 0;
 	cachedDynamicModel		= NULL;
+	rayQueryTlas			= NULL;
+	rayQueryTlasSignature	= 0;
+	rayQueryTlasInstanceCount = 0;
+	rayQueryTlasFrame		= 0;
 	referenceBounds			= bounds_zero;
 	viewCount				= 0;
 	viewEntity				= NULL;

@@ -174,6 +174,7 @@ idRenderModel *	idRenderModelSprite::InstantiateDynamicModel( const struct rende
 	tri->verts[ 3 ].color[ 3 ] = alpha;
 
 	R_BoundTriSurf( tri );
+	R_BumpTriSurfRayQueryGeneration( tri );
 
 	staticModel->bounds = tri->bounds;
 
