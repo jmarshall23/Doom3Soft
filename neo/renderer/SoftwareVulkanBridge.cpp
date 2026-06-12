@@ -412,6 +412,17 @@ static const int SW_VK_OVERLAY_TILE_MAX_REFS = 8 * 1024 * 1024;
 static const uint32_t SW_VK_SHADOW_GROUP_SIZE_X = 128;
 static const unsigned int SW_VK_HYBRID_LIGHT_TYPE_FOG = 1u;
 static const unsigned int SW_VK_HYBRID_LIGHT_TYPE_BLEND = 2u;
+static const VkDeviceSize SW_VK_MIN_UPLOAD_BYTES = 8 * 1024 * 1024;
+static const VkDeviceSize SW_VK_MIN_2D_SOURCE_BYTES = 4 * 1024 * 1024;
+static const VkDeviceSize SW_VK_MIN_OVERLAY_TRI_BYTES = 1024 * 1024;
+static const VkDeviceSize SW_VK_MIN_OVERLAY_TILE_BYTES = 64 * 1024;
+static const VkDeviceSize SW_VK_MIN_OVERLAY_TILE_INDEX_BYTES = 1024 * 1024;
+static const VkDeviceSize SW_VK_MIN_HYBRID_PIXEL_BYTES = 4 * 1024 * 1024;
+static const VkDeviceSize SW_VK_MIN_HYBRID_FRAME_BYTES = 8 * 1024 * 1024;
+static const VkDeviceSize SW_VK_MIN_HYBRID_WORLD_POSITION_BYTES = 4 * 1024 * 1024;
+static const VkDeviceSize SW_VK_MIN_HYBRID_LIGHT_BYTES = 64 * 1024;
+static const VkDeviceSize SW_VK_MIN_HYBRID_LIGHT_TILE_BYTES = 64 * 1024;
+static const VkDeviceSize SW_VK_MIN_HYBRID_LIGHT_INDEX_BYTES = 256 * 1024;
 static const VkDeviceSize SW_VK_MIN_TEXTURE_INFO_BYTES = 4096 * sizeof( swHybridTextureInfo_t );
 static const VkDeviceSize SW_VK_MIN_TEXTURE_TEXEL_BYTES = 32 * 1024 * 1024 * sizeof( uint32_t );
 
@@ -2284,13 +2295,14 @@ bool idSoftwareVulkanBridge::EnsureUploadBuffer( int requiredWidth, int required
 	if ( uploadBuffer != VK_NULL_HANDLE && uploadBufferSize >= requiredSize ) {
 		return true;
 	}
+	const VkDeviceSize capacitySize = SWVkGrowBufferSize( requiredSize, SW_VK_MIN_UPLOAD_BYTES );
 
 	DestroyUploadBuffer();
 
 	VkBufferCreateInfo bufferInfo;
 	memset( &bufferInfo, 0, sizeof( bufferInfo ) );
 	bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-	bufferInfo.size = requiredSize;
+	bufferInfo.size = capacitySize;
 	bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 	bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
@@ -2325,7 +2337,7 @@ bool idSoftwareVulkanBridge::EnsureUploadBuffer( int requiredWidth, int required
 		return false;
 	}
 
-	uploadBufferSize = requiredSize;
+	uploadBufferSize = capacitySize;
 	StoreFrameContext();
 	return true;
 }
@@ -2368,9 +2380,10 @@ bool idSoftwareVulkanBridge::Ensure2DBuffers( int sourcePixelCount ) {
 		return false;
 	}
 	const VkDeviceSize sourceSize = static_cast<VkDeviceSize>( sourcePixelCount ) * sizeof( uint32_t );
+	const VkDeviceSize sourceCapacity = SWVkGrowBufferSize( sourceSize, SW_VK_MIN_2D_SOURCE_BYTES );
 	const VkMemoryPropertyFlags hostMemory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 	if ( hybrid2DSourceBuffer.buffer == VK_NULL_HANDLE || hybrid2DSourceBuffer.size < sourceSize ) {
-		if ( !CreateBuffer( sourceSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybrid2DSourceBuffer ) ) {
+		if ( !CreateBuffer( sourceCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybrid2DSourceBuffer ) ) {
 			return false;
 		}
 	}
@@ -2381,9 +2394,10 @@ bool idSoftwareVulkanBridge::Ensure2DBuffers( int sourcePixelCount ) {
 bool idSoftwareVulkanBridge::EnsureOverlayBuffers( int triCount ) {
 	triCount = Max( 1, triCount );
 	const VkDeviceSize triSize = static_cast<VkDeviceSize>( triCount ) * sizeof( swHybridOverlayTri_t );
+	const VkDeviceSize triCapacity = SWVkGrowBufferSize( triSize, SW_VK_MIN_OVERLAY_TRI_BYTES );
 	const VkMemoryPropertyFlags hostMemory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 	if ( hybridOverlayTriBuffer.buffer == VK_NULL_HANDLE || hybridOverlayTriBuffer.size < triSize ) {
-		if ( !CreateBuffer( triSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridOverlayTriBuffer ) ) {
+		if ( !CreateBuffer( triCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridOverlayTriBuffer ) ) {
 			return false;
 		}
 	}
@@ -2396,14 +2410,16 @@ bool idSoftwareVulkanBridge::EnsureOverlayTileBuffers( int tileCount, int tileIn
 	tileIndexCount = Max( 1, tileIndexCount );
 	const VkDeviceSize tileSize = static_cast<VkDeviceSize>( tileCount ) * sizeof( swVkOverlayTile_t );
 	const VkDeviceSize tileIndexSize = static_cast<VkDeviceSize>( tileIndexCount ) * sizeof( uint32_t );
+	const VkDeviceSize tileCapacity = SWVkGrowBufferSize( tileSize, SW_VK_MIN_OVERLAY_TILE_BYTES );
+	const VkDeviceSize tileIndexCapacity = SWVkGrowBufferSize( tileIndexSize, SW_VK_MIN_OVERLAY_TILE_INDEX_BYTES );
 	const VkMemoryPropertyFlags hostMemory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 	if ( hybridOverlayTileBuffer.buffer == VK_NULL_HANDLE || hybridOverlayTileBuffer.size < tileSize ) {
-		if ( !CreateBuffer( tileSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridOverlayTileBuffer ) ) {
+		if ( !CreateBuffer( tileCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridOverlayTileBuffer ) ) {
 			return false;
 		}
 	}
 	if ( hybridOverlayTileIndexBuffer.buffer == VK_NULL_HANDLE || hybridOverlayTileIndexBuffer.size < tileIndexSize ) {
-		if ( !CreateBuffer( tileIndexSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridOverlayTileIndexBuffer ) ) {
+		if ( !CreateBuffer( tileIndexCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridOverlayTileIndexBuffer ) ) {
 			return false;
 		}
 	}
@@ -2455,70 +2471,77 @@ bool idSoftwareVulkanBridge::EnsureHybridBuffers( int requiredWidth, int require
 	const VkDeviceSize lightSize = static_cast<VkDeviceSize>( lightCount ) * sizeof( swHybridLight_t );
 	const VkDeviceSize lightTileSize = static_cast<VkDeviceSize>( lightTileCount ) * sizeof( swHybridLightTile_t );
 	const VkDeviceSize lightIndexSize = static_cast<VkDeviceSize>( lightIndexCount ) * sizeof( uint32_t );
+	const VkDeviceSize depthCapacity = SWVkGrowBufferSize( depthSize, SW_VK_MIN_HYBRID_PIXEL_BYTES );
+	const VkDeviceSize uintCapacity = SWVkGrowBufferSize( uintSize, SW_VK_MIN_HYBRID_PIXEL_BYTES );
+	const VkDeviceSize worldPositionCapacity = SWVkGrowBufferSize( worldPositionSize, SW_VK_MIN_HYBRID_WORLD_POSITION_BYTES );
+	const VkDeviceSize frameCapacity = SWVkGrowBufferSize( frameSize, SW_VK_MIN_HYBRID_FRAME_BYTES );
+	const VkDeviceSize lightCapacity = SWVkGrowBufferSize( lightSize, SW_VK_MIN_HYBRID_LIGHT_BYTES );
+	const VkDeviceSize lightTileCapacity = SWVkGrowBufferSize( lightTileSize, SW_VK_MIN_HYBRID_LIGHT_TILE_BYTES );
+	const VkDeviceSize lightIndexCapacity = SWVkGrowBufferSize( lightIndexSize, SW_VK_MIN_HYBRID_LIGHT_INDEX_BYTES );
 	const VkMemoryPropertyFlags hostMemory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
 	if ( hybridDepthBuffer.buffer == VK_NULL_HANDLE || hybridDepthBuffer.size < depthSize ) {
-		if ( !CreateBuffer( depthSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridDepthBuffer ) ) {
+		if ( !CreateBuffer( depthCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridDepthBuffer ) ) {
 			return false;
 		}
 	}
 	if ( hybridNormalBuffer.buffer == VK_NULL_HANDLE || hybridNormalBuffer.size < uintSize ) {
-		if ( !CreateBuffer( uintSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridNormalBuffer ) ) {
+		if ( !CreateBuffer( uintCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridNormalBuffer ) ) {
 			return false;
 		}
 	}
 	if ( hybridTangentBuffer.buffer == VK_NULL_HANDLE || hybridTangentBuffer.size < uintSize ) {
-		if ( !CreateBuffer( uintSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridTangentBuffer ) ) {
+		if ( !CreateBuffer( uintCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridTangentBuffer ) ) {
 			return false;
 		}
 	}
 	if ( hybridBitangentBuffer.buffer == VK_NULL_HANDLE || hybridBitangentBuffer.size < uintSize ) {
-		if ( !CreateBuffer( uintSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridBitangentBuffer ) ) {
+		if ( !CreateBuffer( uintCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridBitangentBuffer ) ) {
 			return false;
 		}
 	}
 	if ( hybridUVBuffer.buffer == VK_NULL_HANDLE || hybridUVBuffer.size < uintSize ) {
-		if ( !CreateBuffer( uintSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridUVBuffer ) ) {
+		if ( !CreateBuffer( uintCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridUVBuffer ) ) {
 			return false;
 		}
 	}
 	if ( hybridMaterialBuffer.buffer == VK_NULL_HANDLE || hybridMaterialBuffer.size < uintSize ) {
-		if ( !CreateBuffer( uintSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridMaterialBuffer ) ) {
+		if ( !CreateBuffer( uintCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridMaterialBuffer ) ) {
 			return false;
 		}
 	}
 	if ( hybridAlbedoBuffer.buffer == VK_NULL_HANDLE || hybridAlbedoBuffer.size < uintSize ) {
-		if ( !CreateBuffer( uintSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridAlbedoBuffer ) ) {
+		if ( !CreateBuffer( uintCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridAlbedoBuffer ) ) {
 			return false;
 		}
 	}
 	if ( hybridSpecularBuffer.buffer == VK_NULL_HANDLE || hybridSpecularBuffer.size < uintSize ) {
-		if ( !CreateBuffer( uintSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridSpecularBuffer ) ) {
+		if ( !CreateBuffer( uintCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridSpecularBuffer ) ) {
 			return false;
 		}
 	}
 	if ( hybridSurfaceBuffer.buffer == VK_NULL_HANDLE || hybridSurfaceBuffer.size < uintSize ) {
-		if ( !CreateBuffer( uintSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridSurfaceBuffer ) ) {
+		if ( !CreateBuffer( uintCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridSurfaceBuffer ) ) {
 			return false;
 		}
 	}
 	if ( hybridWorldPositionBuffer.buffer == VK_NULL_HANDLE || hybridWorldPositionBuffer.size < worldPositionSize ) {
-		if ( !CreateBuffer( worldPositionSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridWorldPositionBuffer ) ) {
+		if ( !CreateBuffer( worldPositionCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridWorldPositionBuffer ) ) {
 			return false;
 		}
 	}
 	if ( hybridLitBuffer.buffer == VK_NULL_HANDLE || hybridLitBuffer.size < uintSize ) {
-		if ( !CreateBuffer( uintSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false, hybridLitBuffer ) ) {
+		if ( !CreateBuffer( uintCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false, hybridLitBuffer ) ) {
 			return false;
 		}
 	}
 	if ( hybridFrameBuffer.buffer == VK_NULL_HANDLE || hybridFrameBuffer.size < frameSize ) {
-		if ( !CreateBuffer( frameSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false, hybridFrameBuffer ) ) {
+		if ( !CreateBuffer( frameCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false, hybridFrameBuffer ) ) {
 			return false;
 		}
 	}
 	if ( hybridOverlayBuffer.buffer == VK_NULL_HANDLE || hybridOverlayBuffer.size < frameSize ) {
-		if ( !CreateBuffer( frameSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false, hybridOverlayBuffer ) ) {
+		if ( !CreateBuffer( frameCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false, hybridOverlayBuffer ) ) {
 			return false;
 		}
 	}
@@ -2527,17 +2550,17 @@ bool idSoftwareVulkanBridge::EnsureHybridBuffers( int requiredWidth, int require
 		return false;
 	}
 	if ( hybridLightBuffer.buffer == VK_NULL_HANDLE || hybridLightBuffer.size < lightSize ) {
-		if ( !CreateBuffer( lightSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridLightBuffer ) ) {
+		if ( !CreateBuffer( lightCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridLightBuffer ) ) {
 			return false;
 		}
 	}
 	if ( hybridLightTileBuffer.buffer == VK_NULL_HANDLE || hybridLightTileBuffer.size < lightTileSize ) {
-		if ( !CreateBuffer( lightTileSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridLightTileBuffer ) ) {
+		if ( !CreateBuffer( lightTileCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridLightTileBuffer ) ) {
 			return false;
 		}
 	}
 	if ( hybridLightIndexBuffer.buffer == VK_NULL_HANDLE || hybridLightIndexBuffer.size < lightIndexSize ) {
-		if ( !CreateBuffer( lightIndexSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridLightIndexBuffer ) ) {
+		if ( !CreateBuffer( lightIndexCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostMemory, false, hybridLightIndexBuffer ) ) {
 			return false;
 		}
 	}
@@ -2831,14 +2854,16 @@ bool idSoftwareVulkanBridge::EnsureShadowBuffers( int width, int height ) {
 
 	const VkDeviceSize positionSize = static_cast<VkDeviceSize>( width ) * static_cast<VkDeviceSize>( height ) * sizeof( idVec4 );
 	const VkDeviceSize maskSize = static_cast<VkDeviceSize>( width ) * static_cast<VkDeviceSize>( height ) * sizeof( uint32_t );
+	const VkDeviceSize positionCapacity = SWVkGrowBufferSize( positionSize, SW_VK_MIN_HYBRID_WORLD_POSITION_BYTES );
+	const VkDeviceSize maskCapacity = SWVkGrowBufferSize( maskSize, SW_VK_MIN_HYBRID_PIXEL_BYTES );
 
 	if ( worldPositionBuffer.buffer == VK_NULL_HANDLE || worldPositionBuffer.size < positionSize ) {
-		if ( !CreateBuffer( positionSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, false, worldPositionBuffer ) ) {
+		if ( !CreateBuffer( positionCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, false, worldPositionBuffer ) ) {
 			return false;
 		}
 	}
 	if ( shadowMaskBuffer.buffer == VK_NULL_HANDLE || shadowMaskBuffer.size < maskSize ) {
-		if ( !CreateBuffer( maskSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, false, shadowMaskBuffer ) ) {
+		if ( !CreateBuffer( maskCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, false, shadowMaskBuffer ) ) {
 			return false;
 		}
 	}
@@ -2918,14 +2943,16 @@ bool idSoftwareVulkanBridge::EnsureShadowJobResources( swVkShadowJob_t &job, int
 
 	const VkDeviceSize positionSize = static_cast<VkDeviceSize>( width ) * static_cast<VkDeviceSize>( height ) * sizeof( idVec4 );
 	const VkDeviceSize maskSize = static_cast<VkDeviceSize>( width ) * static_cast<VkDeviceSize>( height ) * sizeof( uint32_t );
+	const VkDeviceSize positionCapacity = SWVkGrowBufferSize( positionSize, SW_VK_MIN_HYBRID_WORLD_POSITION_BYTES );
+	const VkDeviceSize maskCapacity = SWVkGrowBufferSize( maskSize, SW_VK_MIN_HYBRID_PIXEL_BYTES );
 
 	if ( job.worldPositionBuffer.buffer == VK_NULL_HANDLE || job.worldPositionBuffer.size < positionSize ) {
-		if ( !CreateBuffer( positionSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, false, job.worldPositionBuffer ) ) {
+		if ( !CreateBuffer( positionCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, false, job.worldPositionBuffer ) ) {
 			return false;
 		}
 	}
 	if ( job.shadowMaskBuffer.buffer == VK_NULL_HANDLE || job.shadowMaskBuffer.size < maskSize ) {
-		if ( !CreateBuffer( maskSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, false, job.shadowMaskBuffer ) ) {
+		if ( !CreateBuffer( maskCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, false, job.shadowMaskBuffer ) ) {
 			return false;
 		}
 	}
