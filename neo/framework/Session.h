@@ -92,6 +92,7 @@ public:
 	// Returns true if a multiplayer game is running.
 	// CVars and commands are checked differently in multiplayer mode.
 	virtual bool	IsMultiplayer() = 0;
+	virtual bool	IsLoadingMap() const = 0;
 
 	// Processes the given event.
 	virtual	bool	ProcessEvent( const sysEvent_t *event ) = 0;

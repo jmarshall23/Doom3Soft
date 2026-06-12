@@ -598,6 +598,7 @@ public:
 	bool TraceLightShadowMask( const viewLight_t *vLight, const idVec4 *worldPositions, int width, int height, unsigned char *shadowMask );
 	void DestroyRayQueryBlasHandle( void *blas );
 	void DestroyRayQueryEntityHandle( void *entityTlas );
+	void ClearRayQueryScene();
 	void Shutdown();
 
 private:
@@ -5090,7 +5091,7 @@ bool idSoftwareVulkanBridge::PresentFrame() {
 }
 
 bool idSoftwareVulkanBridge::PrepareRayQueryScene( const viewDef_t *viewDef ) {
-	if ( !viewDef || !EnsureInitialized() || !rayQuerySupported ) {
+	if ( !viewDef || ( session && session->IsLoadingMap() ) || !EnsureInitialized() || !rayQuerySupported ) {
 		return false;
 	}
 	if ( HasPendingShadowJobs() ) {
@@ -5239,6 +5240,9 @@ bool idSoftwareVulkanBridge::TraceLightShadowMask( const viewLight_t *vLight, co
 }
 
 bool idSoftwareVulkanBridge::RayQueryAvailable() {
+	if ( session && session->IsLoadingMap() ) {
+		return false;
+	}
 	return EnsureInitialized() && rayQuerySupported;
 }
 
@@ -5270,6 +5274,18 @@ void idSoftwareVulkanBridge::DestroyRayQueryScene() {
 	}
 	rayEntityTlasCache.Clear();
 	rayQuerySceneFrame = 0;
+}
+
+void idSoftwareVulkanBridge::ClearRayQueryScene() {
+	if ( !initialized || device == VK_NULL_HANDLE ) {
+		rayQuerySceneReady = false;
+		rayTlasSignature = 0;
+		rayTlasInstanceCount = 0;
+		rayQuerySceneFrame = 0;
+		return;
+	}
+	WaitForSubmittedWork();
+	DestroyRayQueryScene();
 }
 
 void idSoftwareVulkanBridge::DestroyHybridBuffers() {
@@ -5625,6 +5641,10 @@ void SWVulkan_DestroyRayQueryBlas( void *blas ) {
 
 void SWVulkan_DestroyRayQueryEntity( void *entityTlas ) {
 	swVulkanBridge.DestroyRayQueryEntityHandle( entityTlas );
+}
+
+void SWVulkan_DestroyRayQueryScene( void ) {
+	swVulkanBridge.ClearRayQueryScene();
 }
 
 void SWVulkan_Shutdown( void ) {

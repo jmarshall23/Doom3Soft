@@ -453,6 +453,10 @@ bool	idSessionLocal::IsMultiplayer() {
 	return idAsyncNetwork::IsActive();
 }
 
+bool idSessionLocal::IsLoadingMap() const {
+	return insideExecuteMapChange;
+}
+
 /*
 ================
 idSessionLocal::StartWipe
@@ -1412,6 +1416,10 @@ Exits with mapSpawned = false
 */
 void idSessionLocal::UnloadMap() {
 	StopPlayingRenderDemo();
+
+	if ( renderSystem ) {
+		renderSystem->ClearRayQueryScene();
+	}
 
 	// end the current map in the game
 	if ( game ) {

@@ -188,6 +188,7 @@ public:
 	// if necessary.
 	virtual void			BeginLevelLoad( void ) = 0;
 	virtual void			EndLevelLoad( void ) = 0;
+	virtual void			ClearRayQueryScene( void ) = 0;
 
 	// font support
 	virtual bool			RegisterFont( const char *fontName, fontInfoEx_t &font ) = 0;

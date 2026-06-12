@@ -2238,6 +2238,7 @@ idRenderSystemLocal::BeginLevelLoad
 ========================
 */
 void idRenderSystemLocal::BeginLevelLoad( void ) {
+	ClearRayQueryScene();
 	renderModelManager->BeginLevelLoad();
 	globalImages->BeginLevelLoad();
 }
@@ -2253,6 +2254,15 @@ void idRenderSystemLocal::EndLevelLoad( void ) {
 	if ( r_forceLoadImages.GetBool() ) {
 		RB_ShowImages();
 	}
+}
+
+/*
+========================
+idRenderSystemLocal::ClearRayQueryScene
+========================
+*/
+void idRenderSystemLocal::ClearRayQueryScene( void ) {
+	SWVulkan_DestroyRayQueryScene();
 }
 
 /*
