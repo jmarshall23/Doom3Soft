@@ -1759,10 +1759,17 @@ bool idSoftwareRasterizer::SetupTriangle( const swScreenVert_t &in0, const swScr
 	tri.albedoOrTextureId = stage.albedoOrTextureId;
 	tri.specularAndFlags = stage.specularAndFlags;
 
-	tri.minX = Max( 0, ( Min3( tri.x[0], tri.x[1], tri.x[2] ) + SW_FP_ONE - 1 ) >> SW_FP_SHIFT );
-	tri.minY = Max( 0, ( Min3( tri.y[0], tri.y[1], tri.y[2] ) + SW_FP_ONE - 1 ) >> SW_FP_SHIFT );
-	tri.maxX = Min( width - 1, Max3( tri.x[0], tri.x[1], tri.x[2] ) >> SW_FP_SHIFT );
-	tri.maxY = Min( height - 1, Max3( tri.y[0], tri.y[1], tri.y[2] ) >> SW_FP_SHIFT );
+	const int minFixedX = Min3( tri.x[0], tri.x[1], tri.x[2] );
+	const int minFixedY = Min3( tri.y[0], tri.y[1], tri.y[2] );
+	const int maxFixedX = Max3( tri.x[0], tri.x[1], tri.x[2] );
+	const int maxFixedY = Max3( tri.y[0], tri.y[1], tri.y[2] );
+	const int maxSampleX = maxFixedX >= SW_FP_HALF ? ( maxFixedX - SW_FP_HALF ) >> SW_FP_SHIFT : -1;
+	const int maxSampleY = maxFixedY >= SW_FP_HALF ? ( maxFixedY - SW_FP_HALF ) >> SW_FP_SHIFT : -1;
+
+	tri.minX = Max( 0, ( minFixedX + SW_FP_HALF - 1 ) >> SW_FP_SHIFT );
+	tri.minY = Max( 0, ( minFixedY + SW_FP_HALF - 1 ) >> SW_FP_SHIFT );
+	tri.maxX = Min( width - 1, maxSampleX );
+	tri.maxY = Min( height - 1, maxSampleY );
 
 	if ( tri.minX > tri.maxX || tri.minY > tri.maxY ) {
 		return false;
@@ -1865,10 +1872,17 @@ bool idSoftwareRasterizer::SetupInteractionTriangle( const swInteractionVert_t &
 		tri.attrOverW[2][i] = v2.attrOverW[i];
 	}
 
-	tri.minX = Max( 0, ( Min3( tri.x[0], tri.x[1], tri.x[2] ) + SW_FP_ONE - 1 ) >> SW_FP_SHIFT );
-	tri.minY = Max( 0, ( Min3( tri.y[0], tri.y[1], tri.y[2] ) + SW_FP_ONE - 1 ) >> SW_FP_SHIFT );
-	tri.maxX = Min( width - 1, Max3( tri.x[0], tri.x[1], tri.x[2] ) >> SW_FP_SHIFT );
-	tri.maxY = Min( height - 1, Max3( tri.y[0], tri.y[1], tri.y[2] ) >> SW_FP_SHIFT );
+	const int minFixedX = Min3( tri.x[0], tri.x[1], tri.x[2] );
+	const int minFixedY = Min3( tri.y[0], tri.y[1], tri.y[2] );
+	const int maxFixedX = Max3( tri.x[0], tri.x[1], tri.x[2] );
+	const int maxFixedY = Max3( tri.y[0], tri.y[1], tri.y[2] );
+	const int maxSampleX = maxFixedX >= SW_FP_HALF ? ( maxFixedX - SW_FP_HALF ) >> SW_FP_SHIFT : -1;
+	const int maxSampleY = maxFixedY >= SW_FP_HALF ? ( maxFixedY - SW_FP_HALF ) >> SW_FP_SHIFT : -1;
+
+	tri.minX = Max( 0, ( minFixedX + SW_FP_HALF - 1 ) >> SW_FP_SHIFT );
+	tri.minY = Max( 0, ( minFixedY + SW_FP_HALF - 1 ) >> SW_FP_SHIFT );
+	tri.maxX = Min( width - 1, maxSampleX );
+	tri.maxY = Min( height - 1, maxSampleY );
 
 	if ( tri.minX > tri.maxX || tri.minY > tri.maxY ) {
 		return false;
