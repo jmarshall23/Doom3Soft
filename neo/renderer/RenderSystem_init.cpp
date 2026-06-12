@@ -160,6 +160,7 @@ idCVar r_softwareRayQueryShadowRadius( "r_softwareRayQueryShadowRadius", "8", CV
 idCVar r_softwareHybridRayQueryShadows( "r_softwareHybridRayQueryShadows", "1", CVAR_RENDERER | CVAR_BOOL, "enable expensive per-pixel ray-query shadows in the hybrid compute lighting pass" );
 idCVar r_softwareHybridComputeLighting( "r_softwareHybridComputeLighting", "1", CVAR_RENDERER | CVAR_BOOL, "route software rendering through the G-buffer / Vulkan compute lighting path" );
 idCVar r_softwareHybridDebugView( "r_softwareHybridDebugView", "0", CVAR_RENDERER | CVAR_INTEGER, "hybrid renderer debug view: 0 final lit frame, 1 depth, 2 normal, 3 uv, 4 material, 5 texture, 6 surface", 0, 6, idCmdSystem::ArgCompletion_Integer<0,6> );
+idCVar r_showSoftwarePerf( "r_showSoftwarePerf", "0", CVAR_RENDERER | CVAR_INTEGER, "show software renderer performance metrics: 1 timings, 2 timings and counters", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
 idCVar r_useCombinerDisplayLists( "r_useCombinerDisplayLists", "1", CVAR_RENDERER | CVAR_BOOL | CVAR_NOCHEAT, "put all nvidia register combiner programming in display lists" );
 idCVar r_useDepthBoundsTest( "r_useDepthBoundsTest", "1", CVAR_RENDERER | CVAR_BOOL, "use depth bounds test to reduce shadow fill" );
 

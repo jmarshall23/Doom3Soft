@@ -892,6 +892,7 @@ extern idCVar r_softwareRayQueryShadowRadius;	// soft-shadow ray-query radius in
 extern idCVar r_softwareHybridRayQueryShadows;	// 1 = use per-pixel ray queries in the hybrid compute lighting pass
 extern idCVar r_softwareHybridComputeLighting;	// 1 = use the software G-buffer / Vulkan compute lighting path
 extern idCVar r_softwareHybridDebugView;	// visualizes hybrid G-buffer channels before final compute composite
+extern idCVar r_showSoftwarePerf;		// report software renderer timings and counters
 extern idCVar r_usePortals;				// 1 = use portals to perform area culling, otherwise draw everything
 extern idCVar r_useStateCaching;		// avoid redundant state changes in GL_*() calls
 extern idCVar r_useCombinerDisplayLists;// if 1, put all nvidia register combiner programming in display lists

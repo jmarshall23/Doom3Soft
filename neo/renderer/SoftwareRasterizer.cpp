@@ -459,6 +459,188 @@ struct swRasterWorkerJob_t {
 #endif
 };
 
+struct swSoftwarePerfStats_t {
+	void Clear() {
+		memset( this, 0, sizeof( *this ) );
+	}
+
+	bool enabled;
+	bool is3DView;
+	bool hybridRequested;
+	bool hybridQueued;
+	bool hybridFallback;
+	bool hybridOverlayFallback;
+	bool compute2DOverlay;
+	bool vulkanPresent;
+	bool rayQueryShadows;
+
+	int width;
+	int height;
+	int presentWidth;
+	int presentHeight;
+	int drawSurfs;
+	int depthTriangles;
+	int ambientTriangles;
+	int surfaceTriangles;
+	int interactionTriangles;
+	int overlayTriangles;
+	int subviewOverlayTriangles;
+	int textureCount;
+	int textureTexels;
+	int lightCount;
+	int postLightCount;
+	int lightTileCount;
+	int lightIndexCount;
+	int rasterTilePasses;
+	int rasterTileVisits;
+	int workerCount;
+
+	double totalMsec;
+	double readMsec;
+	double clearMsec;
+	double texturePrimeMsec;
+	double depthSetupMsec;
+	double depthRasterMsec;
+	double hybridOverlaySetupMsec;
+	double hybridLightBuildMsec;
+	double hybridTextureBuildMsec;
+	double hybridCompositeMsec;
+	double hybridOverlayQueueMsec;
+	double rayQuerySceneMsec;
+	double lightMsec;
+	double ambientSetupMsec;
+	double ambientRasterMsec;
+	double fogMsec;
+	double surfaceSetupMsec;
+	double surfaceRasterMsec;
+	double presentMsec;
+};
+
+static const char *SWSoftwarePerfPathName( const swSoftwarePerfStats_t &perf ) {
+	if ( !perf.is3DView ) {
+		return perf.compute2DOverlay ? "2d-compute" : "2d";
+	}
+	if ( perf.hybridQueued ) {
+		return perf.hybridOverlayFallback ? "hybrid+cpu-overlay" : "hybrid";
+	}
+	if ( perf.hybridRequested ) {
+		return "hybrid-fallback";
+	}
+	return "software";
+}
+
+static void SWPrintSoftwarePerfStats( const swSoftwarePerfStats_t &perf ) {
+	if ( !perf.enabled ) {
+		return;
+	}
+
+	common->Printf(
+		"swperf %s %dx%d->%dx%d total:%5.2f read:%5.2f clear:%5.2f depth:%5.2f/%5.2f light:%5.2f ambient:%5.2f/%5.2f fog:%5.2f surf:%5.2f/%5.2f present:%5.2f\n",
+		SWSoftwarePerfPathName( perf ),
+		perf.width,
+		perf.height,
+		perf.presentWidth,
+		perf.presentHeight,
+		perf.totalMsec,
+		perf.readMsec,
+		perf.clearMsec,
+		perf.depthSetupMsec,
+		perf.depthRasterMsec,
+		perf.lightMsec,
+		perf.ambientSetupMsec,
+		perf.ambientRasterMsec,
+		perf.fogMsec,
+		perf.surfaceSetupMsec,
+		perf.surfaceRasterMsec,
+		perf.presentMsec );
+
+	if ( perf.hybridRequested || perf.compute2DOverlay ) {
+		common->Printf(
+			"swperf hybrid prime:%5.2f overlay:%5.2f light:%5.2f tex:%5.2f composite:%5.2f queue:%5.2f ray:%5.2f%s%s\n",
+			perf.texturePrimeMsec,
+			perf.hybridOverlaySetupMsec,
+			perf.hybridLightBuildMsec,
+			perf.hybridTextureBuildMsec,
+			perf.hybridCompositeMsec,
+			perf.hybridOverlayQueueMsec,
+			perf.rayQuerySceneMsec,
+			perf.hybridQueued ? " queued" : "",
+			perf.hybridFallback ? " fallback" : "" );
+	}
+
+	if ( r_showSoftwarePerf.GetInteger() > 1 ) {
+		const float textureMB = static_cast<float>( perf.textureTexels ) * sizeof( unsigned int ) / ( 1024.0f * 1024.0f );
+		common->Printf(
+			"swperf counts surfs:%d tris depth:%d ambient:%d surface:%d interact:%d overlay:%d subview:%d tex:%d/%5.1fMB lights:%d+%d tiles:%d idx:%d raster:%d/%d workers:%d%s\n",
+			perf.drawSurfs,
+			perf.depthTriangles,
+			perf.ambientTriangles,
+			perf.surfaceTriangles,
+			perf.interactionTriangles,
+			perf.overlayTriangles,
+			perf.subviewOverlayTriangles,
+			perf.textureCount,
+			textureMB,
+			perf.lightCount,
+			perf.postLightCount,
+			perf.lightTileCount,
+			perf.lightIndexCount,
+			perf.rasterTilePasses,
+			perf.rasterTileVisits,
+			perf.workerCount,
+			perf.rayQueryShadows ? " rayq" : "" );
+	}
+}
+
+class swScopedPerfTimer {
+public:
+	swScopedPerfTimer( swSoftwarePerfStats_t &stats, double &accumulator ) :
+		stats( stats ),
+		accumulator( accumulator ),
+		enabled( stats.enabled ) {
+		if ( enabled ) {
+			timer.Start();
+		}
+	}
+
+	~swScopedPerfTimer() {
+		if ( enabled ) {
+			timer.Stop();
+			accumulator += timer.Milliseconds();
+		}
+	}
+
+private:
+	swSoftwarePerfStats_t &stats;
+	double &accumulator;
+	bool enabled;
+	idTimer timer;
+};
+
+class swScopedPerfFrame {
+public:
+	swScopedPerfFrame( swSoftwarePerfStats_t &stats ) :
+		stats( stats ),
+		enabled( stats.enabled ) {
+		if ( enabled ) {
+			timer.Start();
+		}
+	}
+
+	~swScopedPerfFrame() {
+		if ( enabled ) {
+			timer.Stop();
+			stats.totalMsec += timer.Milliseconds();
+			SWPrintSoftwarePerfStats( stats );
+		}
+	}
+
+private:
+	swSoftwarePerfStats_t &stats;
+	bool enabled;
+	idTimer timer;
+};
+
 class idSoftwareRasterizer {
 public:
 	idSoftwareRasterizer();
@@ -638,6 +820,7 @@ private:
 	bool captureWorldPosition;
 	bool hybridComputeActive;
 	bool hasSubviewSource;
+	swSoftwarePerfStats_t perf;
 
 #if defined( _WIN32 ) && !defined( _D3SDK )
 	bool workersStarted;
@@ -672,6 +855,7 @@ idSoftwareRasterizer::idSoftwareRasterizer() {
 	subviewSourceHeight = 0;
 	hybridTextureCachePrimed = false;
 	hasSubviewSource = false;
+	perf.Clear();
 
 #if defined( _WIN32 ) && !defined( _D3SDK )
 	workersStarted = false;
@@ -808,6 +992,10 @@ void idSoftwareRasterizer::DrawView( const viewDef_t *viewDef ) {
 		return;
 	}
 
+	perf.Clear();
+	perf.enabled = r_showSoftwarePerf.GetInteger() != 0;
+	swScopedPerfFrame perfFrame( perf );
+
 	const int viewportWidth = viewDef->viewport.x2 - viewDef->viewport.x1 + 1;
 	const int viewportHeight = viewDef->viewport.y2 - viewDef->viewport.y1 + 1;
 	presentWidth = Max( viewportWidth, 1 );
@@ -820,16 +1008,28 @@ void idSoftwareRasterizer::DrawView( const viewDef_t *viewDef ) {
 	const bool captureSubviewSource = is3DView && ViewContainsSubviewSurface( viewDef ) && r_softwareVulkanPresent.GetBool();
 	const bool allowHybridCompute = is3DView && r_softwareHybridComputeLighting.GetBool();
 	const bool tryCompute2DOverlay = !is3DView && r_softwareHybridComputeLighting.GetBool() && r_softwareVulkanPresent.GetBool();
+	perf.is3DView = is3DView;
+	perf.hybridRequested = allowHybridCompute;
+	perf.compute2DOverlay = tryCompute2DOverlay;
+	perf.vulkanPresent = r_softwareVulkanPresent.GetBool();
+	perf.presentWidth = presentWidth;
+	perf.presentHeight = presentHeight;
+	perf.drawSurfs = viewDef->numDrawSurfs;
 	hybridComputeActive = allowHybridCompute;
 	captureWorldPosition = is3DView && ViewNeedsWorldPosition( viewDef );
 	Resize( renderWidth, renderHeight );
+	perf.width = width;
+	perf.height = height;
 	hasSubviewSource = false;
 	subviewSourceWidth = 0;
 	subviewSourceHeight = 0;
 	if ( viewDef->viewEntitys ) {
 		if ( captureSubviewSource ) {
 			subviewSourcePixels.SetNum( width * height, false );
-			hasSubviewSource = SWVulkan_ReadView( viewDef, subviewSourcePixels.Ptr(), width, height );
+			{
+				swScopedPerfTimer timer( perf, perf.readMsec );
+				hasSubviewSource = SWVulkan_ReadView( viewDef, subviewSourcePixels.Ptr(), width, height );
+			}
 			if ( hasSubviewSource ) {
 				subviewSourceWidth = width;
 				subviewSourceHeight = height;
@@ -837,23 +1037,38 @@ void idSoftwareRasterizer::DrawView( const viewDef_t *viewDef ) {
 				subviewSourcePixels.SetNum( 0, false );
 			}
 		}
-		Clear( true );
+		{
+			swScopedPerfTimer timer( perf, perf.clearMsec );
+			Clear( true );
+		}
 	} else {
 		if ( !tryCompute2DOverlay ) {
+			swScopedPerfTimer timer( perf, perf.readMsec );
 			ReadCurrentFramebuffer( viewDef );
 		}
-		Clear( false );
+		{
+			swScopedPerfTimer timer( perf, perf.clearMsec );
+			Clear( false );
+		}
 	}
 
 	if ( viewDef->viewEntitys ) {
 		RB_DetermineLightScale();
 		if ( allowHybridCompute ) {
+			swScopedPerfTimer timer( perf, perf.texturePrimeMsec );
 			PrimeHybridTextureCacheFromImageManager();
 		}
 
-		BeginSurfacePass();
-		SetupDepthPrepass( viewDef );
-		RasterizeTiles();
+		{
+			swScopedPerfTimer timer( perf, perf.depthSetupMsec );
+			BeginSurfacePass();
+			SetupDepthPrepass( viewDef );
+			perf.depthTriangles += triangles.Num();
+		}
+		{
+			swScopedPerfTimer timer( perf, perf.depthRasterMsec );
+			RasterizeTiles();
+		}
 
 		if ( allowHybridCompute ) {
 			swHybridGBufferUpload_t gbuffer;
@@ -873,46 +1088,89 @@ void idSoftwareRasterizer::DrawView( const viewDef_t *viewDef ) {
 			idList<swHybridOverlayTri_t> overlayTris;
 			if ( gbuffer.debugView == 0 ) {
 				if ( hasSubviewSource ) {
-					BeginSurfacePass();
-					SetupSubviewTriangles( viewDef );
-					BuildHybridOverlayTriangles( subviewOverlayTris );
+					{
+						swScopedPerfTimer timer( perf, perf.hybridOverlaySetupMsec );
+						BeginSurfacePass();
+						SetupSubviewTriangles( viewDef );
+						BuildHybridOverlayTriangles( subviewOverlayTris );
+						perf.subviewOverlayTriangles += subviewOverlayTris.Num();
+					}
 					for ( int i = 0; i < subviewOverlayTris.Num(); i++ ) {
 						subviewOverlayTris[i].params0[2] |= SW_OVERLAY_FLAG_SOURCE_IMAGE;
 					}
 				}
-				BeginSurfacePass();
-				SetupTranslucentTriangles( viewDef );
-				BuildHybridOverlayTriangles( overlayTris );
+				{
+					swScopedPerfTimer timer( perf, perf.hybridOverlaySetupMsec );
+					BeginSurfacePass();
+					SetupTranslucentTriangles( viewDef );
+					BuildHybridOverlayTriangles( overlayTris );
+					perf.overlayTriangles += overlayTris.Num();
+				}
 			}
 
-			BuildHybridLightUpload( viewDef, gbuffer );
-			BuildHybridTextureUpload( gbuffer );
-			if ( SWVulkan_CompositeHybridGBuffer( viewDef, gbuffer, width, height, presentWidth, presentHeight ) ) {
+			{
+				swScopedPerfTimer timer( perf, perf.hybridLightBuildMsec );
+				BuildHybridLightUpload( viewDef, gbuffer );
+				perf.lightCount = gbuffer.normalLightCount;
+				perf.postLightCount = gbuffer.postLightCount;
+				perf.lightTileCount = gbuffer.lightTileCount;
+				perf.lightIndexCount = gbuffer.lightIndexCount;
+			}
+			{
+				swScopedPerfTimer timer( perf, perf.hybridTextureBuildMsec );
+				BuildHybridTextureUpload( gbuffer );
+				perf.textureCount = gbuffer.textureInfoCount;
+				perf.textureTexels = gbuffer.textureTexelCount;
+			}
+			bool hybridCompositeQueued = false;
+			{
+				swScopedPerfTimer timer( perf, perf.hybridCompositeMsec );
+				hybridCompositeQueued = SWVulkan_CompositeHybridGBuffer( viewDef, gbuffer, width, height, presentWidth, presentHeight );
+			}
+			if ( hybridCompositeQueued ) {
+				perf.hybridQueued = true;
 				if ( r_softwareHybridDebugView.GetInteger() == 0 ) {
 					bool queuedOverlays = true;
 					if ( subviewOverlayTris.Num() > 0 ) {
+						swScopedPerfTimer timer( perf, perf.hybridOverlayQueueMsec );
 						queuedOverlays = SWVulkan_QueueHybridOverlaySourceTriangles( viewDef, subviewOverlayTris.Ptr(), subviewOverlayTris.Num(),
 							width, height, presentWidth, presentHeight, subviewSourcePixels.Ptr(), subviewSourceWidth, subviewSourceHeight );
 					}
 					if ( queuedOverlays && overlayTris.Num() > 0 ) {
+						swScopedPerfTimer timer( perf, perf.hybridOverlayQueueMsec );
 						queuedOverlays = SWVulkan_QueueHybridOverlayTriangles( viewDef, overlayTris.Ptr(), overlayTris.Num(), width, height, presentWidth, presentHeight );
 					}
 					if ( queuedOverlays ) {
 						return;
 					}
 
-					SWZeroList( colorBuffer );
-					RasterizeTiles();
+					perf.hybridOverlayFallback = true;
+					{
+						swScopedPerfTimer timer( perf, perf.surfaceRasterMsec );
+						SWZeroList( colorBuffer );
+						RasterizeTiles();
+					}
+					{
+						swScopedPerfTimer timer( perf, perf.presentMsec );
+						Present();
+					}
+				}
+				return;
+			}
+			perf.hybridFallback = true;
+			if ( r_softwareHybridDebugView.GetInteger() != 0 ) {
+				{
+					swScopedPerfTimer timer( perf, perf.surfaceRasterMsec );
+					WriteHybridDebugView();
+				}
+				{
+					swScopedPerfTimer timer( perf, perf.presentMsec );
 					Present();
 				}
 				return;
 			}
-			if ( r_softwareHybridDebugView.GetInteger() != 0 ) {
-				WriteHybridDebugView();
-				Present();
-				return;
-			}
 			{
+				swScopedPerfTimer timer( perf, perf.clearMsec );
 				const unsigned int clearColorValue = 0xff000000u;
 				SWFillList( colorBuffer, clearColorValue );
 			}
@@ -921,35 +1179,72 @@ void idSoftwareRasterizer::DrawView( const viewDef_t *viewDef ) {
 		DrawLights( viewDef );
 		ApplyLightScale();
 
-		BeginSurfacePass();
-		SetupAmbientTriangles( viewDef );
-		RasterizeTiles();
-		ApplyFogLights( viewDef );
+		{
+			swScopedPerfTimer timer( perf, perf.ambientSetupMsec );
+			BeginSurfacePass();
+			SetupAmbientTriangles( viewDef );
+			perf.ambientTriangles += triangles.Num();
+		}
+		{
+			swScopedPerfTimer timer( perf, perf.ambientRasterMsec );
+			RasterizeTiles();
+		}
+		{
+			swScopedPerfTimer timer( perf, perf.fogMsec );
+			ApplyFogLights( viewDef );
+		}
 	} else {
 		if ( tryCompute2DOverlay ) {
+			swScopedPerfTimer timer( perf, perf.texturePrimeMsec );
 			PrimeHybridTextureCacheFromImageManager();
 		}
-		BeginSurfacePass();
-		SetupTriangles( viewDef );
+		{
+			swScopedPerfTimer timer( perf, perf.surfaceSetupMsec );
+			BeginSurfacePass();
+			SetupTriangles( viewDef );
+			perf.surfaceTriangles += triangles.Num();
+		}
 		if ( tryCompute2DOverlay ) {
 			idList<swHybridOverlayTri_t> overlayTris;
-			BuildHybridOverlayTriangles( overlayTris );
+			{
+				swScopedPerfTimer timer( perf, perf.hybridOverlaySetupMsec );
+				BuildHybridOverlayTriangles( overlayTris );
+				perf.overlayTriangles += overlayTris.Num();
+			}
 			if ( overlayTris.Num() > 0 ) {
 				swHybridGBufferUpload_t textureUpload;
-				BuildHybridTextureUpload( textureUpload );
-				if ( SWVulkan_UpdateHybridTextures( textureUpload.textureInfos, textureUpload.textureInfoCount,
+				{
+					swScopedPerfTimer timer( perf, perf.hybridTextureBuildMsec );
+					BuildHybridTextureUpload( textureUpload );
+					perf.textureCount = textureUpload.textureInfoCount;
+					perf.textureTexels = textureUpload.textureTexelCount;
+				}
+				bool queued2DOverlay = false;
+				{
+					swScopedPerfTimer timer( perf, perf.hybridOverlayQueueMsec );
+					queued2DOverlay = SWVulkan_UpdateHybridTextures( textureUpload.textureInfos, textureUpload.textureInfoCount,
 					 textureUpload.textureTexels, textureUpload.textureTexelCount, textureUpload.textureGeneration ) &&
-					 SWVulkan_QueueHybridOverlayTriangles( viewDef, overlayTris.Ptr(), overlayTris.Num(), width, height, presentWidth, presentHeight ) ) {
+					 SWVulkan_QueueHybridOverlayTriangles( viewDef, overlayTris.Ptr(), overlayTris.Num(), width, height, presentWidth, presentHeight );
+				}
+				if ( queued2DOverlay ) {
+					perf.hybridQueued = true;
 					return;
 				}
 			}
 		}
 		if ( tryCompute2DOverlay ) {
+			swScopedPerfTimer timer( perf, perf.readMsec );
 			ReadCurrentFramebuffer( viewDef );
 		}
-		RasterizeTiles();
+		{
+			swScopedPerfTimer timer( perf, perf.surfaceRasterMsec );
+			RasterizeTiles();
+		}
 	}
-	Present();
+	{
+		swScopedPerfTimer timer( perf, perf.presentMsec );
+		Present();
+	}
 }
 
 void idSoftwareRasterizer::SetupTriangles( const viewDef_t *viewDef ) {
@@ -1964,9 +2259,14 @@ void idSoftwareRasterizer::DrawLights( const viewDef_t *viewDef ) {
 		return;
 	}
 
-	const bool rayQueryShadows = r_softwareRayQueryShadows.GetBool() &&
-		SWVulkan_RayQueryAvailable() &&
-		SWVulkan_PrepareRayQueryScene( viewDef );
+	swScopedPerfTimer lightTimer( perf, perf.lightMsec );
+
+	bool rayQueryShadows = false;
+	if ( r_softwareRayQueryShadows.GetBool() && SWVulkan_RayQueryAvailable() ) {
+		swScopedPerfTimer rayTimer( perf, perf.rayQuerySceneMsec );
+		rayQueryShadows = SWVulkan_PrepareRayQueryScene( viewDef );
+	}
+	perf.rayQueryShadows = perf.rayQueryShadows || rayQueryShadows;
 
 	const int oldDepthFunc = backEnd.depthFunc;
 	const viewEntity_t *oldSpace = backEnd.currentSpace;
@@ -1982,6 +2282,9 @@ void idSoftwareRasterizer::DrawLights( const viewDef_t *viewDef ) {
 		}
 		if ( !vLight->localInteractions && !vLight->globalInteractions && !vLight->translucentInteractions ) {
 			continue;
+		}
+		if ( !perf.hybridRequested ) {
+			perf.lightCount++;
 		}
 
 		const bool wantsRayQueryShadow = rayQueryShadows && !vLight->lightShader->IsAmbientLight();
@@ -2005,6 +2308,7 @@ void idSoftwareRasterizer::DrawLights( const viewDef_t *viewDef ) {
 		}
 
 		if ( interactionTriangles.Num() > 0 ) {
+			perf.interactionTriangles += interactionTriangles.Num();
 			shadowMaskActive = shadowMaskPending &&
 				SWVulkan_FinishLightShadowMask( vLight, width, height, shadowMask.Ptr() );
 			RasterizeTiles();
@@ -2879,9 +3183,16 @@ void idSoftwareRasterizer::RasterizeTiles() {
 	if ( numTiles <= 0 ) {
 		return;
 	}
+	if ( perf.enabled ) {
+		perf.rasterTilePasses++;
+		perf.rasterTileVisits += numTiles;
+	}
 
 #if defined( _WIN32 ) && !defined( _D3SDK )
 	StartWorkers();
+	if ( perf.enabled ) {
+		perf.workerCount = Max( perf.workerCount, workerCount );
+	}
 
 	const int activeWorkers = Min( workerCount, Max( 0, numTiles - 1 ) );
 	if ( activeWorkers <= 0 ) {
