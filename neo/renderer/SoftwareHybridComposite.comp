@@ -1,5 +1,38 @@
 #version 460
+
+#ifndef SW_HYBRID_DEBUG_VIEW
+#define SW_HYBRID_DEBUG_VIEW 0
+#endif
+
+#ifndef SW_HYBRID_NORMAL_LIGHT_MODE
+#define SW_HYBRID_NORMAL_LIGHT_MODE 0
+#endif
+
+#ifndef SW_HYBRID_POST_LIGHT_MODE
+#define SW_HYBRID_POST_LIGHT_MODE 0
+#endif
+
+#ifndef SW_HYBRID_SHADOW_MODE
+#define SW_HYBRID_SHADOW_MODE 1
+#endif
+
+#define SW_HYBRID_NORMAL_GENERIC 0
+#define SW_HYBRID_NORMAL_NONE 1
+#define SW_HYBRID_NORMAL_AMBIENT_ONLY 2
+#define SW_HYBRID_NORMAL_PROJECTED_ONLY 3
+
+#define SW_HYBRID_POST_GENERIC 0
+#define SW_HYBRID_POST_NONE 1
+#define SW_HYBRID_POST_FOG_ONLY 2
+#define SW_HYBRID_POST_BLEND_ONLY 3
+
+#define SW_HYBRID_SHADOW_OFF 0
+#define SW_HYBRID_SHADOW_FLAGS 1
+#define SW_HYBRID_SHADOW_ALL 2
+
+#if SW_HYBRID_SHADOW_MODE != SW_HYBRID_SHADOW_OFF
 #extension GL_EXT_ray_query : require
+#endif
 
 layout( local_size_x = 32, local_size_y = 4 ) in;
 
@@ -60,7 +93,9 @@ struct HybridLight {
 layout( set = 0, binding = 12, std430 ) readonly buffer LightBuffer {
 	HybridLight lights[];
 };
+#if SW_HYBRID_SHADOW_MODE != SW_HYBRID_SHADOW_OFF
 layout( set = 0, binding = 13 ) uniform accelerationStructureEXT sceneAS;
+#endif
 layout( set = 0, binding = 14, std430 ) readonly buffer TangentBuffer {
 	uint tangentPacked[];
 };
@@ -430,6 +465,7 @@ vec3 DecodeNormalMapTexel( uint texel ) {
 
 const uint MAX_SHADOW_SAMPLES = 9u;
 
+#if SW_HYBRID_SHADOW_MODE != SW_HYBRID_SHADOW_OFF
 vec2 ShadowDiskOffset( uint sampleIndex ) {
 	if ( sampleIndex == 1u ) {
 		return vec2( 0.55, 0.0 );
@@ -510,6 +546,7 @@ float TraceShadow( vec3 worldPos, vec3 normal, vec3 lightPosition, vec3 lightDir
 	}
 	return visible / float( samples );
 }
+#endif
 
 uvec4 LightTileRange( uint srcX, uint srcY ) {
 	uint tileCountX = CeilDiv( pc.dims.x, LIGHT_TILE_SIZE );
@@ -671,6 +708,125 @@ uint ApplyWriteMask( uint src, uint dst, int writeMask ) {
 	return outColor;
 }
 
+bool LightCoversViewPixel( HybridLight light, uint viewX, uint viewY ) {
+	return int( viewX ) >= light.scissor.x && int( viewX ) <= light.scissor.z &&
+		int( viewY ) >= light.scissor.y && int( viewY ) <= light.scissor.w;
+}
+
+void ApplyAmbientLight( inout vec3 lit, vec3 albedoRgb, HybridLight light ) {
+	lit += albedoRgb * max( light.color.rgb, vec3( 0.0 ) );
+}
+
+void ApplyProjectedLight( inout vec3 lit, vec3 albedoRgb, uint srcIndex, vec2 uv, RawUvDerivatives uvDerivs,
+	uint bumpTextureId, uint specularTextureId, inout vec3 normal, vec4 world, HybridLight light,
+	inout vec3 tangent, inout vec3 bitangent, inout vec3 bumpNormal, inout vec3 specularColor,
+	inout bool basisReady, inout bool bumpReady, inout bool specularReady ) {
+	vec4 world4 = vec4( world.xyz, 1.0 );
+	float lightQ = dot( light.lightProject[2], world4 );
+	if ( lightQ <= 0.00001 ) {
+		return;
+	}
+
+	float lightS = dot( light.lightProject[0], world4 ) / lightQ;
+	float lightT = dot( light.lightProject[1], world4 ) / lightQ;
+	float falloffS = dot( light.lightProject[3], world4 );
+
+	uint lightTextureId = OptionalTextureId( light.textureIds.x );
+	uint falloffTextureId = OptionalTextureId( light.textureIds.y );
+	vec4 lightTexel = SampleProjectedTextureLinear( lightTextureId, vec2( lightS, lightT ), PackColor( 255u, 255u, 255u, 255u ) );
+	float falloff = SampleProjectedTextureLinear( falloffTextureId, vec2( falloffS, 0.5 ), PackColor( 255u, 255u, 255u, 255u ) ).r;
+	if ( falloff <= 0.0 || dot( lightTexel.rgb, lightTexel.rgb ) <= 0.000001 ) {
+		return;
+	}
+
+	vec3 toLight = light.originRadius.xyz - world.xyz;
+	float dist2 = dot( toLight, toLight );
+	float invDist = inversesqrt( max( dist2, 0.000001 ) );
+	vec3 lightDir = toLight * invDist;
+	float dist = dist2 * invDist;
+	if ( !basisReady ) {
+		BuildBasis( srcIndex, normal, tangent, bitangent );
+		basisReady = true;
+	}
+	if ( !bumpReady ) {
+		if ( bumpTextureId != 0xffffffffu && bumpTextureId < pc.textureCount ) {
+			vec4 bumpTexel = SampleTextureMip( bumpTextureId, uv, TextureLodFromDerivatives( bumpTextureId, uvDerivs ), PackColor( 128u, 128u, 255u, 255u ) );
+			bumpNormal = DecodeNormalMapTexel( PackColorVec( bumpTexel ) );
+		}
+		bumpReady = true;
+	}
+	vec3 lightTS = vec3( dot( lightDir, tangent ), dot( lightDir, bitangent ), dot( lightDir, normal ) );
+	if ( dot( lightTS, lightTS ) > 0.000001 ) {
+		lightTS = normalize( lightTS );
+	}
+	float nDotL = max( dot( bumpNormal, lightTS ), 0.0 );
+	if ( nDotL <= 0.0 ) {
+		return;
+	}
+#if SW_HYBRID_SHADOW_MODE == SW_HYBRID_SHADOW_OFF
+	float shadow = 1.0;
+#elif SW_HYBRID_SHADOW_MODE == SW_HYBRID_SHADOW_ALL
+	float shadow = TraceShadow( world.xyz, normal, light.originRadius.xyz, lightDir, dist );
+#else
+	float shadow = light.flags.z != 0u ? TraceShadow( world.xyz, normal, light.originRadius.xyz, lightDir, dist ) : 1.0;
+#endif
+	float lightAmount = nDotL * falloff * shadow;
+	vec3 projectedLightColor = max( light.color.rgb, vec3( 0.0 ) ) * lightTexel.rgb;
+	lit += albedoRgb * projectedLightColor * lightAmount;
+	if ( lightAmount > 0.0 ) {
+		if ( !specularReady ) {
+			if ( specularTextureId != 0xffffffffu && specularTextureId < pc.textureCount ) {
+				specularColor = SampleTextureMip( specularTextureId, uv, TextureLodFromDerivatives( specularTextureId, uvDerivs ), PackColor( 0u, 0u, 0u, 255u ) ).rgb;
+			}
+			specularReady = true;
+		}
+	}
+	if ( dot( specularColor, specularColor ) > 0.000001 && lightAmount > 0.0 ) {
+		vec3 viewDir = normalize( pc.viewOrigin.xyz - world.xyz );
+		vec3 viewTS = vec3( dot( viewDir, tangent ), dot( viewDir, bitangent ), dot( viewDir, normal ) );
+		if ( dot( viewTS, viewTS ) > 0.000001 ) {
+			viewTS = normalize( viewTS );
+		}
+		vec3 halfTS = normalize( lightTS + viewTS );
+		float spec = pow( max( dot( bumpNormal, halfTS ), 0.0 ), 16.0 );
+		lit += specularColor * projectedLightColor * spec * falloff * shadow;
+	}
+}
+
+void ApplyFogLight( inout uint color, vec4 world, HybridLight light ) {
+	vec4 world4 = vec4( world.xyz, 1.0 );
+	uint fogTextureId = OptionalTextureId( light.textureIds.x );
+	uint fogEnterTextureId = OptionalTextureId( light.textureIds.y );
+	float fogS = dot( light.lightProject[0], world4 ) + 0.5;
+	float enterT = dot( light.lightProject[1], world4 ) + FOG_ENTER;
+	vec4 fogTexel = SampleProjectedTextureLinear( fogTextureId, vec2( fogS, 0.5 ), PackColor( 255u, 255u, 255u, 255u ) );
+	vec4 enterTexel = SampleProjectedTextureLinear( fogEnterTextureId, vec2( light.originRadius.w, enterT ), PackColor( 255u, 255u, 255u, 255u ) );
+	float alpha = fogTexel.a * enterTexel.a;
+	if ( alpha <= 0.0 ) {
+		return;
+	}
+	uint src = PackColorVec( vec4( light.color.rgb * fogTexel.rgb * enterTexel.rgb, alpha ) );
+	color = BlendSourceOver( src, color );
+}
+
+void ApplyBlendLight( inout uint color, vec4 world, HybridLight light ) {
+	vec4 world4 = vec4( world.xyz, 1.0 );
+	float lightQ = dot( light.lightProject[2], world4 );
+	if ( lightQ <= 0.00001 ) {
+		return;
+	}
+	float lightS = dot( light.lightProject[0], world4 ) / lightQ;
+	float lightT = dot( light.lightProject[1], world4 ) / lightQ;
+	float falloffS = dot( light.lightProject[3], world4 );
+	uint lightTextureId = OptionalTextureId( light.textureIds.x );
+	uint falloffTextureId = OptionalTextureId( light.textureIds.y );
+	vec4 lightTexel = SampleProjectedTextureLinear( lightTextureId, vec2( lightS, lightT ), PackColor( 255u, 255u, 255u, 255u ) );
+	vec4 falloffTexel = SampleProjectedTextureLinear( falloffTextureId, vec2( falloffS, 0.5 ), PackColor( 255u, 255u, 255u, 255u ) );
+	uint src = PackColorVec( light.color * lightTexel * falloffTexel );
+	uint blended = BlendColor( src, color, int( light.flags.x ), int( light.flags.y ), int( light.flags.z ) );
+	color = ApplyWriteMask( blended, color, int( light.textureIds.z ) );
+}
+
 uint ShadeTexturedPixel( uint srcIndex, uint srcX, uint srcY, uint viewX, uint viewY ) {
 	uint packedUV = uvPacked[srcIndex];
 	vec2 uv = DecodePackedUV( packedUV );
@@ -692,6 +848,7 @@ uint ShadeTexturedPixel( uint srcIndex, uint srcX, uint srcY, uint viewX, uint v
 	vec4 world = worldPositions[srcIndex];
 	uvec4 tileRange = pc.lightCount > 0u ? LightTileRange( srcX, srcY ) : uvec4( 0u );
 
+#if SW_HYBRID_NORMAL_LIGHT_MODE != SW_HYBRID_NORMAL_NONE
 	if ( world.w > 0.0 && pc.lightCount > 0u ) {
 		for ( uint tileLight = 0u; tileLight < tileRange.y; tileLight++ ) {
 			uint i = lightIndices[tileRange.x + tileLight];
@@ -699,137 +856,62 @@ uint ShadeTexturedPixel( uint srcIndex, uint srcX, uint srcY, uint viewX, uint v
 				continue;
 			}
 			HybridLight light = lights[i];
-			if ( int( viewX ) < light.scissor.x || int( viewX ) > light.scissor.z ||
-				 int( viewY ) < light.scissor.y || int( viewY ) > light.scissor.w ) {
-				continue;
-			}
-			if ( light.flags.w != LIGHT_TYPE_NORMAL ) {
+			if ( !LightCoversViewPixel( light, viewX, viewY ) ) {
 				continue;
 			}
 
-			vec3 lightColor = max( light.color.rgb, vec3( 0.0 ) );
+#if SW_HYBRID_NORMAL_LIGHT_MODE == SW_HYBRID_NORMAL_AMBIENT_ONLY
+			ApplyAmbientLight( lit, albedo.rgb, light );
+#elif SW_HYBRID_NORMAL_LIGHT_MODE == SW_HYBRID_NORMAL_PROJECTED_ONLY
+			ApplyProjectedLight( lit, albedo.rgb, srcIndex, uv, uvDerivs, bumpTextureId, specularTextureId,
+				normal, world, light, tangent, bitangent, bumpNormal, specularColor, basisReady, bumpReady, specularReady );
+#else
 			if ( light.flags.x != 0u ) {
-				lit += albedo.rgb * lightColor;
+				ApplyAmbientLight( lit, albedo.rgb, light );
 				continue;
 			}
-
-			vec4 world4 = vec4( world.xyz, 1.0 );
-			float lightQ = dot( light.lightProject[2], world4 );
-			if ( lightQ <= 0.00001 ) {
-				continue;
-			}
-
-			float lightS = dot( light.lightProject[0], world4 ) / lightQ;
-			float lightT = dot( light.lightProject[1], world4 ) / lightQ;
-			float falloffS = dot( light.lightProject[3], world4 );
-
-			uint lightTextureId = OptionalTextureId( light.textureIds.x );
-			uint falloffTextureId = OptionalTextureId( light.textureIds.y );
-			vec4 lightTexel = SampleProjectedTextureLinear( lightTextureId, vec2( lightS, lightT ), PackColor( 255u, 255u, 255u, 255u ) );
-			float falloff = SampleProjectedTextureLinear( falloffTextureId, vec2( falloffS, 0.5 ), PackColor( 255u, 255u, 255u, 255u ) ).r;
-			if ( falloff <= 0.0 || dot( lightTexel.rgb, lightTexel.rgb ) <= 0.000001 ) {
-				continue;
-			}
-
-			vec3 toLight = light.originRadius.xyz - world.xyz;
-			float dist2 = dot( toLight, toLight );
-			float invDist = inversesqrt( max( dist2, 0.000001 ) );
-			vec3 lightDir = toLight * invDist;
-			float dist = dist2 * invDist;
-			float attenuation = 1.0;
-			if ( !basisReady ) {
-				BuildBasis( srcIndex, normal, tangent, bitangent );
-				basisReady = true;
-			}
-			if ( !bumpReady ) {
-				if ( bumpTextureId != 0xffffffffu && bumpTextureId < pc.textureCount ) {
-					vec4 bumpTexel = SampleTextureMip( bumpTextureId, uv, TextureLodFromDerivatives( bumpTextureId, uvDerivs ), PackColor( 128u, 128u, 255u, 255u ) );
-					bumpNormal = DecodeNormalMapTexel( PackColorVec( bumpTexel ) );
-				}
-				bumpReady = true;
-			}
-			vec3 lightTS = vec3( dot( lightDir, tangent ), dot( lightDir, bitangent ), dot( lightDir, normal ) );
-			if ( dot( lightTS, lightTS ) > 0.000001 ) {
-				lightTS = normalize( lightTS );
-			}
-			float nDotL = max( dot( bumpNormal, lightTS ), 0.0 );
-			if ( nDotL <= 0.0 ) {
-				continue;
-			}
-			float shadow = light.flags.z != 0u ? TraceShadow( world.xyz, normal, light.originRadius.xyz, lightDir, dist ) : 1.0;
-			float lightAmount = nDotL * attenuation * falloff * shadow;
-			vec3 projectedLightColor = lightColor * lightTexel.rgb;
-			lit += albedo.rgb * projectedLightColor * lightAmount;
-			if ( lightAmount > 0.0 ) {
-				if ( !specularReady ) {
-					if ( specularTextureId != 0xffffffffu && specularTextureId < pc.textureCount ) {
-						specularColor = SampleTextureMip( specularTextureId, uv, TextureLodFromDerivatives( specularTextureId, uvDerivs ), PackColor( 0u, 0u, 0u, 255u ) ).rgb;
-					}
-					specularReady = true;
-				}
-			}
-			if ( dot( specularColor, specularColor ) > 0.000001 && lightAmount > 0.0 ) {
-				vec3 viewDir = normalize( pc.viewOrigin.xyz - world.xyz );
-				vec3 viewTS = vec3( dot( viewDir, tangent ), dot( viewDir, bitangent ), dot( viewDir, normal ) );
-				if ( dot( viewTS, viewTS ) > 0.000001 ) {
-					viewTS = normalize( viewTS );
-				}
-				vec3 halfTS = normalize( lightTS + viewTS );
-				float spec = pow( max( dot( bumpNormal, halfTS ), 0.0 ), 16.0 );
-				lit += specularColor * projectedLightColor * spec * attenuation * falloff * shadow;
-			}
+			ApplyProjectedLight( lit, albedo.rgb, srcIndex, uv, uvDerivs, bumpTextureId, specularTextureId,
+				normal, world, light, tangent, bitangent, bumpNormal, specularColor, basisReady, bumpReady, specularReady );
+#endif
 		}
 	} else {
 		vec3 lightDir = normalize( vec3( -0.35, 0.45, 0.82 ) );
 		float nDotL = max( dot( normal, lightDir ), 0.0 );
 		lit += albedo.rgb * ( 0.16 + 0.80 * nDotL );
 	}
+#elif SW_HYBRID_POST_LIGHT_MODE == SW_HYBRID_POST_NONE
+	vec3 lightDir = normalize( vec3( -0.35, 0.45, 0.82 ) );
+	float nDotL = max( dot( normal, lightDir ), 0.0 );
+	lit += albedo.rgb * ( 0.16 + 0.80 * nDotL );
+#endif
 
 	uint color = PackColorVec( vec4( lit, albedo.a ) );
+#if SW_HYBRID_POST_LIGHT_MODE != SW_HYBRID_POST_NONE
 	if ( world.w > 0.0 && pc.lightCount > 0u ) {
-		vec4 world4 = vec4( world.xyz, 1.0 );
 		for ( uint tileLight = 0u; tileLight < tileRange.w; tileLight++ ) {
 			uint i = lightIndices[tileRange.z + tileLight];
 			if ( i >= pc.lightCount ) {
 				continue;
 			}
 			HybridLight light = lights[i];
-			if ( int( viewX ) < light.scissor.x || int( viewX ) > light.scissor.z ||
-				 int( viewY ) < light.scissor.y || int( viewY ) > light.scissor.w ) {
+			if ( !LightCoversViewPixel( light, viewX, viewY ) ) {
 				continue;
 			}
 
+#if SW_HYBRID_POST_LIGHT_MODE == SW_HYBRID_POST_FOG_ONLY
+			ApplyFogLight( color, world, light );
+#elif SW_HYBRID_POST_LIGHT_MODE == SW_HYBRID_POST_BLEND_ONLY
+			ApplyBlendLight( color, world, light );
+#else
 			if ( light.flags.w == LIGHT_TYPE_FOG ) {
-				uint fogTextureId = OptionalTextureId( light.textureIds.x );
-				uint fogEnterTextureId = OptionalTextureId( light.textureIds.y );
-				float fogS = dot( light.lightProject[0], world4 ) + 0.5;
-				float enterT = dot( light.lightProject[1], world4 ) + FOG_ENTER;
-				vec4 fogTexel = SampleProjectedTextureLinear( fogTextureId, vec2( fogS, 0.5 ), PackColor( 255u, 255u, 255u, 255u ) );
-				vec4 enterTexel = SampleProjectedTextureLinear( fogEnterTextureId, vec2( light.originRadius.w, enterT ), PackColor( 255u, 255u, 255u, 255u ) );
-				float alpha = fogTexel.a * enterTexel.a;
-				if ( alpha <= 0.0 ) {
-					continue;
-				}
-				uint src = PackColorVec( vec4( light.color.rgb * fogTexel.rgb * enterTexel.rgb, alpha ) );
-				color = BlendSourceOver( src, color );
+				ApplyFogLight( color, world, light );
 			} else if ( light.flags.w == LIGHT_TYPE_BLEND ) {
-				float lightQ = dot( light.lightProject[2], world4 );
-				if ( lightQ <= 0.00001 ) {
-					continue;
-				}
-				float lightS = dot( light.lightProject[0], world4 ) / lightQ;
-				float lightT = dot( light.lightProject[1], world4 ) / lightQ;
-				float falloffS = dot( light.lightProject[3], world4 );
-				uint lightTextureId = OptionalTextureId( light.textureIds.x );
-				uint falloffTextureId = OptionalTextureId( light.textureIds.y );
-				vec4 lightTexel = SampleProjectedTextureLinear( lightTextureId, vec2( lightS, lightT ), PackColor( 255u, 255u, 255u, 255u ) );
-				vec4 falloffTexel = SampleProjectedTextureLinear( falloffTextureId, vec2( falloffS, 0.5 ), PackColor( 255u, 255u, 255u, 255u ) );
-				uint src = PackColorVec( light.color * lightTexel * falloffTexel );
-				uint blended = BlendColor( src, color, int( light.flags.x ), int( light.flags.y ), int( light.flags.z ) );
-				color = ApplyWriteMask( blended, color, int( light.textureIds.z ) );
+				ApplyBlendLight( color, world, light );
 			}
+#endif
 		}
 	}
+#endif
 	return color;
 }
 
@@ -882,33 +964,33 @@ void main() {
 		uint viewY = min( uint( pc.viewport.w ) - 1u, ( viewY0 + viewY1 - 1u ) >> 1u );
 
 		if ( depth[srcIndex] < 1.0 && surfaceId[srcIndex] != 0u ) {
-			if ( pc.debugView == 0u ) {
-				color = ShadeTexturedPixel( srcIndex, srcX, srcY, viewX, viewY );
-			} else if ( pc.debugView == 1u ) {
-				uint v = ByteFromFloat( 1.0 - depth[srcIndex] );
-				color = PackColor( v, v, v, 255u );
-			} else if ( pc.debugView == 2u ) {
-				uint packed = normalPacked[srcIndex];
-				uint r = ByteFromFloat( UnpackSnorm10( packed, 0u ) * 0.5 + 0.5 );
-				uint g = ByteFromFloat( UnpackSnorm10( packed, 10u ) * 0.5 + 0.5 );
-				uint b = ByteFromFloat( UnpackSnorm10( packed, 20u ) * 0.5 + 0.5 );
-				color = PackColor( r, g, b, 255u );
-			} else if ( pc.debugView == 3u ) {
-				uint packed = uvPacked[srcIndex];
-				color = PackColor( ( packed & 0xffffu ) >> 8,
-					( ( packed >> 16 ) & 0xffffu ) >> 8,
-					64u,
-					255u );
-			} else if ( pc.debugView == 4u ) {
-				color = IdDebugColor( materialId[srcIndex] );
-			} else if ( pc.debugView == 5u ) {
-				uint packed = uvPacked[srcIndex];
-				vec2 uv = DecodePackedUV( packed );
-				uint textureId = albedoOrTextureId[srcIndex];
-				color = PackColorVec( SampleTextureMip( textureId, uv, TextureLodFromDerivatives( textureId, ComputeRawUvDerivatives( srcIndex, uv ) ), PackColor( 255u, 255u, 255u, 255u ) ) );
-			} else if ( pc.debugView == 6u ) {
-				color = IdDebugColor( surfaceId[srcIndex] );
-			}
+#if SW_HYBRID_DEBUG_VIEW == 0
+			color = ShadeTexturedPixel( srcIndex, srcX, srcY, viewX, viewY );
+#elif SW_HYBRID_DEBUG_VIEW == 1
+			uint v = ByteFromFloat( 1.0 - depth[srcIndex] );
+			color = PackColor( v, v, v, 255u );
+#elif SW_HYBRID_DEBUG_VIEW == 2
+			uint packed = normalPacked[srcIndex];
+			uint r = ByteFromFloat( UnpackSnorm10( packed, 0u ) * 0.5 + 0.5 );
+			uint g = ByteFromFloat( UnpackSnorm10( packed, 10u ) * 0.5 + 0.5 );
+			uint b = ByteFromFloat( UnpackSnorm10( packed, 20u ) * 0.5 + 0.5 );
+			color = PackColor( r, g, b, 255u );
+#elif SW_HYBRID_DEBUG_VIEW == 3
+			uint packed = uvPacked[srcIndex];
+			color = PackColor( ( packed & 0xffffu ) >> 8,
+				( ( packed >> 16 ) & 0xffffu ) >> 8,
+				64u,
+				255u );
+#elif SW_HYBRID_DEBUG_VIEW == 4
+			color = IdDebugColor( materialId[srcIndex] );
+#elif SW_HYBRID_DEBUG_VIEW == 5
+			uint packed = uvPacked[srcIndex];
+			vec2 uv = DecodePackedUV( packed );
+			uint textureId = albedoOrTextureId[srcIndex];
+			color = PackColorVec( SampleTextureMip( textureId, uv, TextureLodFromDerivatives( textureId, ComputeRawUvDerivatives( srcIndex, uv ) ), PackColor( 255u, 255u, 255u, 255u ) ) );
+#elif SW_HYBRID_DEBUG_VIEW == 6
+			color = IdDebugColor( surfaceId[srcIndex] );
+#endif
 		}
 	}
 

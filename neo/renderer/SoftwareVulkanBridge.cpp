@@ -21,6 +21,7 @@ This file is part of the idTech 4 software renderer source code
 #include "SoftwareVulkanBridge.h"
 #include "Software2DComposite_spv.h"
 #include "SoftwareHybridComposite_spv.h"
+#include "SoftwareHybridCompositeVariants_spv.h"
 #include "SoftwareOverlayRaster_spv.h"
 #include "SoftwareOverlayTileComposite_spv.h"
 #include "SoftwareRayQueryShadow_spv.h"
@@ -349,6 +350,56 @@ struct swVk2DJob_t {
 	int presentHeight;
 };
 
+enum swVkHybridCompositeVariant_t {
+	SW_VK_HYBRID_VARIANT_GENERIC_NOSHADOW,
+	SW_VK_HYBRID_VARIANT_GENERIC_SHADOW,
+	SW_VK_HYBRID_VARIANT_NO_LIGHTS,
+	SW_VK_HYBRID_VARIANT_AMBIENT_ONLY,
+	SW_VK_HYBRID_VARIANT_PROJECTED_NOSHADOW,
+	SW_VK_HYBRID_VARIANT_PROJECTED_SHADOW,
+	SW_VK_HYBRID_VARIANT_POST_FOG_NOSHADOW,
+	SW_VK_HYBRID_VARIANT_POST_FOG_SHADOW,
+	SW_VK_HYBRID_VARIANT_POST_BLEND_NOSHADOW,
+	SW_VK_HYBRID_VARIANT_POST_BLEND_SHADOW,
+	SW_VK_HYBRID_VARIANT_DEBUG_DEPTH,
+	SW_VK_HYBRID_VARIANT_DEBUG_NORMAL,
+	SW_VK_HYBRID_VARIANT_DEBUG_UV,
+	SW_VK_HYBRID_VARIANT_DEBUG_MATERIAL,
+	SW_VK_HYBRID_VARIANT_DEBUG_ALBEDO,
+	SW_VK_HYBRID_VARIANT_DEBUG_SURFACE,
+	SW_VK_HYBRID_VARIANT_COUNT
+};
+
+struct swVkHybridCompositeShader_t {
+	const unsigned int *code;
+	size_t codeSize;
+	const char *name;
+	bool needsRayQuery;
+};
+
+#define SW_VK_HYBRID_SHADER( name, rayQuery ) { name, sizeof( name ), #name, rayQuery }
+
+static const swVkHybridCompositeShader_t swVkHybridCompositeShaders[SW_VK_HYBRID_VARIANT_COUNT] = {
+	SW_VK_HYBRID_SHADER( swHybridCompositeGenericNoShadowCompSpv, false ),
+	SW_VK_HYBRID_SHADER( swHybridCompositeCompSpv, true ),
+	SW_VK_HYBRID_SHADER( swHybridCompositeNoLightsCompSpv, false ),
+	SW_VK_HYBRID_SHADER( swHybridCompositeAmbientOnlyCompSpv, false ),
+	SW_VK_HYBRID_SHADER( swHybridCompositeProjectedNoShadowCompSpv, false ),
+	SW_VK_HYBRID_SHADER( swHybridCompositeProjectedShadowCompSpv, true ),
+	SW_VK_HYBRID_SHADER( swHybridCompositePostFogNoShadowCompSpv, false ),
+	SW_VK_HYBRID_SHADER( swHybridCompositePostFogShadowCompSpv, true ),
+	SW_VK_HYBRID_SHADER( swHybridCompositePostBlendNoShadowCompSpv, false ),
+	SW_VK_HYBRID_SHADER( swHybridCompositePostBlendShadowCompSpv, true ),
+	SW_VK_HYBRID_SHADER( swHybridCompositeDebugDepthCompSpv, false ),
+	SW_VK_HYBRID_SHADER( swHybridCompositeDebugNormalCompSpv, false ),
+	SW_VK_HYBRID_SHADER( swHybridCompositeDebugUvCompSpv, false ),
+	SW_VK_HYBRID_SHADER( swHybridCompositeDebugMaterialCompSpv, false ),
+	SW_VK_HYBRID_SHADER( swHybridCompositeDebugAlbedoCompSpv, false ),
+	SW_VK_HYBRID_SHADER( swHybridCompositeDebugSurfaceCompSpv, false )
+};
+
+#undef SW_VK_HYBRID_SHADER
+
 static const int SW_VK_MAX_SHADOW_JOBS = 64;
 static const uint32_t SW_VK_LINEAR_GROUP_SIZE_X = 32;
 static const uint32_t SW_VK_LINEAR_GROUP_SIZE_Y = 4;
@@ -358,6 +409,8 @@ static const uint32_t SW_VK_OVERLAY_TILE_WIDTH = 32;
 static const uint32_t SW_VK_OVERLAY_TILE_HEIGHT = 16;
 static const int SW_VK_OVERLAY_TILE_MAX_REFS = 8 * 1024 * 1024;
 static const uint32_t SW_VK_SHADOW_GROUP_SIZE_X = 128;
+static const unsigned int SW_VK_HYBRID_LIGHT_TYPE_FOG = 1u;
+static const unsigned int SW_VK_HYBRID_LIGHT_TYPE_BLEND = 2u;
 static const VkDeviceSize SW_VK_MIN_TEXTURE_INFO_BYTES = 4096 * sizeof( swHybridTextureInfo_t );
 static const VkDeviceSize SW_VK_MIN_TEXTURE_TEXEL_BYTES = 32 * 1024 * 1024 * sizeof( uint32_t );
 
@@ -531,6 +584,7 @@ private:
 	void DestroyUploadBuffer();
 	void LogFailure( const char *text );
 	void UpdateHybridDescriptorSet();
+	swVkHybridCompositeVariant_t SelectHybridCompositeVariant( const swHybridGBufferUpload_t &gbuffer, bool shadowsActive ) const;
 	bool RecordHybridCompositeCommands( bool outputForCompute );
 	void RecordHybridFrameTransferBarrier();
 	void ReadTimestampQueries();
@@ -578,6 +632,7 @@ private:
 	int hybridLightTileCount;
 	int hybridLightIndexCount;
 	bool hybridShadowEnabled;
+	swVkHybridCompositeVariant_t hybridCompositeVariant;
 	float hybridViewOrigin[3];
 	idList<unsigned int> hybrid2DSourcePixels;
 	idList<swVk2DJob_t> hybrid2DJobs;
@@ -641,8 +696,8 @@ private:
 	VkDescriptorPool hybridDescriptorPool;
 	VkDescriptorSet hybridDescriptorSet;
 	VkPipelineLayout hybridPipelineLayout;
-	VkPipeline hybridPipeline;
-	VkShaderModule hybridShaderModule;
+	VkPipeline hybridPipelines[SW_VK_HYBRID_VARIANT_COUNT];
+	VkShaderModule hybridShaderModules[SW_VK_HYBRID_VARIANT_COUNT];
 
 	swVkBuffer_t shadowScratchBuffer;
 	swVkBuffer_t tlasBuffer;
@@ -731,6 +786,7 @@ idSoftwareVulkanBridge::idSoftwareVulkanBridge() {
 	hybridLightTileCount = 0;
 	hybridLightIndexCount = 0;
 	hybridShadowEnabled = false;
+	hybridCompositeVariant = SW_VK_HYBRID_VARIANT_GENERIC_NOSHADOW;
 	hybridViewOrigin[0] = hybridViewOrigin[1] = hybridViewOrigin[2] = 0.0f;
 	hybridOverlaySourceWidth = 0;
 	hybridOverlaySourceHeight = 0;
@@ -765,8 +821,10 @@ idSoftwareVulkanBridge::idSoftwareVulkanBridge() {
 	hybridDescriptorPool = VK_NULL_HANDLE;
 	hybridDescriptorSet = VK_NULL_HANDLE;
 	hybridPipelineLayout = VK_NULL_HANDLE;
-	hybridPipeline = VK_NULL_HANDLE;
-	hybridShaderModule = VK_NULL_HANDLE;
+	for ( int i = 0; i < SW_VK_HYBRID_VARIANT_COUNT; i++ ) {
+		hybridPipelines[i] = VK_NULL_HANDLE;
+		hybridShaderModules[i] = VK_NULL_HANDLE;
+	}
 
 	twoDDescriptorSetLayout = VK_NULL_HANDLE;
 	twoDDescriptorPool = VK_NULL_HANDLE;
@@ -1775,31 +1833,38 @@ bool idSoftwareVulkanBridge::CreateHybridPipeline() {
 		return false;
 	}
 
-	VkShaderModuleCreateInfo shaderInfo;
-	memset( &shaderInfo, 0, sizeof( shaderInfo ) );
-	shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-	shaderInfo.codeSize = sizeof( swHybridCompositeCompSpv );
-	shaderInfo.pCode = swHybridCompositeCompSpv;
-	if ( vkCreateShaderModule( device, &shaderInfo, NULL, &hybridShaderModule ) != VK_SUCCESS ) {
-		LogFailure( "vkCreateShaderModule hybrid failed" );
-		return false;
-	}
+	for ( int i = 0; i < SW_VK_HYBRID_VARIANT_COUNT; i++ ) {
+		const swVkHybridCompositeShader_t &shader = swVkHybridCompositeShaders[i];
+		if ( shader.needsRayQuery && !rayQuerySupported ) {
+			continue;
+		}
 
-	VkPipelineShaderStageCreateInfo stageInfo;
-	memset( &stageInfo, 0, sizeof( stageInfo ) );
-	stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-	stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-	stageInfo.module = hybridShaderModule;
-	stageInfo.pName = "main";
+		VkShaderModuleCreateInfo shaderInfo;
+		memset( &shaderInfo, 0, sizeof( shaderInfo ) );
+		shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+		shaderInfo.codeSize = shader.codeSize;
+		shaderInfo.pCode = shader.code;
+		if ( vkCreateShaderModule( device, &shaderInfo, NULL, &hybridShaderModules[i] ) != VK_SUCCESS ) {
+			LogFailure( "vkCreateShaderModule hybrid failed" );
+			return false;
+		}
 
-	VkComputePipelineCreateInfo pipelineInfo;
-	memset( &pipelineInfo, 0, sizeof( pipelineInfo ) );
-	pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-	pipelineInfo.stage = stageInfo;
-	pipelineInfo.layout = hybridPipelineLayout;
-	if ( vkCreateComputePipelines( device, VK_NULL_HANDLE, 1, &pipelineInfo, NULL, &hybridPipeline ) != VK_SUCCESS ) {
-		LogFailure( "vkCreateComputePipelines hybrid failed" );
-		return false;
+		VkPipelineShaderStageCreateInfo stageInfo;
+		memset( &stageInfo, 0, sizeof( stageInfo ) );
+		stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+		stageInfo.module = hybridShaderModules[i];
+		stageInfo.pName = "main";
+
+		VkComputePipelineCreateInfo pipelineInfo;
+		memset( &pipelineInfo, 0, sizeof( pipelineInfo ) );
+		pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+		pipelineInfo.stage = stageInfo;
+		pipelineInfo.layout = hybridPipelineLayout;
+		if ( vkCreateComputePipelines( device, VK_NULL_HANDLE, 1, &pipelineInfo, NULL, &hybridPipelines[i] ) != VK_SUCCESS ) {
+			LogFailure( "vkCreateComputePipelines hybrid failed" );
+			return false;
+		}
 	}
 
 	VkDescriptorPoolSize poolSizes[2];
@@ -2413,6 +2478,72 @@ void idSoftwareVulkanBridge::UpdateHybridUpscaleDescriptorSet() {
 		writes[i].pBufferInfo = &infos[i];
 	}
 	vkUpdateDescriptorSets( device, 2, writes, 0, NULL );
+}
+
+swVkHybridCompositeVariant_t idSoftwareVulkanBridge::SelectHybridCompositeVariant( const swHybridGBufferUpload_t &gbuffer, bool shadowsActive ) const {
+	switch ( idMath::ClampInt( 0, 6, gbuffer.debugView ) ) {
+		case 1: return SW_VK_HYBRID_VARIANT_DEBUG_DEPTH;
+		case 2: return SW_VK_HYBRID_VARIANT_DEBUG_NORMAL;
+		case 3: return SW_VK_HYBRID_VARIANT_DEBUG_UV;
+		case 4: return SW_VK_HYBRID_VARIANT_DEBUG_MATERIAL;
+		case 5: return SW_VK_HYBRID_VARIANT_DEBUG_ALBEDO;
+		case 6: return SW_VK_HYBRID_VARIANT_DEBUG_SURFACE;
+		default: break;
+	}
+
+	const int lightCount = Max( 0, gbuffer.lightCount );
+	if ( lightCount <= 0 || !gbuffer.lights ) {
+		return SW_VK_HYBRID_VARIANT_NO_LIGHTS;
+	}
+
+	const int normalCount = idMath::ClampInt( 0, lightCount, gbuffer.normalLightCount );
+	const int postCount = idMath::ClampInt( 0, lightCount - normalCount, gbuffer.postLightCount );
+	bool hasAmbientNormal = false;
+	bool hasProjectedNormal = false;
+	bool hasShadowedNormal = false;
+
+	for ( int i = 0; i < normalCount; i++ ) {
+		const swHybridLight_t &light = gbuffer.lights[i];
+		if ( light.flags[0] != 0u ) {
+			hasAmbientNormal = true;
+		} else {
+			hasProjectedNormal = true;
+			if ( light.flags[2] != 0u ) {
+				hasShadowedNormal = true;
+			}
+		}
+	}
+
+	const bool useShadowVariant = shadowsActive && hasShadowedNormal && rayQuerySupported;
+
+	if ( postCount <= 0 ) {
+		if ( normalCount <= 0 ) {
+			return SW_VK_HYBRID_VARIANT_NO_LIGHTS;
+		}
+		if ( hasAmbientNormal && !hasProjectedNormal ) {
+			return SW_VK_HYBRID_VARIANT_AMBIENT_ONLY;
+		}
+		if ( hasProjectedNormal && !hasAmbientNormal ) {
+			return useShadowVariant ? SW_VK_HYBRID_VARIANT_PROJECTED_SHADOW : SW_VK_HYBRID_VARIANT_PROJECTED_NOSHADOW;
+		}
+		return useShadowVariant ? SW_VK_HYBRID_VARIANT_GENERIC_SHADOW : SW_VK_HYBRID_VARIANT_GENERIC_NOSHADOW;
+	}
+
+	bool postAllFog = true;
+	bool postAllBlend = true;
+	for ( int i = normalCount; i < normalCount + postCount; i++ ) {
+		const unsigned int type = gbuffer.lights[i].flags[3];
+		postAllFog = postAllFog && type == SW_VK_HYBRID_LIGHT_TYPE_FOG;
+		postAllBlend = postAllBlend && type == SW_VK_HYBRID_LIGHT_TYPE_BLEND;
+	}
+
+	if ( postAllFog ) {
+		return useShadowVariant ? SW_VK_HYBRID_VARIANT_POST_FOG_SHADOW : SW_VK_HYBRID_VARIANT_POST_FOG_NOSHADOW;
+	}
+	if ( postAllBlend ) {
+		return useShadowVariant ? SW_VK_HYBRID_VARIANT_POST_BLEND_SHADOW : SW_VK_HYBRID_VARIANT_POST_BLEND_NOSHADOW;
+	}
+	return useShadowVariant ? SW_VK_HYBRID_VARIANT_GENERIC_SHADOW : SW_VK_HYBRID_VARIANT_GENERIC_NOSHADOW;
 }
 
 bool idSoftwareVulkanBridge::EnsureShadowBuffers( int width, int height ) {
@@ -3402,6 +3533,7 @@ bool idSoftwareVulkanBridge::CompositeHybridGBuffer( const viewDef_t *viewDef, c
 	if ( gbuffer.lightCount > 0 && r_softwareRayQueryShadows.GetBool() && r_softwareHybridRayQueryShadows.GetBool() && rayQuerySupported ) {
 		hybridShadowEnabled = PrepareRayQueryScene( viewDef ) && tlas != VK_NULL_HANDLE;
 	}
+	hybridCompositeVariant = SelectHybridCompositeVariant( gbuffer, hybridShadowEnabled );
 	UpdateHybridDescriptorSet();
 	BeginFrame( false );
 
@@ -3995,9 +4127,14 @@ bool idSoftwareVulkanBridge::RecordOverlayRasterCommands( bool targetFrame ) {
 }
 
 bool idSoftwareVulkanBridge::RecordHybridCompositeCommands( bool outputForCompute ) {
+	int variant = static_cast<int>( hybridCompositeVariant );
+	if ( variant < 0 || variant >= SW_VK_HYBRID_VARIANT_COUNT || hybridPipelines[variant] == VK_NULL_HANDLE ) {
+		variant = static_cast<int>( SW_VK_HYBRID_VARIANT_GENERIC_NOSHADOW );
+	}
+
 	if ( !hybridFrameDirty ||
 		 hybridDescriptorSet == VK_NULL_HANDLE || hybridUpscaleDescriptorSet == VK_NULL_HANDLE ||
-		 hybridPipeline == VK_NULL_HANDLE || twoDPipeline == VK_NULL_HANDLE || twoDPipelineLayout == VK_NULL_HANDLE ||
+		 hybridPipelines[variant] == VK_NULL_HANDLE || twoDPipeline == VK_NULL_HANDLE || twoDPipelineLayout == VK_NULL_HANDLE ||
 		 hybridLitBuffer.buffer == VK_NULL_HANDLE || hybridOverlayBuffer.buffer == VK_NULL_HANDLE ||
 		 hybridFrameBuffer.buffer == VK_NULL_HANDLE ) {
 		return false;
@@ -4084,7 +4221,7 @@ bool idSoftwareVulkanBridge::RecordHybridCompositeCommands( bool outputForComput
 	push.viewOrigin[2] = hybridViewOrigin[2];
 	push.viewOrigin[3] = 1.0f;
 
-	vkCmdBindPipeline( commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, hybridPipeline );
+	vkCmdBindPipeline( commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, hybridPipelines[variant] );
 	vkCmdBindDescriptorSets( commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, hybridPipelineLayout, 0, 1, &hybridDescriptorSet, 0, NULL );
 	vkCmdPushConstants( commandBuffer, hybridPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
 	vkCmdDispatch( commandBuffer,
@@ -4712,6 +4849,7 @@ void idSoftwareVulkanBridge::DestroyHybridBuffers() {
 	hybridLightTileCount = 0;
 	hybridLightIndexCount = 0;
 	hybridShadowEnabled = false;
+	hybridCompositeVariant = SW_VK_HYBRID_VARIANT_GENERIC_NOSHADOW;
 	hybridFrameDirty = false;
 	hybridOverlayDirty = false;
 	hybridOverlayOnly = false;
@@ -4802,13 +4940,15 @@ void idSoftwareVulkanBridge::DestroyOverlayTilePipeline() {
 void idSoftwareVulkanBridge::DestroyHybridPipeline() {
 	DestroyHybridBuffers();
 
-	if ( hybridPipeline != VK_NULL_HANDLE ) {
-		vkDestroyPipeline( device, hybridPipeline, NULL );
-		hybridPipeline = VK_NULL_HANDLE;
-	}
-	if ( hybridShaderModule != VK_NULL_HANDLE ) {
-		vkDestroyShaderModule( device, hybridShaderModule, NULL );
-		hybridShaderModule = VK_NULL_HANDLE;
+	for ( int i = 0; i < SW_VK_HYBRID_VARIANT_COUNT; i++ ) {
+		if ( hybridPipelines[i] != VK_NULL_HANDLE ) {
+			vkDestroyPipeline( device, hybridPipelines[i], NULL );
+			hybridPipelines[i] = VK_NULL_HANDLE;
+		}
+		if ( hybridShaderModules[i] != VK_NULL_HANDLE ) {
+			vkDestroyShaderModule( device, hybridShaderModules[i], NULL );
+			hybridShaderModules[i] = VK_NULL_HANDLE;
+		}
 	}
 	if ( hybridPipelineLayout != VK_NULL_HANDLE ) {
 		vkDestroyPipelineLayout( device, hybridPipelineLayout, NULL );
@@ -4951,6 +5091,7 @@ void idSoftwareVulkanBridge::Shutdown() {
 	hybridLightTileCount = 0;
 	hybridLightIndexCount = 0;
 	hybridShadowEnabled = false;
+	hybridCompositeVariant = SW_VK_HYBRID_VARIANT_GENERIC_NOSHADOW;
 	hybridOverlayDirty = false;
 	hybridOverlayOnly = false;
 	twoDDescriptorSet = VK_NULL_HANDLE;
