@@ -2,7 +2,7 @@
 
 A Software renderer for Doom 3 with optional compute based acceleration with optional raytraced shadows via vulkan headless raytracing extensions.
 
-![Doom3Software Rasterizer]([https://i.ibb.co/mC0wbV9Z/image.webp](https://i.ibb.co/NdgRrVXn/image-1.webp))
+![Doom3Software Rasterizer](https://i.ibb.co/NdgRrVXn/image-1.webp)
 
 ## Status
 
