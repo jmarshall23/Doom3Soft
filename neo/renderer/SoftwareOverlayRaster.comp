@@ -121,19 +121,74 @@ uint PackColorVec( vec4 color ) {
 	return PackColor( ByteFromFloat( color.r ), ByteFromFloat( color.g ), ByteFromFloat( color.b ), ByteFromFloat( color.a ) );
 }
 
-uint SampleTextureNearest( uint textureId, float s, float t, uint fallbackColor ) {
+uint MipLevelOffset( TextureInfo info, uint level, out uint width, out uint height ) {
+	uint offset = info.offset;
+	width = info.width;
+	height = info.height;
+	for ( uint i = 0u; i < level; i++ ) {
+		offset += width * height;
+		width = max( 1u, ( width + 1u ) >> 1 );
+		height = max( 1u, ( height + 1u ) >> 1 );
+	}
+	return offset;
+}
+
+uint AddressTextureTexel( int coord, uint size, uint repeat ) {
+	if ( repeat == 0u ) {
+		int wrapped = coord % int( size );
+		return uint( wrapped < 0 ? wrapped + int( size ) : wrapped );
+	}
+	return uint( clamp( coord, 0, int( size ) - 1 ) );
+}
+
+vec4 FetchTextureTexel( TextureInfo info, uint level, int x, int y ) {
+	uint width;
+	uint height;
+	uint offset = MipLevelOffset( info, level, width, height );
+	uint sx = AddressTextureTexel( x, width, info.repeat );
+	uint sy = AddressTextureTexel( y, height, info.repeat );
+	return UnpackColor( textureTexels[offset + sy * width + sx] );
+}
+
+uint MaxTextureMipLevel( TextureInfo info ) {
+	uint width = info.width;
+	uint height = info.height;
+	uint level = 0u;
+	while ( width > 1u || height > 1u ) {
+		width = max( 1u, ( width + 1u ) >> 1 );
+		height = max( 1u, ( height + 1u ) >> 1 );
+		level++;
+	}
+	return level;
+}
+
+vec4 SampleTextureLevelLinear( TextureInfo info, uint level, vec2 uv ) {
+	uint width;
+	uint height;
+	MipLevelOffset( info, level, width, height );
+	vec2 texel = uv * vec2( float( width ), float( height ) ) - vec2( 0.5 );
+	ivec2 base = ivec2( floor( texel ) );
+	vec2 blend = fract( texel );
+	vec4 c00 = FetchTextureTexel( info, level, base.x, base.y );
+	vec4 c10 = FetchTextureTexel( info, level, base.x + 1, base.y );
+	vec4 c01 = FetchTextureTexel( info, level, base.x, base.y + 1 );
+	vec4 c11 = FetchTextureTexel( info, level, base.x + 1, base.y + 1 );
+	return mix( mix( c00, c10, blend.x ), mix( c01, c11, blend.x ), blend.y );
+}
+
+vec4 SampleTextureMip( uint textureId, float s, float t, float lod, uint fallbackColor ) {
 	if ( textureId == 0xffffffffu || textureId >= pc.textureCount ) {
-		return fallbackColor;
+		return UnpackColor( fallbackColor );
 	}
 
 	TextureInfo info = textureInfos[textureId];
 	if ( info.width == 0u || info.height == 0u ) {
-		return fallbackColor;
+		return UnpackColor( fallbackColor );
 	}
 
 	bool outside = s < 0.0 || s > 1.0 || t < 0.0 || t > 1.0;
 	if ( outside && ( info.repeat == 3u || info.repeat == 4u ) ) {
-		return info.repeat == 4u ? PackColor( 0u, 0u, 0u, 0u ) : PackColor( 0u, 0u, 0u, 255u );
+		return info.repeat == 4u ? vec4( 0.0 ) : vec4( 0.0, 0.0, 0.0, 1.0 );
 	}
 	if ( info.repeat == 0u ) {
 		s = fract( s );
@@ -145,9 +200,31 @@ uint SampleTextureNearest( uint textureId, float s, float t, uint fallbackColor 
 		t = clamp( t, 0.0, 1.0 );
 	}
 
-	uint x = min( info.width - 1u, uint( s * float( info.width ) ) );
-	uint y = min( info.height - 1u, uint( t * float( info.height ) ) );
-	return textureTexels[info.offset + y * info.width + x];
+	uint maxLevel = MaxTextureMipLevel( info );
+	float clampedLod = clamp( lod, 0.0, float( maxLevel ) );
+	uint level0 = uint( floor( clampedLod ) );
+	uint level1 = min( maxLevel, level0 + 1u );
+	vec2 uv = vec2( s, t );
+	vec4 c0 = SampleTextureLevelLinear( info, level0, uv );
+	if ( level0 == level1 ) {
+		return c0;
+	}
+	return mix( c0, SampleTextureLevelLinear( info, level1, uv ), clampedLod - float( level0 ) );
+}
+
+float TextureLodForDerivatives( uint textureId, float dsdx, float dtdx, float dsdy, float dtdy ) {
+	if ( textureId == 0xffffffffu || textureId >= pc.textureCount ) {
+		return 0.0;
+	}
+	TextureInfo info = textureInfos[textureId];
+	if ( info.width <= 1u && info.height <= 1u ) {
+		return 0.0;
+	}
+	vec2 textureSize = vec2( float( info.width ), float( info.height ) );
+	float rhoX = length( vec2( dsdx, dtdx ) * textureSize );
+	float rhoY = length( vec2( dsdy, dtdy ) * textureSize );
+	float rho = max( rhoX, rhoY );
+	return rho > 1.0 ? log2( rho ) : 0.0;
 }
 
 uint BlendSourceOver( uint src, uint dst ) {
@@ -365,11 +442,21 @@ void main() {
 		return;
 	}
 	float invPerspective = 1.0 / invW;
-	float s = EvalPlane( tri.sPlane, srcX, srcY ) * invPerspective;
-	float t = EvalPlane( tri.tPlane, srcX, srcY ) * invPerspective;
+	float sOverW = EvalPlane( tri.sPlane, srcX, srcY );
+	float tOverW = EvalPlane( tri.tPlane, srcX, srcY );
+	float s = sOverW * invPerspective;
+	float t = tOverW * invPerspective;
 
-	uint srcColor = ( tri.params0.z & FLAG_TEXTURE ) != 0u ?
-		SampleTextureNearest( tri.params0.x, s, t, tri.params0.y ) : tri.params0.y;
+	uint srcColor = tri.params0.y;
+	if ( ( tri.params0.z & FLAG_TEXTURE ) != 0u ) {
+		float invW2 = invW * invW;
+		float dsdx = invW2 > 0.000000001 ? ( tri.sPlane.y * invW - sOverW * tri.invWPlane.y ) / invW2 : 0.0;
+		float dtdx = invW2 > 0.000000001 ? ( tri.tPlane.y * invW - tOverW * tri.invWPlane.y ) / invW2 : 0.0;
+		float dsdy = invW2 > 0.000000001 ? ( tri.sPlane.z * invW - sOverW * tri.invWPlane.z ) / invW2 : 0.0;
+		float dtdy = invW2 > 0.000000001 ? ( tri.tPlane.z * invW - tOverW * tri.invWPlane.z ) / invW2 : 0.0;
+		float lod = TextureLodForDerivatives( tri.params0.x, dsdx, dtdx, dsdy, dtdy );
+		srcColor = PackColorVec( SampleTextureMip( tri.params0.x, s, t, lod, tri.params0.y ) );
+	}
 	if ( ( tri.params0.z & FLAG_COLOR_MOD ) != 0u ) {
 		vec4 colorScale = ( tri.colorPlane0 + tri.colorPlane1 * srcX + tri.colorPlane2 * srcY ) * invPerspective;
 		srcColor = PackColorVec( UnpackColor( srcColor ) * clamp( colorScale, vec4( 0.0 ), vec4( 1.0 ) ) );

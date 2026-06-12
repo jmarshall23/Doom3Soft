@@ -879,7 +879,10 @@ void RB_DrawView( const void *data ) {
 
 	RB_ShowOverdraw();
 
-	if ( r_useSoftwareRenderer.GetBool() ) {
+	const bool useSoftwareDrawView = r_useSoftwareRenderer.GetBool() &&
+		!backEnd.viewDef->isSubview &&
+		!backEnd.viewDef->isMirror;
+	if ( useSoftwareDrawView ) {
 		RB_SW_DrawView();
 	} else {
 		// render the scene, jumping to the hardware specific interaction renderers

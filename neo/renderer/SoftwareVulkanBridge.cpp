@@ -3397,7 +3397,7 @@ bool idSoftwareVulkanBridge::PrepareRayQueryScene( const viewDef_t *viewDef ) {
 		if ( !surf || !surf->geo || !surf->space || !surf->material ) {
 			continue;
 		}
-		if ( !surf->material->IsDrawn() || !surf->material->SurfaceCastsShadow() || surf->material->Coverage() == MC_TRANSLUCENT ) {
+		if ( !surf->material->IsDrawn() || !surf->material->SurfaceCastsShadow() || surf->material->Coverage() != MC_OPAQUE ) {
 			continue;
 		}
 		const float sort = surf->material->GetSort();

@@ -39,7 +39,7 @@ static const int SW_TILE_SIZE = 16;
 static const int SW_MAX_CLIP_VERTS = 12;
 static const int SW_INTERACTION_ATTR_COUNT = 18;
 static const float SW_DEPTH_EQUAL_EPSILON = 0.0001f;
-static const int SW_FP_SHIFT = 4;
+static const int SW_FP_SHIFT = 8;
 static const int SW_FP_ONE = 1 << SW_FP_SHIFT;
 static const int SW_FP_HALF = SW_FP_ONE >> 1;
 static const int SW_WRITE_RED = BIT(0);
@@ -235,6 +235,7 @@ struct swTexture_t {
 		image = NULL;
 		width = 0;
 		height = 0;
+		mipCount = 0;
 		repeat = TR_REPEAT;
 	}
 
@@ -242,8 +243,12 @@ struct swTexture_t {
 	idStr name;
 	int width;
 	int height;
+	int mipCount;
 	textureRepeat_t repeat;
 	idList<unsigned int> texels;
+	idList<int> mipOffsets;
+	idList<int> mipWidths;
+	idList<int> mipHeights;
 };
 
 struct swFogLightState_t {
@@ -525,9 +530,15 @@ private:
 	bool LoadBoundTexture( swTexture_t &texture, const idImage *image ) const;
 	bool LoadGeneratedTexture( swTexture_t &texture, const idImage *image ) const;
 	void LoadDefaultTexture( swTexture_t &texture ) const;
+	void BuildTextureMipChain( swTexture_t &texture ) const;
 	unsigned int SampleTexture( int textureIndex, float s, float t ) const;
 	unsigned int SampleTextureLinear( int textureIndex, float s, float t ) const;
-	unsigned int TextureTexel( const swTexture_t &texture, int x, int y ) const;
+	unsigned int SampleTextureMip( int textureIndex, float s, float t, float lod ) const;
+	unsigned int SampleTextureLinearMip( int textureIndex, float s, float t, float lod ) const;
+	unsigned int SampleTextureLevelLinear( const swTexture_t &texture, int level, float s, float t ) const;
+	unsigned int TextureTexel( const swTexture_t &texture, int level, int x, int y ) const;
+	float TextureLodForGradients( int textureIndex, float invW, float sOverW, float tOverW, float dsOverWdx, float dtOverWdx, float dinvWdx, float dsOverWdy, float dtOverWdy, float dinvWdy ) const;
+	float TextureLodForDerivatives( int textureIndex, float dsdx, float dtdx, float dsdy, float dtdy ) const;
 	unsigned int SurfaceColor( int surfIndex, const drawSurf_t *surf ) const;
 	static unsigned int DebugTextureColor( int mode, float s, float t );
 	static unsigned int BlendSourceOver( unsigned int src, unsigned int dst );
@@ -550,6 +561,8 @@ private:
 	static unsigned int PackOptionalTextureId16( int textureIndex );
 	static unsigned int IdDebugColor( unsigned int value );
 	static unsigned int ModulateColor( unsigned int color, const float scale[4] );
+	static unsigned int AverageTexels( unsigned int c00, unsigned int c10, unsigned int c01, unsigned int c11 );
+	static unsigned int LerpTexels( unsigned int c0, unsigned int c1, float fraction );
 	static unsigned int AdditiveColor( unsigned int src, unsigned int dst );
 	static float ColorChannel( unsigned int color, int shift );
 	static int TextureImageHashKey( const idImage *image );
@@ -899,7 +912,7 @@ void idSoftwareRasterizer::SetupDepthPrepass( const viewDef_t *viewDef ) {
 			continue;
 		}
 		const float sort = surf->material->GetSort();
-		if ( sort < SS_OPAQUE || sort == SS_PORTAL_SKY || sort >= SS_POST_PROCESS ) {
+		if ( sort != SS_OPAQUE ) {
 			continue;
 		}
 		SetupDepthDrawSurf( viewDef, surf );
@@ -913,7 +926,8 @@ void idSoftwareRasterizer::SetupAmbientTriangles( const viewDef_t *viewDef ) {
 			continue;
 		}
 		const float sort = surf->material->GetSort();
-		if ( sort < SS_OPAQUE || sort == SS_PORTAL_SKY || sort >= SS_POST_PROCESS ) {
+		const bool guiSort = sort >= SS_GUI && sort < SS_OPAQUE;
+		if ( ( sort < SS_OPAQUE && !guiSort ) || sort == SS_PORTAL_SKY || sort >= SS_POST_PROCESS ) {
 			continue;
 		}
 
@@ -940,10 +954,11 @@ void idSoftwareRasterizer::SetupTranslucentTriangles( const viewDef_t *viewDef )
 			continue;
 		}
 		const float sort = surf->material->GetSort();
+		const bool guiSort = sort >= SS_GUI && sort < SS_OPAQUE;
 		if ( sort >= SS_POST_PROCESS ) {
 			continue;
 		}
-		if ( sort <= SS_OPAQUE && surf->material->Coverage() != MC_TRANSLUCENT ) {
+		if ( sort <= SS_OPAQUE && !guiSort && surf->material->Coverage() != MC_TRANSLUCENT ) {
 			continue;
 		}
 		SetupDrawSurf( viewDef, surf );
@@ -1085,11 +1100,13 @@ void idSoftwareRasterizer::SetupDepthDrawSurf( const viewDef_t *viewDef, const d
 void idSoftwareRasterizer::ConfigureStageForView( const viewDef_t *viewDef, const drawSurf_t *surf, swSurfaceStage_t &stage ) const {
 	const bool is2DView = viewDef->viewEntitys == NULL;
 	const bool materialTranslucent = surf->material->Coverage() == MC_TRANSLUCENT;
-	const bool sortedAfterOpaque = surf->material->GetSort() > SS_OPAQUE;
-	const bool translucent = is2DView || materialTranslucent || sortedAfterOpaque;
+	const float sort = surf->material->GetSort();
+	const bool guiSort = sort >= SS_GUI && sort < SS_OPAQUE;
+	const bool sortedAfterOpaque = sort > SS_OPAQUE;
+	const bool translucent = is2DView || materialTranslucent || sortedAfterOpaque || guiSort;
 	stage.depthTest = viewDef->viewEntitys != NULL;
 	stage.depthWrite = viewDef->viewEntitys != NULL && !translucent;
-	stage.depthEqual = viewDef->viewEntitys != NULL && sortedAfterOpaque && !materialTranslucent;
+	stage.depthEqual = viewDef->viewEntitys != NULL && sortedAfterOpaque && !translucent;
 	if ( is2DView && ( stage.writeMask & ( SW_WRITE_RED | SW_WRITE_GREEN | SW_WRITE_BLUE ) ) &&
 		 stage.srcBlend == GLS_SRCBLEND_ONE && stage.dstBlend == GLS_DSTBLEND_ZERO ) {
 		stage.srcBlend = GLS_SRCBLEND_SRC_ALPHA;
@@ -1264,8 +1281,8 @@ bool idSoftwareRasterizer::TransformVertex( const idDrawVert &src, const float *
 	const float sx = ( ndcX * 0.5f + 0.5f ) * static_cast<float>( width );
 	const float sy = ( ndcY * 0.5f + 0.5f ) * static_cast<float>( height );
 
-	dst.x = idMath::FtoiFast( sx * static_cast<float>( SW_FP_ONE ) );
-	dst.y = idMath::FtoiFast( sy * static_cast<float>( SW_FP_ONE ) );
+	dst.x = idMath::FtoiFast( sx * static_cast<float>( SW_FP_ONE ) + 0.5f );
+	dst.y = idMath::FtoiFast( sy * static_cast<float>( SW_FP_ONE ) + 0.5f );
 	dst.z = ndcZ * 0.5f + 0.5f;
 	dst.invW = 1.0f / clip[3];
 	dst.sOverW = 0.0f;
@@ -1491,8 +1508,8 @@ bool idSoftwareRasterizer::ProjectClipVertex( const swClipVert_t &src, swScreenV
 	const float sx = ( idMath::ClampFloat( -1.0f, 1.0f, ndcX ) * 0.5f + 0.5f ) * static_cast<float>( width );
 	const float sy = ( idMath::ClampFloat( -1.0f, 1.0f, ndcY ) * 0.5f + 0.5f ) * static_cast<float>( height );
 
-	dst.x = idMath::FtoiFast( sx * static_cast<float>( SW_FP_ONE ) );
-	dst.y = idMath::FtoiFast( sy * static_cast<float>( SW_FP_ONE ) );
+	dst.x = idMath::FtoiFast( sx * static_cast<float>( SW_FP_ONE ) + 0.5f );
+	dst.y = idMath::FtoiFast( sy * static_cast<float>( SW_FP_ONE ) + 0.5f );
 	dst.z = idMath::ClampFloat( 0.0f, 1.0f, ndcZ * 0.5f + 0.5f );
 	dst.invW = invW;
 	dst.sOverW = src.s * invW;
@@ -1522,8 +1539,8 @@ bool idSoftwareRasterizer::ProjectInteractionClipVertex( const swClipVert_t &src
 	const float sx = ( idMath::ClampFloat( -1.0f, 1.0f, ndcX ) * 0.5f + 0.5f ) * static_cast<float>( width );
 	const float sy = ( idMath::ClampFloat( -1.0f, 1.0f, ndcY ) * 0.5f + 0.5f ) * static_cast<float>( height );
 
-	dst.x = idMath::FtoiFast( sx * static_cast<float>( SW_FP_ONE ) );
-	dst.y = idMath::FtoiFast( sy * static_cast<float>( SW_FP_ONE ) );
+	dst.x = idMath::FtoiFast( sx * static_cast<float>( SW_FP_ONE ) + 0.5f );
+	dst.y = idMath::FtoiFast( sy * static_cast<float>( SW_FP_ONE ) + 0.5f );
 	dst.z = idMath::ClampFloat( 0.0f, 1.0f, ndcZ * 0.5f + 0.5f );
 	dst.invW = invW;
 	for ( int i = 0; i < SW_INTERACTION_ATTR_COUNT; i++ ) {
@@ -2160,7 +2177,7 @@ void idSoftwareRasterizer::BuildHybridTextureUpload( swHybridGBufferUpload_t &gb
 		 hybridTextureInfos.Num() == 0 ||
 		 hybridTextureTexels.Num() == 0 ) {
 		const unsigned int whiteTexel = PackColor( 255, 255, 255, 255 );
-		const int maxHybridTextureTexels = 128 * 1024 * 1024;
+		const int maxHybridTextureTexels = 256 * 1024 * 1024;
 		const int textureCount = Max( 1, textureCache.Num() );
 
 		hybridTextureInfos.SetNum( textureCount, false );
@@ -2177,10 +2194,7 @@ void idSoftwareRasterizer::BuildHybridTextureUpload( swHybridGBufferUpload_t &gb
 			if ( texture.width <= 0 || texture.height <= 0 || texture.texels.Num() <= 0 ) {
 				continue;
 			}
-			if ( texture.width > maxHybridTextureTexels / texture.height ) {
-				continue;
-			}
-			const int texelCount = texture.width * texture.height;
+			const int texelCount = texture.texels.Num();
 			if ( texelCount <= 0 || totalTexels > maxHybridTextureTexels - texelCount ) {
 				continue;
 			}
@@ -2203,7 +2217,7 @@ void idSoftwareRasterizer::BuildHybridTextureUpload( swHybridGBufferUpload_t &gb
 				continue;
 			}
 
-			const int texelCount = texture.width * texture.height;
+			const int texelCount = texture.texels.Num();
 			for ( int texel = 0; texel < texelCount; texel++ ) {
 				hybridTextureTexels[outTexel++] = texel < texture.texels.Num() ? texture.texels[texel] : whiteTexel;
 			}
@@ -2948,7 +2962,9 @@ void idSoftwareRasterizer::RasterizeAlphaTestDepthTriangleInTile( const swTriSet
 				const float invPerspective = 1.0f / invW;
 				const float s = sOverW * invPerspective;
 				const float t = tOverW * invPerspective;
-				const unsigned int texel = SampleTexture( tri.textureIndex, s, t );
+				const float lod = TextureLodForGradients( tri.textureIndex, invW, sOverW, tOverW,
+					tri.dsOverWdx, tri.dtOverWdx, tri.dinvWdx, tri.dsOverWdy, tri.dtOverWdy, tri.dinvWdy );
+				const unsigned int texel = SampleTextureMip( tri.textureIndex, s, t, lod );
 				int alpha = static_cast<int>( ( texel >> 24 ) & 255u );
 				if ( tri.needsColorModulation ) {
 					alpha = ByteFromFloat( static_cast<float>( alpha ) * ( 1.0f / 255.0f ) * colorOverW[3] * invPerspective );
@@ -3408,8 +3424,34 @@ unsigned int idSoftwareRasterizer::ShadeInteractionPixel( const swInteractionTri
 	const float diffuseT = st[0] * tri.diffuseMatrix[1][0] + st[1] * tri.diffuseMatrix[1][1] + tri.diffuseMatrix[1][3];
 	const float specularS = st[0] * tri.specularMatrix[0][0] + st[1] * tri.specularMatrix[0][1] + tri.specularMatrix[0][3];
 	const float specularT = st[0] * tri.specularMatrix[1][0] + st[1] * tri.specularMatrix[1][1] + tri.specularMatrix[1][3];
+	const float invW2 = invW * invW;
+	float stDsdx = 0.0f;
+	float stDtdx = 0.0f;
+	float stDsdy = 0.0f;
+	float stDtdy = 0.0f;
+	if ( invW2 > 0.000000001f ) {
+		stDsdx = ( tri.dAttrOverWdx[SW_ATTR_ST_X] * invW - attrOverW[SW_ATTR_ST_X] * tri.dinvWdx ) / invW2;
+		stDtdx = ( tri.dAttrOverWdx[SW_ATTR_ST_Y] * invW - attrOverW[SW_ATTR_ST_Y] * tri.dinvWdx ) / invW2;
+		stDsdy = ( tri.dAttrOverWdy[SW_ATTR_ST_X] * invW - attrOverW[SW_ATTR_ST_X] * tri.dinvWdy ) / invW2;
+		stDtdy = ( tri.dAttrOverWdy[SW_ATTR_ST_Y] * invW - attrOverW[SW_ATTR_ST_Y] * tri.dinvWdy ) / invW2;
+	}
+	const float bumpLod = TextureLodForDerivatives( tri.bumpTextureIndex,
+		stDsdx * tri.bumpMatrix[0][0] + stDtdx * tri.bumpMatrix[0][1],
+		stDsdx * tri.bumpMatrix[1][0] + stDtdx * tri.bumpMatrix[1][1],
+		stDsdy * tri.bumpMatrix[0][0] + stDtdy * tri.bumpMatrix[0][1],
+		stDsdy * tri.bumpMatrix[1][0] + stDtdy * tri.bumpMatrix[1][1] );
+	const float diffuseLod = TextureLodForDerivatives( tri.diffuseTextureIndex,
+		stDsdx * tri.diffuseMatrix[0][0] + stDtdx * tri.diffuseMatrix[0][1],
+		stDsdx * tri.diffuseMatrix[1][0] + stDtdx * tri.diffuseMatrix[1][1],
+		stDsdy * tri.diffuseMatrix[0][0] + stDtdy * tri.diffuseMatrix[0][1],
+		stDsdy * tri.diffuseMatrix[1][0] + stDtdy * tri.diffuseMatrix[1][1] );
+	const float specularLod = TextureLodForDerivatives( tri.specularTextureIndex,
+		stDsdx * tri.specularMatrix[0][0] + stDtdx * tri.specularMatrix[0][1],
+		stDsdx * tri.specularMatrix[1][0] + stDtdx * tri.specularMatrix[1][1],
+		stDsdy * tri.specularMatrix[0][0] + stDtdy * tri.specularMatrix[0][1],
+		stDsdy * tri.specularMatrix[1][0] + stDtdy * tri.specularMatrix[1][1] );
 
-	idVec3 bumpNormal = DecodeNormal( SampleTexture( tri.bumpTextureIndex, bumpS, bumpT ) );
+	idVec3 bumpNormal = DecodeNormal( SampleTextureMip( tri.bumpTextureIndex, bumpS, bumpT, bumpLod ) );
 	if ( bumpNormal.LengthSqr() <= 0.000001f ) {
 		bumpNormal.Set( 0.0f, 0.0f, 1.0f );
 	} else {
@@ -3454,7 +3496,7 @@ unsigned int idSoftwareRasterizer::ShadeInteractionPixel( const swInteractionTri
 		vertexScale[0] = vertexScale[1] = vertexScale[2] = vertexScale[3] = 1.0f;
 	}
 
-	const unsigned int diffuseTexel = SampleTexture( tri.diffuseTextureIndex, diffuseS, diffuseT );
+	const unsigned int diffuseTexel = SampleTextureMip( tri.diffuseTextureIndex, diffuseS, diffuseT, diffuseLod );
 	float r = ColorChannel( diffuseTexel, 16 ) * tri.diffuseColor[0] * ColorChannel( lightTexel, 16 ) * falloff * nDotL * shadowVisibility * vertexScale[0];
 	float g = ColorChannel( diffuseTexel, 8 ) * tri.diffuseColor[1] * ColorChannel( lightTexel, 8 ) * falloff * nDotL * shadowVisibility * vertexScale[1];
 	float b = ColorChannel( diffuseTexel, 0 ) * tri.diffuseColor[2] * ColorChannel( lightTexel, 0 ) * falloff * nDotL * shadowVisibility * vertexScale[2];
@@ -3471,7 +3513,7 @@ unsigned int idSoftwareRasterizer::ShadeInteractionPixel( const swInteractionTri
 					halfTS.Normalize();
 					const float specular = idMath::Pow( Max( 0.0f, bumpNormal * halfTS ), 16.0f );
 					if ( specular > 0.0f ) {
-						const unsigned int specularTexel = SampleTexture( tri.specularTextureIndex, specularS, specularT );
+						const unsigned int specularTexel = SampleTextureMip( tri.specularTextureIndex, specularS, specularT, specularLod );
 						r += ColorChannel( specularTexel, 16 ) * tri.specularColor[0] * ColorChannel( lightTexel, 16 ) * falloff * specular * shadowVisibility * vertexScale[0];
 						g += ColorChannel( specularTexel, 8 ) * tri.specularColor[1] * ColorChannel( lightTexel, 8 ) * falloff * specular * shadowVisibility * vertexScale[1];
 						b += ColorChannel( specularTexel, 0 ) * tri.specularColor[2] * ColorChannel( lightTexel, 0 ) * falloff * specular * shadowVisibility * vertexScale[2];
@@ -3499,7 +3541,9 @@ ID_INLINE unsigned int idSoftwareRasterizer::ShadePixel( const swTriSetup_t &tri
 		const float invPerspective = 1.0f / invW;
 		const float s = sOverW * invPerspective;
 		const float t = tOverW * invPerspective;
-		srcColor = SampleTexture( tri.textureIndex, s, t );
+		const float lod = TextureLodForGradients( tri.textureIndex, invW, sOverW, tOverW,
+			tri.dsOverWdx, tri.dtOverWdx, tri.dinvWdx, tri.dsOverWdy, tri.dtOverWdy, tri.dinvWdy );
+		srcColor = SampleTextureMip( tri.textureIndex, s, t, lod );
 	} else {
 		srcColor = tri.fallbackColor;
 	}
@@ -3879,6 +3923,7 @@ int idSoftwareRasterizer::AddHybridTextureToCache( const idImage *image, bool pr
 		texture.image = image;
 		texture.name = image->imgName;
 		LoadDefaultTexture( texture );
+		BuildTextureMipChain( texture );
 	}
 
 	textureCacheGeneration++;
@@ -3910,9 +3955,14 @@ bool idSoftwareRasterizer::LoadSoftwareTexture( swTexture_t &texture, const idIm
 	texture.repeat = image->repeat;
 	texture.width = 0;
 	texture.height = 0;
+	texture.mipCount = 0;
 	texture.texels.Clear();
+	texture.mipOffsets.Clear();
+	texture.mipWidths.Clear();
+	texture.mipHeights.Clear();
 
 	if ( LoadGeneratedTexture( texture, image ) ) {
+		BuildTextureMipChain( texture );
 		return true;
 	}
 
@@ -3936,6 +3986,7 @@ bool idSoftwareRasterizer::LoadSoftwareTexture( swTexture_t &texture, const idIm
 		texture.texels[i] = PackColor( rgba[0], rgba[1], rgba[2], rgba[3] );
 	}
 	R_StaticFree( pic );
+	BuildTextureMipChain( texture );
 	return true;
 }
 
@@ -3963,6 +4014,7 @@ bool idSoftwareRasterizer::LoadBoundTexture( swTexture_t &texture, const idImage
 		const byte *rgba = pixels.Ptr() + i * 4;
 		texture.texels[i] = PackColor( rgba[0], rgba[1], rgba[2], rgba[3] );
 	}
+	BuildTextureMipChain( texture );
 	return true;
 }
 
@@ -4044,8 +4096,12 @@ bool idSoftwareRasterizer::LoadGeneratedTexture( swTexture_t &texture, const idI
 void idSoftwareRasterizer::LoadDefaultTexture( swTexture_t &texture ) const {
 	texture.width = 16;
 	texture.height = 16;
+	texture.mipCount = 0;
 	texture.repeat = TR_REPEAT;
 	texture.texels.SetNum( texture.width * texture.height, false );
+	texture.mipOffsets.Clear();
+	texture.mipWidths.Clear();
+	texture.mipHeights.Clear();
 	for ( int y = 0; y < texture.height; y++ ) {
 		for ( int x = 0; x < texture.width; x++ ) {
 			const bool bright = ( ( x >> 2 ) ^ ( y >> 2 ) ) & 1;
@@ -4054,13 +4110,66 @@ void idSoftwareRasterizer::LoadDefaultTexture( swTexture_t &texture ) const {
 	}
 }
 
+void idSoftwareRasterizer::BuildTextureMipChain( swTexture_t &texture ) const {
+	const int baseTexelCount = texture.width * texture.height;
+	if ( texture.width <= 0 || texture.height <= 0 || texture.texels.Num() < baseTexelCount ) {
+		texture.mipCount = 0;
+		texture.mipOffsets.Clear();
+		texture.mipWidths.Clear();
+		texture.mipHeights.Clear();
+		return;
+	}
+
+	texture.texels.SetNum( baseTexelCount, false );
+	texture.mipOffsets.Clear();
+	texture.mipWidths.Clear();
+	texture.mipHeights.Clear();
+
+	int currentOffset = 0;
+	int currentWidth = texture.width;
+	int currentHeight = texture.height;
+	texture.mipOffsets.Append( currentOffset );
+	texture.mipWidths.Append( currentWidth );
+	texture.mipHeights.Append( currentHeight );
+
+	while ( currentWidth > 1 || currentHeight > 1 ) {
+		const int nextWidth = Max( 1, ( currentWidth + 1 ) >> 1 );
+		const int nextHeight = Max( 1, ( currentHeight + 1 ) >> 1 );
+		const int nextOffset = texture.texels.Num();
+		texture.texels.SetNum( nextOffset + nextWidth * nextHeight, false );
+
+		for ( int y = 0; y < nextHeight; y++ ) {
+			const int srcY0 = Min( currentHeight - 1, y * 2 );
+			const int srcY1 = Min( currentHeight - 1, srcY0 + 1 );
+			for ( int x = 0; x < nextWidth; x++ ) {
+				const int srcX0 = Min( currentWidth - 1, x * 2 );
+				const int srcX1 = Min( currentWidth - 1, srcX0 + 1 );
+				const unsigned int c00 = texture.texels[currentOffset + srcY0 * currentWidth + srcX0];
+				const unsigned int c10 = texture.texels[currentOffset + srcY0 * currentWidth + srcX1];
+				const unsigned int c01 = texture.texels[currentOffset + srcY1 * currentWidth + srcX0];
+				const unsigned int c11 = texture.texels[currentOffset + srcY1 * currentWidth + srcX1];
+				texture.texels[nextOffset + y * nextWidth + x] = AverageTexels( c00, c10, c01, c11 );
+			}
+		}
+
+		currentOffset = nextOffset;
+		currentWidth = nextWidth;
+		currentHeight = nextHeight;
+		texture.mipOffsets.Append( currentOffset );
+		texture.mipWidths.Append( currentWidth );
+		texture.mipHeights.Append( currentHeight );
+	}
+
+	texture.mipCount = texture.mipOffsets.Num();
+}
+
 unsigned int idSoftwareRasterizer::SampleTexture( int textureIndex, float s, float t ) const {
 	if ( textureIndex < 0 || textureIndex >= textureCache.Num() ) {
 		return PackColor( 255, 255, 255, 255 );
 	}
 
 	const swTexture_t &texture = textureCache[textureIndex];
-	if ( texture.width <= 0 || texture.height <= 0 || texture.texels.Num() == 0 ) {
+	if ( texture.width <= 0 || texture.height <= 0 || texture.texels.Num() == 0 || texture.mipCount <= 0 ) {
 		return PackColor( 255, 255, 255, 255 );
 	}
 
@@ -4072,40 +4181,58 @@ unsigned int idSoftwareRasterizer::SampleTexture( int textureIndex, float s, flo
 	s = WrapTextureCoordinate( s, texture.repeat );
 	t = WrapTextureCoordinate( t, texture.repeat );
 
-	int x = idMath::Ftoi( s * static_cast<float>( texture.width ) );
-	int y = idMath::Ftoi( t * static_cast<float>( texture.height ) );
-	x = Max( 0, Min( texture.width - 1, x ) );
-	y = Max( 0, Min( texture.height - 1, y ) );
-	return texture.texels[y * texture.width + x];
+	const int level = 0;
+	const int mipWidth = texture.mipWidths[level];
+	const int mipHeight = texture.mipHeights[level];
+	int x = idMath::Ftoi( s * static_cast<float>( mipWidth ) );
+	int y = idMath::Ftoi( t * static_cast<float>( mipHeight ) );
+	x = Max( 0, Min( mipWidth - 1, x ) );
+	y = Max( 0, Min( mipHeight - 1, y ) );
+	return TextureTexel( texture, level, x, y );
 }
 
-unsigned int idSoftwareRasterizer::TextureTexel( const swTexture_t &texture, int x, int y ) const {
-	if ( texture.width <= 0 || texture.height <= 0 || texture.texels.Num() <= 0 ) {
+unsigned int idSoftwareRasterizer::TextureTexel( const swTexture_t &texture, int level, int x, int y ) const {
+	if ( texture.mipCount <= 0 || texture.texels.Num() <= 0 ) {
+		return PackColor( 255, 255, 255, 255 );
+	}
+	level = Max( 0, Min( texture.mipCount - 1, level ) );
+	const int mipWidth = texture.mipWidths[level];
+	const int mipHeight = texture.mipHeights[level];
+	const int mipOffset = texture.mipOffsets[level];
+	if ( mipWidth <= 0 || mipHeight <= 0 || mipOffset < 0 || mipOffset >= texture.texels.Num() ) {
 		return PackColor( 255, 255, 255, 255 );
 	}
 	if ( texture.repeat == TR_REPEAT ) {
-		x %= texture.width;
-		y %= texture.height;
+		x %= mipWidth;
+		y %= mipHeight;
 		if ( x < 0 ) {
-			x += texture.width;
+			x += mipWidth;
 		}
 		if ( y < 0 ) {
-			y += texture.height;
+			y += mipHeight;
 		}
 	} else {
-		x = Max( 0, Min( texture.width - 1, x ) );
-		y = Max( 0, Min( texture.height - 1, y ) );
+		x = Max( 0, Min( mipWidth - 1, x ) );
+		y = Max( 0, Min( mipHeight - 1, y ) );
 	}
-	return texture.texels[y * texture.width + x];
+	return texture.texels[mipOffset + y * mipWidth + x];
 }
 
 unsigned int idSoftwareRasterizer::SampleTextureLinear( int textureIndex, float s, float t ) const {
+	return SampleTextureLinearMip( textureIndex, s, t, 0.0f );
+}
+
+unsigned int idSoftwareRasterizer::SampleTextureMip( int textureIndex, float s, float t, float lod ) const {
+	return SampleTextureLinearMip( textureIndex, s, t, lod );
+}
+
+unsigned int idSoftwareRasterizer::SampleTextureLinearMip( int textureIndex, float s, float t, float lod ) const {
 	if ( textureIndex < 0 || textureIndex >= textureCache.Num() ) {
 		return PackColor( 255, 255, 255, 255 );
 	}
 
 	const swTexture_t &texture = textureCache[textureIndex];
-	if ( texture.width <= 0 || texture.height <= 0 || texture.texels.Num() == 0 ) {
+	if ( texture.width <= 0 || texture.height <= 0 || texture.texels.Num() == 0 || texture.mipCount <= 0 ) {
 		return PackColor( 255, 255, 255, 255 );
 	}
 
@@ -4117,17 +4244,39 @@ unsigned int idSoftwareRasterizer::SampleTextureLinear( int textureIndex, float 
 	s = WrapTextureCoordinate( s, texture.repeat );
 	t = WrapTextureCoordinate( t, texture.repeat );
 
-	const float texelS = s * static_cast<float>( texture.width ) - 0.5f;
-	const float texelT = t * static_cast<float>( texture.height ) - 0.5f;
+	const float clampedLod = idMath::ClampFloat( 0.0f, static_cast<float>( texture.mipCount - 1 ), lod );
+	const int level0 = Max( 0, Min( texture.mipCount - 1, idMath::Ftoi( idMath::Floor( clampedLod ) ) ) );
+	const int level1 = Min( texture.mipCount - 1, level0 + 1 );
+	const unsigned int c0 = SampleTextureLevelLinear( texture, level0, s, t );
+	if ( level1 == level0 ) {
+		return c0;
+	}
+	const unsigned int c1 = SampleTextureLevelLinear( texture, level1, s, t );
+	return LerpTexels( c0, c1, clampedLod - static_cast<float>( level0 ) );
+}
+
+unsigned int idSoftwareRasterizer::SampleTextureLevelLinear( const swTexture_t &texture, int level, float s, float t ) const {
+	if ( texture.mipCount <= 0 ) {
+		return PackColor( 255, 255, 255, 255 );
+	}
+	level = Max( 0, Min( texture.mipCount - 1, level ) );
+	const int mipWidth = texture.mipWidths[level];
+	const int mipHeight = texture.mipHeights[level];
+	if ( mipWidth <= 0 || mipHeight <= 0 ) {
+		return PackColor( 255, 255, 255, 255 );
+	}
+
+	const float texelS = s * static_cast<float>( mipWidth ) - 0.5f;
+	const float texelT = t * static_cast<float>( mipHeight ) - 0.5f;
 	const int x0 = idMath::Ftoi( idMath::Floor( texelS ) );
 	const int y0 = idMath::Ftoi( idMath::Floor( texelT ) );
 	const float fracS = texelS - static_cast<float>( x0 );
 	const float fracT = texelT - static_cast<float>( y0 );
 
-	const unsigned int c00 = TextureTexel( texture, x0, y0 );
-	const unsigned int c10 = TextureTexel( texture, x0 + 1, y0 );
-	const unsigned int c01 = TextureTexel( texture, x0, y0 + 1 );
-	const unsigned int c11 = TextureTexel( texture, x0 + 1, y0 + 1 );
+	const unsigned int c00 = TextureTexel( texture, level, x0, y0 );
+	const unsigned int c10 = TextureTexel( texture, level, x0 + 1, y0 );
+	const unsigned int c01 = TextureTexel( texture, level, x0, y0 + 1 );
+	const unsigned int c11 = TextureTexel( texture, level, x0 + 1, y0 + 1 );
 	int out[4];
 	const int shifts[4] = { 16, 8, 0, 24 };
 	for ( int i = 0; i < 4; i++ ) {
@@ -4141,6 +4290,41 @@ unsigned int idSoftwareRasterizer::SampleTextureLinear( int textureIndex, float 
 		out[i] = idMath::Ftoi( v0 + ( v1 - v0 ) * fracT + 0.5f );
 	}
 	return PackColor( out[0], out[1], out[2], out[3] );
+}
+
+float idSoftwareRasterizer::TextureLodForGradients( int textureIndex, float invW, float sOverW, float tOverW, float dsOverWdx, float dtOverWdx, float dinvWdx, float dsOverWdy, float dtOverWdy, float dinvWdy ) const {
+	if ( textureIndex < 0 || textureIndex >= textureCache.Num() || invW == 0.0f ) {
+		return 0.0f;
+	}
+	const float invW2 = invW * invW;
+	if ( invW2 <= 0.000000001f ) {
+		return 0.0f;
+	}
+	const float dsdx = ( dsOverWdx * invW - sOverW * dinvWdx ) / invW2;
+	const float dtdx = ( dtOverWdx * invW - tOverW * dinvWdx ) / invW2;
+	const float dsdy = ( dsOverWdy * invW - sOverW * dinvWdy ) / invW2;
+	const float dtdy = ( dtOverWdy * invW - tOverW * dinvWdy ) / invW2;
+	return TextureLodForDerivatives( textureIndex, dsdx, dtdx, dsdy, dtdy );
+}
+
+float idSoftwareRasterizer::TextureLodForDerivatives( int textureIndex, float dsdx, float dtdx, float dsdy, float dtdy ) const {
+	if ( textureIndex < 0 || textureIndex >= textureCache.Num() ) {
+		return 0.0f;
+	}
+	const swTexture_t &texture = textureCache[textureIndex];
+	if ( texture.width <= 1 && texture.height <= 1 ) {
+		return 0.0f;
+	}
+
+	const float widthScale = static_cast<float>( Max( texture.width, 1 ) );
+	const float heightScale = static_cast<float>( Max( texture.height, 1 ) );
+	const float rhoX = idMath::Sqrt( dsdx * dsdx * widthScale * widthScale + dtdx * dtdx * heightScale * heightScale );
+	const float rhoY = idMath::Sqrt( dsdy * dsdy * widthScale * widthScale + dtdy * dtdy * heightScale * heightScale );
+	const float rho = Max( rhoX, rhoY );
+	if ( rho <= 1.0f ) {
+		return 0.0f;
+	}
+	return idMath::Log( rho ) * 1.4426950408889634f;
 }
 
 unsigned int idSoftwareRasterizer::SurfaceColor( int surfIndex, const drawSurf_t *surf ) const {
@@ -4412,6 +4596,31 @@ unsigned int idSoftwareRasterizer::ModulateColor( unsigned int color, const floa
 	const int r = ByteFromFloat( static_cast<float>( ( color >> 16 ) & 255 ) / 255.0f * scale[0] );
 	const int a = ByteFromFloat( static_cast<float>( ( color >> 24 ) & 255 ) / 255.0f * scale[3] );
 	return PackColor( r, g, b, a );
+}
+
+unsigned int idSoftwareRasterizer::AverageTexels( unsigned int c00, unsigned int c10, unsigned int c01, unsigned int c11 ) {
+	const int r = ( static_cast<int>( ( c00 >> 16 ) & 255 ) + static_cast<int>( ( c10 >> 16 ) & 255 ) +
+		static_cast<int>( ( c01 >> 16 ) & 255 ) + static_cast<int>( ( c11 >> 16 ) & 255 ) + 2 ) >> 2;
+	const int g = ( static_cast<int>( ( c00 >> 8 ) & 255 ) + static_cast<int>( ( c10 >> 8 ) & 255 ) +
+		static_cast<int>( ( c01 >> 8 ) & 255 ) + static_cast<int>( ( c11 >> 8 ) & 255 ) + 2 ) >> 2;
+	const int b = ( static_cast<int>( c00 & 255 ) + static_cast<int>( c10 & 255 ) +
+		static_cast<int>( c01 & 255 ) + static_cast<int>( c11 & 255 ) + 2 ) >> 2;
+	const int a = ( static_cast<int>( ( c00 >> 24 ) & 255 ) + static_cast<int>( ( c10 >> 24 ) & 255 ) +
+		static_cast<int>( ( c01 >> 24 ) & 255 ) + static_cast<int>( ( c11 >> 24 ) & 255 ) + 2 ) >> 2;
+	return PackColor( r, g, b, a );
+}
+
+unsigned int idSoftwareRasterizer::LerpTexels( unsigned int c0, unsigned int c1, float fraction ) {
+	fraction = idMath::ClampFloat( 0.0f, 1.0f, fraction );
+	const int shifts[4] = { 16, 8, 0, 24 };
+	int out[4];
+	for ( int i = 0; i < 4; i++ ) {
+		const int shift = shifts[i];
+		const float v0 = static_cast<float>( ( c0 >> shift ) & 255 );
+		const float v1 = static_cast<float>( ( c1 >> shift ) & 255 );
+		out[i] = idMath::Ftoi( v0 + ( v1 - v0 ) * fraction + 0.5f );
+	}
+	return PackColor( out[0], out[1], out[2], out[3] );
 }
 
 unsigned int idSoftwareRasterizer::AdditiveColor( unsigned int src, unsigned int dst ) {

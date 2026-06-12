@@ -134,6 +134,10 @@ vec4 UnpackColor( uint color ) {
 		float( ( color >> 24 ) & 255u ) ) * ( 1.0 / 255.0 );
 }
 
+vec2 DecodePackedUV( uint packedUV ) {
+	return vec2( float( packedUV & 0xffffu ), float( ( packedUV >> 16 ) & 0xffffu ) ) * ( 1.0 / 65535.0 );
+}
+
 uint PackColorVec( vec4 color ) {
 	return PackColor( ByteFromFloat( color.r ), ByteFromFloat( color.g ), ByteFromFloat( color.b ), ByteFromFloat( color.a ) );
 }
@@ -173,21 +177,148 @@ vec3 DecodeNormal( uint packed ) {
 	return normal * inversesqrt( len2 );
 }
 
-uint SampleTextureNearest( uint textureId, uint packedUV ) {
+uint MipLevelOffset( TextureInfo info, uint level, out uint width, out uint height ) {
+	uint offset = info.offset;
+	width = info.width;
+	height = info.height;
+	for ( uint i = 0u; i < level; i++ ) {
+		offset += width * height;
+		width = max( 1u, ( width + 1u ) >> 1 );
+		height = max( 1u, ( height + 1u ) >> 1 );
+	}
+	return offset;
+}
+
+uint AddressTextureTexel( int coord, uint size, uint repeat ) {
+	if ( repeat == 0u ) {
+		int wrapped = coord % int( size );
+		return uint( wrapped < 0 ? wrapped + int( size ) : wrapped );
+	}
+	return uint( clamp( coord, 0, int( size ) - 1 ) );
+}
+
+vec4 FetchTextureTexel( TextureInfo info, uint level, int x, int y ) {
+	uint width;
+	uint height;
+	uint offset = MipLevelOffset( info, level, width, height );
+	uint sx = AddressTextureTexel( x, width, info.repeat );
+	uint sy = AddressTextureTexel( y, height, info.repeat );
+	return UnpackColor( textureTexels[offset + sy * width + sx] );
+}
+
+uint MaxTextureMipLevel( TextureInfo info ) {
+	uint width = info.width;
+	uint height = info.height;
+	uint level = 0u;
+	while ( width > 1u || height > 1u ) {
+		width = max( 1u, ( width + 1u ) >> 1 );
+		height = max( 1u, ( height + 1u ) >> 1 );
+		level++;
+	}
+	return level;
+}
+
+vec4 SampleTextureLevelLinear( TextureInfo info, uint level, vec2 uv ) {
+	uint width;
+	uint height;
+	MipLevelOffset( info, level, width, height );
+	vec2 texel = uv * vec2( float( width ), float( height ) ) - vec2( 0.5 );
+	ivec2 base = ivec2( floor( texel ) );
+	vec2 blend = fract( texel );
+	vec4 c00 = FetchTextureTexel( info, level, base.x, base.y );
+	vec4 c10 = FetchTextureTexel( info, level, base.x + 1, base.y );
+	vec4 c01 = FetchTextureTexel( info, level, base.x, base.y + 1 );
+	vec4 c11 = FetchTextureTexel( info, level, base.x + 1, base.y + 1 );
+	return mix( mix( c00, c10, blend.x ), mix( c01, c11, blend.x ), blend.y );
+}
+
+vec4 SampleTextureMip( uint textureId, vec2 uv, float lod, uint fallbackColor ) {
 	if ( textureId == 0xffffffffu || textureId >= pc.textureCount ) {
-		return PackColor( 255u, 255u, 255u, 255u );
+		return UnpackColor( fallbackColor );
 	}
 
 	TextureInfo info = textureInfos[textureId];
 	if ( info.width == 0u || info.height == 0u ) {
-		return PackColor( 255u, 255u, 255u, 255u );
+		return UnpackColor( fallbackColor );
 	}
 
-	uint us = packedUV & 0xffffu;
-	uint vt = ( packedUV >> 16 ) & 0xffffu;
-	uint x = min( info.width - 1u, ( us * info.width ) >> 16 );
-	uint y = min( info.height - 1u, ( vt * info.height ) >> 16 );
-	return textureTexels[info.offset + y * info.width + x];
+	bool outside = uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0;
+	if ( outside && ( info.repeat == 3u || info.repeat == 4u ) ) {
+		return info.repeat == 4u ? vec4( 0.0 ) : vec4( 0.0, 0.0, 0.0, 1.0 );
+	}
+	if ( info.repeat == 0u ) {
+		uv = fract( uv );
+		uv += vec2( uv.x < 0.0 ? 1.0 : 0.0, uv.y < 0.0 ? 1.0 : 0.0 );
+	} else {
+		uv = clamp( uv, vec2( 0.0 ), vec2( 1.0 ) );
+	}
+
+	uint maxLevel = MaxTextureMipLevel( info );
+	float clampedLod = clamp( lod, 0.0, float( maxLevel ) );
+	uint level0 = uint( floor( clampedLod ) );
+	uint level1 = min( maxLevel, level0 + 1u );
+	vec4 c0 = SampleTextureLevelLinear( info, level0, uv );
+	if ( level0 == level1 ) {
+		return c0;
+	}
+	return mix( c0, SampleTextureLevelLinear( info, level1, uv ), clampedLod - float( level0 ) );
+}
+
+float WrappedUvDelta( float delta, uint repeat ) {
+	if ( repeat == 0u ) {
+		if ( delta > 0.5 ) {
+			delta -= 1.0;
+		} else if ( delta < -0.5 ) {
+			delta += 1.0;
+		}
+	}
+	return delta;
+}
+
+vec2 SurfaceNeighborDelta( uint neighborIndex, vec2 uv, uint repeat ) {
+	vec2 delta = DecodePackedUV( uvPacked[neighborIndex] ) - uv;
+	return vec2( WrappedUvDelta( delta.x, repeat ), WrappedUvDelta( delta.y, repeat ) );
+}
+
+float TextureLodFromNeighbors( uint textureId, uint srcIndex, vec2 uv ) {
+	if ( textureId == 0xffffffffu || textureId >= pc.textureCount ) {
+		return 0.0;
+	}
+
+	TextureInfo info = textureInfos[textureId];
+	if ( info.width <= 1u && info.height <= 1u ) {
+		return 0.0;
+	}
+
+	uint x = srcIndex % pc.dims.x;
+	uint y = srcIndex / pc.dims.x;
+	uint currentSurface = surfaceId[srcIndex];
+	vec2 dx = vec2( 0.0 );
+	vec2 dy = vec2( 0.0 );
+	bool haveX = false;
+	bool haveY = false;
+
+	if ( x + 1u < pc.dims.x && surfaceId[srcIndex + 1u] == currentSurface ) {
+		dx = SurfaceNeighborDelta( srcIndex + 1u, uv, info.repeat );
+		haveX = true;
+	} else if ( x > 0u && surfaceId[srcIndex - 1u] == currentSurface ) {
+		dx = -SurfaceNeighborDelta( srcIndex - 1u, uv, info.repeat );
+		haveX = true;
+	}
+
+	if ( y + 1u < pc.dims.y && surfaceId[srcIndex + pc.dims.x] == currentSurface ) {
+		dy = SurfaceNeighborDelta( srcIndex + pc.dims.x, uv, info.repeat );
+		haveY = true;
+	} else if ( y > 0u && surfaceId[srcIndex - pc.dims.x] == currentSurface ) {
+		dy = -SurfaceNeighborDelta( srcIndex - pc.dims.x, uv, info.repeat );
+		haveY = true;
+	}
+
+	vec2 textureSize = vec2( float( info.width ), float( info.height ) );
+	float rhoX = haveX ? length( dx * textureSize ) : 0.0;
+	float rhoY = haveY ? length( dy * textureSize ) : 0.0;
+	float rho = max( rhoX, rhoY );
+	return rho > 1.0 ? log2( rho ) : 0.0;
 }
 
 uint AddressProjectedTexel( int coord, uint size, uint repeat ) {
@@ -508,7 +639,10 @@ uint ApplyWriteMask( uint src, uint dst, int writeMask ) {
 }
 
 uint ShadeTexturedPixel( uint srcIndex, uint viewX, uint viewY ) {
-	vec4 albedo = UnpackColor( SampleTextureNearest( albedoOrTextureId[srcIndex], uvPacked[srcIndex] ) );
+	uint packedUV = uvPacked[srcIndex];
+	vec2 uv = DecodePackedUV( packedUV );
+	uint albedoTextureId = albedoOrTextureId[srcIndex];
+	vec4 albedo = SampleTextureMip( albedoTextureId, uv, TextureLodFromNeighbors( albedoTextureId, srcIndex, uv ), PackColor( 255u, 255u, 255u, 255u ) );
 	vec3 normal = DecodeNormal( normalPacked[srcIndex] );
 	uint packedMaterial = specularAndFlags[srcIndex];
 	uint bumpTextureId = OptionalTextureId( packedMaterial & 0xffffu );
@@ -570,7 +704,8 @@ uint ShadeTexturedPixel( uint srcIndex, uint viewX, uint viewY ) {
 			}
 			if ( !bumpReady ) {
 				if ( bumpTextureId != 0xffffffffu && bumpTextureId < pc.textureCount ) {
-					bumpNormal = DecodeNormalMapTexel( SampleTextureNearest( bumpTextureId, uvPacked[srcIndex] ) );
+					vec4 bumpTexel = SampleTextureMip( bumpTextureId, uv, TextureLodFromNeighbors( bumpTextureId, srcIndex, uv ), PackColor( 128u, 128u, 255u, 255u ) );
+					bumpNormal = DecodeNormalMapTexel( PackColorVec( bumpTexel ) );
 				}
 				bumpReady = true;
 			}
@@ -586,7 +721,7 @@ uint ShadeTexturedPixel( uint srcIndex, uint viewX, uint viewY ) {
 			if ( lightAmount > 0.0 ) {
 				if ( !specularReady ) {
 					if ( specularTextureId != 0xffffffffu && specularTextureId < pc.textureCount ) {
-						specularColor = UnpackColor( SampleTextureNearest( specularTextureId, uvPacked[srcIndex] ) ).rgb;
+						specularColor = SampleTextureMip( specularTextureId, uv, TextureLodFromNeighbors( specularTextureId, srcIndex, uv ), PackColor( 0u, 0u, 0u, 255u ) ).rgb;
 					}
 					specularReady = true;
 				}
@@ -714,7 +849,10 @@ void main() {
 			} else if ( pc.debugView == 4u ) {
 				color = IdDebugColor( materialId[srcIndex] );
 			} else if ( pc.debugView == 5u ) {
-				color = SampleTextureNearest( albedoOrTextureId[srcIndex], uvPacked[srcIndex] );
+				uint packed = uvPacked[srcIndex];
+				vec2 uv = DecodePackedUV( packed );
+				uint textureId = albedoOrTextureId[srcIndex];
+				color = PackColorVec( SampleTextureMip( textureId, uv, TextureLodFromNeighbors( textureId, srcIndex, uv ), PackColor( 255u, 255u, 255u, 255u ) ) );
 			} else if ( pc.debugView == 6u ) {
 				color = IdDebugColor( surfaceId[srcIndex] );
 			}
